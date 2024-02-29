@@ -55,14 +55,14 @@
 
 import numpy as np
 import numba as nb
+from pathlib import Path
 from scipy.special import gammainc
-import sys
 import matplotlib.pyplot as plt
 import progressbar as bar
 
 # =====================================================
 
-### Covariance calculation ### 
+### Covariance calculation ###
 
 @nb.jit(nopython=True)
 def setupc(m,n):
@@ -76,7 +76,7 @@ def setupc(m,n):
         for j in range(1,m+1):
 
             # Heaviside
-            if (i + j - n - 2 >= 0):
+            if i + j - n - 2 >= 0:
                 heav = 1.0
             else:
                 heav = 0.0
@@ -99,7 +99,7 @@ def calc_cov(n,m,c,a2,s2):
     cov += cov.T
     for i in range(1,m+1):
         cov[i-1,i-1] = c[i-1,i-1] * s2**2 / 3. + add_to_cov(a2,s2,n,i,i)
-    return(cov)
+    return cov
 
 @nb.jit(nopython=True)
 def add_to_cov(a2,s2,n,i,j):
@@ -116,18 +116,16 @@ def inv_mat(A):
     cinv = np.linalg.inv(A)
     return cinv
 
+
 # GLS calculation
 
-def calc_gls(n,m,v,d2max,nitmax,step):
-    a2est, s2est, s2varest = gls_closed(n,v)
+def calc_gls(n,m,v,d2max,nitmax):
+    a2est, s2est, _s2varest = gls_closed(n,v)
     a2, s2, nit = gls_iter(n,m,v,a2est,s2est,d2max,nitmax)
 
     if nit >= nitmax:
         print('WARNING: Optimizer did not converge. Falling back to M=2.')
         a2, s2 = a2est, s2est # use M=2 result
-
-    # a2 /= step
-    # s2 /= step
 
     return a2, s2
 
@@ -155,10 +153,10 @@ def gls_closed(n,v):
 
     s2 = v[1]-v[0]
     a2 = 2*v[0] - v[1]
-    
+
     cov = calc_cov(n,2,c,a2,s2)
-    cinv = inv_mat(cov)
- 
+    #_cinv = inv_mat(cov)
+
     # a2var = abs(4. * cov[0,0] - 4. * cov[0,1] + cov[1,1])
     s2var = abs(cov[0,0] - 2. * cov[0,1] + cov[1,1])
 
@@ -235,19 +233,18 @@ def calc_var(n,m,a2,s2):
     s2var = A / denom
     return s2var
 
-def eval_vars(n,m,a2m,s2m,ndim,step):
+def eval_vars(n,m,a2m,s2m,ndim):
     """ a2 and s2 are means across segments, 
     but still per dim """
     s2var = 0.0
     for d in range(ndim):
         s2var += calc_var(n,m,a2m[d],s2m[d]) # using mean across segments but per dim
-    # s2var /= step**2
     return s2var
 
 def calc_q(n,m,a2_3D,s2_3D,msds_3D,a2full_3D,s2full_3D,ndim):
     """ Q per segment (Eq. 22). Use best a2 and s2 estimates from 
     full trajectory for cov and cinv. """
-    
+
     c = setupc(m,n) # setups of cov matrix
     cov = calc_cov(n,m,c,a2full_3D,s2full_3D)
     cinv = inv_mat(cov)
@@ -296,9 +293,10 @@ def compute_correlation_via_fft(x, y=None):
 # ================================
 
 class Dcov():
-
-    def __init__(self, fz=None, m=20,tmin=1,tmax=100,dt=1.0,d2max=1e-10,nitmax=100,
-    nseg=None,imgfmt = 'pdf',fout = 'D_analysis'):
+    def __init__(self, fz:list[str|Path]|tuple[str|Path]|str|Path = None,
+                 m:int = 20, tmin:int = 1, tmax:int = 100, dt: float = 1.0,
+                 d2max:float = 1e-10, nitmax:int = 100,
+                 nseg: int|None = None, imgfmt:str = 'pdf', fout:str = 'D_analysis'):
 
         self.fz = fz
         if type(self.fz) in (list, tuple):
@@ -307,12 +305,13 @@ class Dcov():
         else:
             self.multi = False
             print('Analyzing single trajectory.')
+
         self.dt = dt # Trajecotory timestep in ps
         self.m = m
         self.tmin = tmin
         self.tmax = tmax
         self.d2max = d2max
-        self.nitmax = nitmax   
+        self.nitmax = nitmax
 
         if imgfmt not in ['pdf','png']:
             raise TypeError("Error! Choose 'pdf' or 'png' as output format.")
@@ -331,32 +330,41 @@ class Dcov():
         else:
             self.ndim = 1
             self.n = self.z.shape[0] - 1 # length of timeseries N+1
-        print('N = {}'.format(self.n))
-        print('ndim = {}'.format(self.ndim))
+        print(f'N = {self.n}')
+        print(f'ndim = {self.ndim}')
         if self.multi:
             self.nseg = len(self.fz) # number of individual molecules
             self.nperseg = self.n # all molecules from trajectory with same length
         else:
             self.nseg = int((self.n+1) / (100. * self.tmax)) # number of segments
-            if nseg != None: # given nseg
+            if nseg is not None: # given nseg
                 if nseg > self.nseg: # compare if given nseg is over max nseg
-                    print("Warning, too many segments chosen, falling back to nseg = {}".format(self.nseg))
+                    print(f"Warning, too many segments chosen, falling back to nseg = {self.nseg}")
                 else:
                     self.nseg = nseg
             self.nperseg = int((self.n+1) / self.nseg) - 1 # length of segment timeseries Nperseg+1
             if self.nseg == 0:
                 raise ValueError('Timeseries too short! Reduce tmax')
             self.a2full = np.zeros((self.tmax-self.tmin+1,self.ndim)) # full trajectory, per dim
-            self.s2full = self.a2full.copy() # full trajectory, per dim
+            self.s2full = np.zeros((self.tmax-self.tmin+1,self.ndim)) # full trajectory, per dim
 
         if self.m > self.nperseg:
             self.m = self.nperseg # force self.m to not be larger than Nperseg
 
         self.a2 = np.zeros((self.tmax-self.tmin+1,self.nseg,self.ndim))  # per segment and dims
-        self.s2 = self.a2.copy() # per segment and dims
+        self.s2 = np.zeros((self.tmax-self.tmin+1,self.nseg,self.ndim))  # per segment and dims
 
         self.s2var = np.zeros((self.tmax-self.tmin+1)) # mean across all segments and dims
         self.q = np.zeros((self.tmax-self.tmin+1,self.nseg)) # per segment, mean across dims
+
+        # initialize som stuff that will be computed within the analysis method
+        self.Dseg = None
+        self.Dstd = None
+        self.Dperdim = None
+        self.D = None
+        self.Dempstd = None
+        self.q_m = None
+        self.q_std = None
 
     def run_Dfit(self):
         """ Main Function to calculate the stepsize sigma^2 and offset a^2 of a 
@@ -373,7 +381,7 @@ class Dcov():
                             z = self.z[d,::step] # full traj
                         n = len(z) - 1
                         msd = compute_MSD_1D_via_correlation(z)[1:(self.m+1)]
-                        self.a2full[t,d], self.s2full[t,d] = calc_gls(n,self.m,msd,self.d2max,self.nitmax,step)
+                        self.a2full[t,d], self.s2full[t,d] = calc_gls(n,self.m,msd,self.d2max,self.nitmax)
 
                     a2full_3D = np.sum(self.a2full[t]) # sum across dims
                     s2full_3D = np.sum(self.s2full[t]) # sum across dims
@@ -396,7 +404,7 @@ class Dcov():
                         else:
                             z = self.z[d,zstart:zend:step] # copy segment from trajectory
                         msds[d] = compute_MSD_1D_via_correlation(z)[1:(self.m+1)]
-                        self.a2[t,s,d], self.s2[t,s,d] = calc_gls(n,self.m,msds[d],self.d2max,self.nitmax,step)
+                        self.a2[t,s,d], self.s2[t,s,d] = calc_gls(n,self.m,msds[d],self.d2max,self.nitmax)
                     msds_3D = np.sum(msds,axis=0) # --> MSD_3D per deltaT and segment
                     a2_3D = np.sum(self.a2[t,s]) # sum across dims
                     s2_3D = np.sum(self.s2[t,s]) # sum across dims
@@ -409,7 +417,7 @@ class Dcov():
                 a2m = np.mean(self.a2[t],axis=0) # mean across segments, per dim
                 s2m = np.mean(self.s2[t],axis=0) # mean across segments, per dim
 
-                self.s2var[t] = eval_vars(n,self.m,a2m,s2m,self.ndim,step) # a2 and s2 are mean over segments, but still per dim (and for given timestp)
+                self.s2var[t] = eval_vars(n,self.m,a2m,s2m,self.ndim) # a2 and s2 are mean over segments, but still per dim (and for given timestp)
             
                 self.a2[t] /= step
                 self.s2[t] /= step
@@ -420,13 +428,12 @@ class Dcov():
                 progbar.update(t)
 
     # Output and plotting
-    def analysis(self,tc=10):        
+    def analysis(self,tc=10):
         if tc % self.dt != 0:
             raise ValueError('tc must be a multiple of dt!')
-        else:
-            itc = int(tc/self.dt) - self.tmin
-        self.Dseg = self.s2.sum(axis=2) # across dims
-        self.Dseg = np.mean(self.Dseg,axis=1) / (2.*self.ndim*self.dt) # mean across segs, nm^2 / (dt * ps)
+        itc = int(tc/self.dt) - self.tmin
+        Dseg = self.s2.sum(axis=2) # across dims
+        self.Dseg = np.mean(Dseg, axis=1) / (2.*self.ndim*self.dt) # mean across segs, nm^2 / (dt * ps)
         self.Dstd = np.sqrt(self.s2var/ (2.*self.ndim*self.dt)**2) # nm^2 / (dt * ps)
 
         if self.multi: # no 'full' run available
@@ -436,13 +443,13 @@ class Dcov():
             self.D = self.s2full.sum(axis=1)/(2.*self.ndim*self.dt) # nm^2 / (dt * ps)
             self.Dperdim = self.s2full / (2.*self.dt)
 
-        self.Dempstd = np.var(self.s2,axis=1) # across segments per dim
-        self.Dempstd = np.sum(self.Dempstd,axis=1) # across dims
-        self.Dempstd = np.sqrt(self.Dempstd) / (2.*self.ndim*self.dt)
-        self.q_m = np.mean(self.q,axis=1)
-        self.q_std = np.std(self.q,axis=1)
+        Dempstd = np.var(self.s2, axis=1) # across segments per dim
+        Dempstd = np.sum(Dempstd, axis=1) # across dims
+        self.Dempstd = np.sqrt(Dempstd) / (2.*self.ndim*self.dt)
+        self.q_m = np.mean(self.q, axis=1)
+        self.q_std = np.std(self.q, axis=1)
 
-        with open('{}.dat'.format(self.fout),'w') as g:
+        with open(f'{self.fout}.dat','w') as g:
             g.write("DIFFUSION COEFFICIENT ESTIMATE\n")
             g.write("INPUT:\n")
             g.write("Trajectory: {}\n".format(self.fz))
@@ -455,7 +462,7 @@ class Dcov():
             g.write("Your chosen diffusion coefficient at {} ps: {} nm^2/ps\n".format(tc,self.D[itc]))
             g.write("DIFFUSION COEFFICIENT OUTPUT SUMMARY:\n")
             g.write("t[ps] D[nm^2/ps] varD[nm^4/ps^2] Q\n")
-            for t,step in enumerate(range(self.tmin,self.tmax)):
+            for t,step in enumerate(range(self.tmin, self.tmax)):
                 g.write("{:.4g} {:.5g} {:.5g} {:.5f}\n".format(step*self.dt,self.D[t],self.Dstd[t]**2,self.q_m[t]))
             if self.ndim > 1:
                 g.write("\n\DIFFUSION COEFFICIENT PER DIMENSION:\n")
