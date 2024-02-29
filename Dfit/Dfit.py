@@ -484,18 +484,18 @@ class Dcov():
         fig.tight_layout(h_pad=0.1)
         fig.savefig('{}.{}'.format(self.fout,self.imgfmt),dpi=300)
 
-    def finite_size_correction(self,T=300,eta=None,L=None,boxtype='cubic',tc=10):
+    def finite_size_correction(self, T=300, eta=None, L=None, boxtype='cubic', tc=10):
         """ T in Kelvin, eta in Pa*s, L in nm"""
         if tc % self.dt != 0:
-            raise ValueError('tc must be a multiple of dt!')
-        else:
-            itc = int(tc/self.dt) - self.tmin
+            raise ValueError(f'tc [{tc}] must be a multiple of dt [{self.dt}]!')
+
+        itc = int(tc/self.dt) - self.tmin
         if self.ndim != 3:
             raise ValueError("Currently only 3D correction implemented")
-        if L == None:
-            raise ValueError("Box edge length L missing.")
-        if eta == None:
-            raise ValueError("Viscosity eta missing.")
+        if L is None:
+            raise ValueError("Required parameter missing: L, box edge length")
+        if eta is None:
+            raise ValueError("Required parameter missing: eta, viscosity eta")
         if boxtype != 'cubic':
             raise ValueError("Sorry, correction only implemented for cubic simulation boxes")
 
