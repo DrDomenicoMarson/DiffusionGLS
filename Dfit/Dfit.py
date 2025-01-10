@@ -465,7 +465,7 @@ class Dcov():
             for t,step in enumerate(range(self.tmin, self.tmax)):
                 g.write("{:.4g} {:.5g} {:.5g} {:.5f}\n".format(step*self.dt,self.D[t],self.Dstd[t]**2,self.q_m[t]))
             if self.ndim > 1:
-                g.write("\n\DIFFUSION COEFFICIENT PER DIMENSION:\n")
+                g.write("\nDIFFUSION COEFFICIENT PER DIMENSION:\n")
                 g.write("TIMESTEP Dx[nm^2/ps] Dy[nm^2/ps] ...\n")
                 for t, Dt in zip( (range(self.tmin,self.tmax+1)), self.Dperdim):
                     g.write("{:.4f} {}\n".format(t, Dt))
