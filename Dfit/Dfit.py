@@ -12,6 +12,7 @@ from collections.abc import Sequence
 from pathlib import Path
 import warnings
 import concurrent.futures
+import os
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -41,6 +42,58 @@ def calc_q(n,m,a2_3D,s2_3D,msds_3D,a2full_3D,s2full_3D,ndim):
     else:
         q = 1-gammainc( (m-2)/2.,chi2/2.) # goodness-of-fit Q
     return q
+
+def analyze_chunk_task(chunk_data, step, m, dt, nperseg, multi, ndim, d2max, nitmax, c2_pre, cm_pre, a2full_3D=0.0, s2full_3D=0.0):
+    results = []
+    
+    for s_idx, seg_z in enumerate(chunk_data):
+        # Stride it
+        z_analyzed = seg_z[::step, :]
+
+        if len(z_analyzed) <= m:
+            # Calculate suggestions
+            max_m_possible = len(z_analyzed) - 1
+            max_tmax_possible = (nperseg / m) * dt
+            
+            # We can't raise here easily without crashing the worker.
+            # Return error info.
+            return None, ValueError(f"Segment too short (length N={len(z_analyzed)}) to calculate m={m} MSD points at lag time step={step} (t={step*dt} ps).\n"
+                                    f"Suggestions:\n"
+                                    f"  - Reduce m to at most {max_m_possible}\n"
+                                    f"  - Reduce tmax to less than {max_tmax_possible:.1f} ps\n"
+                                    f"  - Use a longer trajectory")
+
+        msds = np.zeros((ndim, m))
+        res_a2 = np.zeros(ndim)
+        res_s2 = np.zeros(ndim)
+        res_converged = True
+        
+        n_per_seg_step = len(z_analyzed) - 1
+
+        # Analyze per dimension
+        for d in range(ndim):
+            z_dim = z_analyzed[:, d]
+            msds[d] = math_utils.compute_MSD_1D_via_correlation(z_dim)[1:(m+1)]
+            
+            # Check if pre-calculated matrices match current n
+            use_c2 = c2_pre
+            use_cm = cm_pre
+            
+            res_a2[d], res_s2[d], conv = math_utils.calc_gls(n_per_seg_step, m, msds[d], d2max, nitmax, c2=use_c2, cm=use_cm)
+            if not conv: res_converged = False
+        
+        msds_3D = np.sum(msds, axis=0)
+        a2_3D_val = np.sum(res_a2)
+        s2_3D_val = np.sum(res_s2)
+        
+        if multi:
+            q_val = calc_q(n_per_seg_step, m, a2_3D_val, s2_3D_val, msds_3D, a2_3D_val, s2_3D_val, ndim)
+        else:
+            q_val = calc_q(n_per_seg_step, m, a2_3D_val, s2_3D_val, msds_3D, a2full_3D, s2full_3D, ndim)
+            
+        results.append((res_a2, res_s2, q_val, res_converged))
+        
+    return results, None
 
 class Dcov():
     def __init__(self, fz: TrajectoryInput = None, universe=None, selection=None,
@@ -186,117 +239,103 @@ class Dcov():
                         z_strided = z_dim[::step]
                         if len(z_strided) <= self.m:
                              raise ValueError(f"Trajectory too short (length N={len(z_strided)}) to calculate m={self.m} MSD points at lag time step={step} (t={step*self.dt} ps). Please reduce tmax or m, or use a longer trajectory.")
-                        n = len(z_strided) - 1
-                        msd = math_utils.compute_MSD_1D_via_correlation(z_strided)[1:(self.m+1)]
-                        self.a2full[t,d], self.s2full[t,d], converged = math_utils.calc_gls(n, self.m, msd, self.d2max, self.nitmax)
-                        if not converged: non_converged_count += 1
+        # Initialize ProcessPoolExecutor outside the loop
+        # Use ProcessPoolExecutor to bypass GIL
+        max_workers = self.n_jobs if self.n_jobs > 0 else None
+        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+            
+            with bar.ProgressBar(max_value=self.tmax-self.tmin+1) as progbar:
+                for t, step in enumerate(range(self.tmin, self.tmax+1)):
                     
-                    a2full_3D = np.sum(self.a2full[t])
-                    s2full_3D = np.sum(self.s2full[t])
-                
-                # 2. Segment Analysis
-                # If multi: iterate over molecules
-                # If single: iterate over segments of the single trajectory
-                
-                # 2. Segment Analysis
-                # If multi: iterate over molecules
-                # If single: iterate over segments of the single trajectory
-                
-                n_per_seg_step = int(self.nperseg / step)
-                
-                # Pre-calculate covariance matrices for this step
-                # We need c2 (m=2) and cm (m=self.m)
-                # n depends on segment length.
-                # For segments, length is n_per_seg_step + 1 points.
-                # n passed to calc_gls is len(z) - 1 = n_per_seg_step.
-                
-                c2_pre = None
-                if n_per_seg_step >= 2:
-                    c2_pre = math_utils.setupc(2, n_per_seg_step)
-                
-                cm_pre = None
-                if n_per_seg_step >= self.m:
-                    cm_pre = math_utils.setupc(self.m, n_per_seg_step)
-                
-                def analyze_segment(s):
-                    msds = np.zeros((self.ndim, self.m))
-                    res_a2 = np.zeros(self.ndim)
-                    res_s2 = np.zeros(self.ndim)
-                    res_converged = True
-                    
-                    # Get the segment data
-                    if self.multi:
-                        # Segment s is molecule s
-                        seg_z = all_trajs[s]
-                        # Stride it
-                        z_analyzed = seg_z[::step, :]
-                    else:
-                        # Segment s is a slice of the single trajectory
+                    # 1. Full Trajectory Analysis (Only for Single Trajectory mode)
+                    if not self.multi:
+                        # In single mode, all_trajs has 1 element
                         full_z = all_trajs[0]
-                        zstart = s * (self.nperseg + 1)
-                        zend = (s + 1) * (self.nperseg + 1)
-                        z_analyzed = full_z[zstart:zend:step, :]
-
-                    if len(z_analyzed) <= self.m:
-                        # Calculate suggestions
-                        max_m_possible = len(z_analyzed) - 1
-                        max_tmax_possible = (self.nperseg / self.m) * self.dt
+                        for d in range(self.ndim):
+                            z_dim = full_z[:, d]
+                            z_strided = z_dim[::step]
+                            if len(z_strided) <= self.m:
+                                 raise ValueError(f"Trajectory too short (length N={len(z_strided)}) to calculate m={self.m} MSD points at lag time step={step} (t={step*self.dt} ps). Please reduce tmax or m, or use a longer trajectory.")
+                            n = len(z_strided) - 1
+                            msd = math_utils.compute_MSD_1D_via_correlation(z_strided)[1:(self.m+1)]
+                            self.a2full[t,d], self.s2full[t,d], converged = math_utils.calc_gls(n, self.m, msd, self.d2max, self.nitmax)
+                            if not converged: non_converged_count += 1
                         
-                        raise ValueError(f"Segment too short (length N={len(z_analyzed)}) to calculate m={self.m} MSD points at lag time step={step} (t={step*self.dt} ps).\n"
-                                         f"Suggestions:\n"
-                                         f"  - Reduce m to at most {max_m_possible}\n"
-                                         f"  - Reduce tmax to less than {max_tmax_possible:.1f} ps\n"
-                                         f"  - Use a longer trajectory")
-
-                    # Analyze per dimension
-                    for d in range(self.ndim):
-                        z_dim = z_analyzed[:, d]
-                        msds[d] = math_utils.compute_MSD_1D_via_correlation(z_dim)[1:(self.m+1)]
-                        # Pass pre-calculated matrices
-                        res_a2[d], res_s2[d], conv = math_utils.calc_gls(n_per_seg_step, self.m, msds[d], self.d2max, self.nitmax, c2=c2_pre, cm=cm_pre)
-                        if not conv: res_converged = False
+                        a2full_3D = np.sum(self.a2full[t])
+                        s2full_3D = np.sum(self.s2full[t])
                     
-                    msds_3D = np.sum(msds, axis=0)
-                    a2_3D = np.sum(res_a2)
-                    s2_3D = np.sum(res_s2)
+                    # 2. Segment Analysis
+                    n_per_seg_step = int(self.nperseg / step)
                     
-                    if self.multi:
-                        q_val = calc_q(n_per_seg_step, self.m, a2_3D, s2_3D, msds_3D, a2_3D, s2_3D, self.ndim)
-                    else:
-                        q_val = calc_q(n_per_seg_step, self.m, a2_3D, s2_3D, msds_3D, a2full_3D, s2full_3D, self.ndim)
+                    # Pre-calculate covariance matrices for this step
+                    c2_pre = None
+                    if n_per_seg_step >= 2:
+                        c2_pre = math_utils.setupc(2, n_per_seg_step)
+                    
+                    cm_pre = None
+                    if n_per_seg_step >= self.m:
+                        cm_pre = math_utils.setupc(self.m, n_per_seg_step)
+                    
+                    # Prepare chunks
+                    n_workers_count = max_workers if max_workers else (os.cpu_count() or 1)
+                    chunk_size = max(1, self.nseg // (n_workers_count * 4))
+                    
+                    # Prepare full trajectory values if single mode
+                    a2full_3D_val = 0.0
+                    s2full_3D_val = 0.0
+                    if not self.multi:
+                        a2full_3D_val = np.sum(self.a2full[t])
+                        s2full_3D_val = np.sum(self.s2full[t])
+                    
+                    future_to_range = {}
+                    for s_start in range(0, self.nseg, chunk_size):
+                        s_end = min(s_start + chunk_size, self.nseg)
                         
-                    return s, res_a2, res_s2, q_val, res_converged
-
-                # Use ThreadPoolExecutor for parallel processing
-                # Numba releases GIL, so threads are effective
-                max_workers = self.n_jobs if self.n_jobs > 0 else None
-                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    futures = [executor.submit(analyze_segment, s) for s in range(self.nseg)]
-                    for future in concurrent.futures.as_completed(futures):
+                        chunk_data = []
+                        if self.multi:
+                            chunk_data = all_trajs[s_start:s_end]
+                        else:
+                            # Slice the single trajectory
+                            full_z = all_trajs[0]
+                            for s in range(s_start, s_end):
+                                zstart = s * (self.nperseg + 1)
+                                zend = (s + 1) * (self.nperseg + 1)
+                                chunk_data.append(full_z[zstart:zend])
+                                
+                        fut = executor.submit(analyze_chunk_task, chunk_data, step, self.m, self.dt, self.nperseg, self.multi, self.ndim, self.d2max, self.nitmax, c2_pre, cm_pre, a2full_3D_val, s2full_3D_val)
+                        future_to_range[fut] = (s_start, s_end)
+                    
+                    for future in concurrent.futures.as_completed(future_to_range):
+                        s_start, s_end = future_to_range[future]
                         try:
-                            s, res_a2, res_s2, q_val, res_converged = future.result()
-                            self.a2[t,s] = res_a2
-                            self.s2[t,s] = res_s2
-                            self.q[t,s] = q_val
-                            if not res_converged: non_converged_count += 1
+                            chunk_results, error = future.result()
+                            if error:
+                                raise error
+                            
+                            for i, (res_a2, res_s2, q_val, res_converged) in enumerate(chunk_results):
+                                s = s_start + i
+                                self.a2[t,s] = res_a2
+                                self.s2[t,s] = res_s2
+                                self.q[t,s] = q_val
+                                if not res_converged: non_converged_count += 1
                         except Exception as exc:
                             raise exc
 
-                # 3. Averaging
-                a2m = np.mean(self.a2[t], axis=0)
-                s2m = np.mean(self.s2[t], axis=0)
-                
-                self.s2var[t] = math_utils.eval_vars(n_per_seg_step, self.m, a2m, s2m, self.ndim)
-                
-                # Normalize by step
-                self.a2[t] /= step
-                self.s2[t] /= step
-                self.s2var[t] /= step**2
-                if not self.multi:
-                    self.a2full[t] /= step
-                    self.s2full[t] /= step
-                
-                progbar.update(t)
+                    # 3. Averaging
+                    a2m = np.mean(self.a2[t], axis=0)
+                    s2m = np.mean(self.s2[t], axis=0)
+                    
+                    self.s2var[t] = math_utils.eval_vars(n_per_seg_step, self.m, a2m, s2m, self.ndim)
+                    
+                    # Normalize by step
+                    self.a2[t] /= step
+                    self.s2[t] /= step
+                    self.s2var[t] /= step**2
+                    if not self.multi:
+                        self.a2full[t] /= step
+                        self.s2full[t] /= step
+                    
+                    progbar.update(t)
         
         if non_converged_count > 0:
             print(f"WARNING: Optimizer did not converge in {non_converged_count} cases. Falling back to M=2 for those cases.")

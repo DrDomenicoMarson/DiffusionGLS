@@ -175,29 +175,39 @@ def eval_vars(n,m,a2m,s2m,ndim):
         s2var += calc_var(n,m,a2m[d],s2m[d]) # using mean across segments but per dim
     return s2var
 
-def compute_correlation_via_fft(x, y=None):
+def compute_autocorrelation_via_fft(x):
     """
-    Correlation of two arrays calculated via FFT.
+    Autocorrelation of array calculated via FFT.
     """
-    x   = np.array(x)
-    l   = len(x)
+    # x is assumed to be a numpy array (float64)
+    l = len(x)
+    
+    # FFT
     xft = np.fft.fft(x, 2*l)
-
-    if y is None:
-        yft = xft
-    else:
-        y   = np.array(y)
-        yft = np.fft.fft(y, 2*l)
-    corr    = np.real(np.fft.ifft(np.conjugate(xft)*yft))
-    norm    = l - np.arange(l)
-    corr    = corr[:l]/norm
+    
+    # Autocorrelation: ifft( |xft|^2 )
+    # np.abs(xft)**2 is real, but ifft expects complex? 
+    # Actually correlation is ifft( conj(xft) * xft ) = ifft( |xft|^2 )
+    # |xft|^2 is real.
+    
+    # Numba supports basic arithmetic on complex arrays
+    spec = np.abs(xft)**2
+    corr = np.real(np.fft.ifft(spec))
+    
+    # Normalization
+    norm = l - np.arange(l)
+    # Avoid division by zero if l=0 (unlikely)
+    # Numba handles array division
+    
+    # Slice to length l
+    corr = corr[:l]/norm
     return corr
 
 def compute_MSD_1D_via_correlation(x):
     """
     One-dimensional MSD calculated via FFT-based auto-correlation.
     """
-    corrx  = compute_correlation_via_fft(x)
+    corrx = compute_autocorrelation_via_fft(x)
     nt     = len(x)
     dsq    = x**2
     sumsq  = 2*np.sum(dsq)
