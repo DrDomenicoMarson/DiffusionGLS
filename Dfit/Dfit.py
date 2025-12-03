@@ -340,10 +340,13 @@ class Dcov():
                     
                     progbar.update(t)
         
+        self.non_converged_count = non_converged_count
+        self.total_cases = (self.tmax - self.tmin + 1) * (self.nseg + (1 if not self.multi else 0))
+        self.percent_failed = 0.0
+        
         if non_converged_count > 0:
-            total_cases = (self.tmax - self.tmin + 1) * (self.nseg + (1 if not self.multi else 0))
-            percent_failed = (non_converged_count / total_cases) * 100
-            print(f"WARNING: Optimizer did not converge in {non_converged_count} cases ({percent_failed:.1f}% of Total {total_cases}). Falling back to M=2 for those cases.")
+            self.percent_failed = (non_converged_count / self.total_cases) * 100
+            print(f"WARNING: Optimizer did not converge in {non_converged_count} cases ({self.percent_failed:.1f}% of Total {self.total_cases}). Falling back to M=2 for those cases.")
 
     # Output and plotting
     def analysis(self, tc: float | str = 10):
@@ -388,30 +391,33 @@ class Dcov():
             g.write("DIFFUSION COEFFICIENT ESTIMATE\n")
             g.write("INPUT:\n")
             # g.write("Trajectory: {}\n".format(self.fz)) # fz might be None now
-            g.write("Number of dimensions : {}\n".format(self.ndim))
-            g.write("Min/max timestep: {}/{}\n".format(self.tmin,self.tmax))
-            g.write("Number of segments: {}\n".format(self.nseg))
-            g.write("Total number of trajectory data points per dim.: {}\n".format(self.n+1))
-            g.write("Data points per segment and dim.: {}\n".format(self.nperseg+1))
+            g.write(f"Number of dimensions : {self.ndim}\n")
+            g.write(f"Min/max lag time [steps]: {self.tmin}/{self.tmax}\n")
+            g.write(f"Min/max lag time [ps]: {self.tmin*self.dt}/{self.tmax*self.dt}\n")
+            g.write(f"Parameter m: {self.m}\n")
+            
+            if self.multi:
+                g.write(f"Number of molecules: {self.nseg}\n")
+            else:
+                g.write(f"Number of segments: {self.nseg}\n")
+                
+            g.write(f"Total number of trajectory data points per dim.: {self.n+1}\n")
+            g.write(f"Data points per segment and dim.: {self.nperseg+1}\n")
+            
+            if hasattr(self, 'non_converged_count'):
+                 g.write(f"Optimizer convergence failures: {self.non_converged_count} ({self.percent_failed:.1f}% of {self.total_cases})\n")
 
-            g.write("Your chosen diffusion coefficient at {} ps: {:.4e} nm^2/ps\n".format(tc, self.D[itc]))
-            g.write("Your chosen diffusion coefficient at {} ps: {:.4e} cm^2/s\n".format(tc, self.D[itc]*0.01))
+            g.write(f"Your chosen diffusion coefficient at {tc} ps: {self.D[itc]:.4e} nm^2/ps\n")
+            g.write(f"Your chosen diffusion coefficient at {tc} ps: {self.D[itc]*0.01:.4e} cm^2/s\n")
             g.write("DIFFUSION COEFFICIENT OUTPUT SUMMARY:\n")
             g.write("t[ps] D[nm^2/ps] varD[nm^4/ps^2] Q D[cm^2/s] varD[cm^4/s^2]\n")
             for t,step in enumerate(range(self.tmin, self.tmax+1)):
-                g.write("{:.4g} {:.5g} {:.5g} {:.5f} {:.5g} {:.5g}\n".format(
-                    step*self.dt,
-                    self.D[t],
-                    self.Dstd[t]**2,
-                    self.q_m[t],
-                    self.D[t]*0.01,
-                    (self.Dstd[t]**2)*0.0001
-                ))
+                g.write(f"{step*self.dt:.4g} {self.D[t]:.5g} {self.Dstd[t]**2:.5g} {self.q_m[t]:.5f} {self.D[t]*0.01:.5g} {(self.Dstd[t]**2)*0.0001:.5g}\n")
             if self.ndim > 1:
                 g.write("\nDIFFUSION COEFFICIENT PER DIMENSION:\n")
                 g.write("TIMESTEP Dx[nm^2/ps] Dy[nm^2/ps] ...\n")
                 for t, Dt in zip( (range(self.tmin,self.tmax+1)), self.Dperdim):
-                    g.write("{:.4f} {}\n".format(t, Dt))
+                    g.write(f"{t:.4f} {Dt}\n")
         
         self.plot_results(tc)
 
@@ -436,7 +442,7 @@ class Dcov():
         ax[1].set(xlabel='time step size [ps]')
         ax[1].set(ylim=(0,1))
         fig.tight_layout(h_pad=0.1)
-        fig.savefig('{}.{}'.format(self.fout,self.imgfmt),dpi=300)
+        fig.savefig(f'{self.fout}.{self.imgfmt}',dpi=300)
         plt.close(fig)
 
     def finite_size_correction(self, T=300, eta=None, L=None, boxtype='cubic', tc=10):
@@ -453,4 +459,4 @@ class Dcov():
 
         kbT = T * BOLTZMANN_K # J
         self.Dcor = self.D + kbT * XI_CUBIC * 1e15 / (6. * np.pi * eta * L) # nm^2 / ps
-        print("Finite-size corrected diffusion coefficient D_t for timestep {} ps: {:.4g} nm^2/ps with standard dev. {:.4g} nm^2/ps".format(tc,self.Dcor[itc],self.Dstd[itc]))
+        print(f"Finite-size corrected diffusion coefficient D_t for timestep {tc} ps: {self.Dcor[itc]:.4g} nm^2/ps with standard dev. {self.Dstd[itc]:.4g} nm^2/ps")
