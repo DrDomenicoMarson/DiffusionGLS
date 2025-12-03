@@ -10,9 +10,9 @@ The input trajectory is analyzed as a whole and split into segments. For each se
 # Basic Example
 ```
 import Dfit
-res = Dfit.Dcov(m=20,fz='mytrajectory.dat',tmin=1,tmax=100,nseg=150)
+res = Dfit.Dcov(m=20,fz='mytrajectory.dat',tmin=1.0,tmax=100.0,nseg=150)
 res.run_Dfit()
-res.analysis(tc=10)
+res.analysis(tc=10.0)
 res.finite_size_correction()
 ```
 
@@ -26,8 +26,8 @@ Required:
 Optional:
 * dt (float): Timestep [in ps] (default: 1.0).
 * m (int): Number of MSD values to consider (default: 20).
-* tmin (int): Minimum timestep (default: 1).
-* tmax (int): Maximum timestep (default: 100).
+* tmin (float): Minimum lag time [in ps] (default: None, defaults to dt).
+* tmax (float): Maximum lag time [in ps] (default: 100.0).
 * d2max (float): Convergence criterion for GLS iteration (default: 1e-10).
 * nitmax (int): Maximum number of iterations in GLS procedure (default: 100).
 * nseg (int): Number of segments (default: N / (100*tmax)).
@@ -39,7 +39,7 @@ Run res.run_Dfit() without additional arguments (everything is stored in `self`)
 # Output
 
 Files:
-* D_analysis.dat: Summary of output, including diffusion coefficient and Q-factor analysis.
+* D_analysis.dat: Summary of output, including diffusion coefficient (in nm^2/ps and cm^2/s) and Q-factor analysis.
 * D_analysis.pdf: (or .png) Output plots. Use this to assess which diffusion coefficient to select. Refer to Figs. 2 and 4 in the paper.
 
 Stored values in the Dfit class instance:
@@ -51,7 +51,7 @@ Stored values in the Dfit class instance:
 
 # Additional input for method analysis():
 
-* tc (int/float): 'Timestep chosen' [in ps] for the diffusion coefficient. Must be a multiple of dt.
+* tc (float/str): 'Timestep chosen' [in ps] for the diffusion coefficient. Must be a multiple of dt. Can also be set to 'auto' to automatically select the time point where Q is closest to 0.5.
 
 The analysis can be repeated with different values of tc. A red vertical line indicates the chosen timestep in the plot. Repeat until you are content with the chosen timestep
 

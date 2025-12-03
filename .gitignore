@@ -1,2 +1,5 @@
 Dfit/__pycache__/*.pyc
 .DS_Store
+Dfit.egg-info/
+build/
+.venv/

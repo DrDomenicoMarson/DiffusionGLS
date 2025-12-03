@@ -1,0 +1,40 @@
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "Dfit"
+version = "0.3"
+description = "Diffusion Coefficient Fitting using Generalized Least Squares"
+readme = "README.md"
+authors = [
+  { name="Sören von Bülow", email="soeren.buelow@biophys.mpg.de" },
+  { name="Domenico Marson", email="domenico87@gmail.com" },
+]
+license = { text = "GPL-3.0-only" }
+requires-python = ">=3.11"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+
+dependencies = [
+    "numpy",
+    "scipy",
+    "numba",
+    "MDAnalysis",
+    "matplotlib",
+    "progressbar2",
+]
+
+[tool.setuptools.packages.find]
+include = ["Dfit*"]
+exclude = ["Example*"]
+
+[tool.pytest.ini_options]
+minversion = "6.0"
+addopts = "-ra -q"
+testpaths = [
+    "tests",
+]
