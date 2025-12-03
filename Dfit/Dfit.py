@@ -53,12 +53,17 @@
 # res.finite_size_correction(L=7.5, eta=0.9e-3, tc=10)
 #
 
-import numpy as np
-import numba as nb
+import math
+from collections.abc import Sequence
 from pathlib import Path
-from scipy.special import gammainc
+
 import matplotlib.pyplot as plt
+import numba as nb
+import numpy as np
 import progressbar as bar
+from scipy.special import gammainc
+
+TrajectoryInput = str | Path | Sequence[str | Path] | None
 
 # =====================================================
 
@@ -293,13 +298,13 @@ def compute_correlation_via_fft(x, y=None):
 # ================================
 
 class Dcov():
-    def __init__(self, fz:list[str|Path]|tuple[str|Path]|str|Path = None,
-                 m:int = 20, tmin:int = 1, tmax:int = 100, dt: float = 1.0,
-                 d2max:float = 1e-10, nitmax:int = 100,
-                 nseg: int|None = None, imgfmt:str = 'pdf', fout:str = 'D_analysis'):
+    def __init__(self, fz: TrajectoryInput = None,
+                 m: int = 20, tmin: int = 1, tmax: int = 100, dt: float = 1.0,
+                 d2max: float = 1e-10, nitmax: int = 100,
+                 nseg: int | None = None, imgfmt: str = 'pdf', fout: str = 'D_analysis'):
 
         self.fz = fz
-        if type(self.fz) in (list, tuple):
+        if isinstance(self.fz, Sequence) and not isinstance(self.fz, (str, bytes, Path)):
             self.multi = True
             print('Analyzing trajectories of multiple molecules from the same simulation.')
         else:
@@ -336,15 +341,20 @@ class Dcov():
             self.nseg = len(self.fz) # number of individual molecules
             self.nperseg = self.n # all molecules from trajectory with same length
         else:
-            self.nseg = int((self.n+1) / (100. * self.tmax)) # number of segments
-            if nseg is not None: # given nseg
-                if nseg > self.nseg: # compare if given nseg is over max nseg
-                    print(f"Warning, too many segments chosen, falling back to nseg = {self.nseg}")
+            auto_nseg = int((self.n+1) / (100. * self.tmax)) # number of segments
+            if nseg is None:
+                if auto_nseg < 1:
+                    raise ValueError('Timeseries too short! Reduce tmax or provide nseg >= 1')
+                self.nseg = auto_nseg
+            else:
+                if nseg < 1:
+                    raise ValueError('nseg must be at least 1')
+                if auto_nseg > 0 and nseg > auto_nseg: # too many segments chosen
+                    print(f"Warning, too many segments chosen, falling back to nseg = {auto_nseg}")
+                    self.nseg = auto_nseg
                 else:
                     self.nseg = nseg
             self.nperseg = int((self.n+1) / self.nseg) - 1 # length of segment timeseries Nperseg+1
-            if self.nseg == 0:
-                raise ValueError('Timeseries too short! Reduce tmax')
             self.a2full = np.zeros((self.tmax-self.tmin+1,self.ndim)) # full trajectory, per dim
             self.s2full = np.zeros((self.tmax-self.tmin+1,self.ndim)) # full trajectory, per dim
 
@@ -365,6 +375,16 @@ class Dcov():
         self.Dempstd = None
         self.q_m = None
         self.q_std = None
+
+    def _timestep_index(self, tc: float) -> int:
+        steps = tc / self.dt
+        steps_int = round(steps)
+        if not math.isclose(steps, steps_int, rel_tol=1e-9, abs_tol=1e-12):
+            raise ValueError(f'tc [{tc}] must be a multiple of dt [{self.dt}] within numerical tolerance')
+        itc = int(steps_int) - self.tmin
+        if itc < 0 or itc >= (self.tmax - self.tmin + 1):
+            raise ValueError(f'tc [{tc}] is outside the computed timestep range')
+        return itc
 
     def run_Dfit(self):
         """ Main Function to calculate the stepsize sigma^2 and offset a^2 of a 
@@ -429,9 +449,7 @@ class Dcov():
 
     # Output and plotting
     def analysis(self,tc=10):
-        if tc % self.dt != 0:
-            raise ValueError('tc must be a multiple of dt!')
-        itc = int(tc/self.dt) - self.tmin
+        itc = self._timestep_index(tc)
         Dseg = self.s2.sum(axis=2) # across dims
         self.Dseg = np.mean(Dseg, axis=1) / (2.*self.ndim*self.dt) # mean across segs, nm^2 / (dt * ps)
         self.Dstd = np.sqrt(self.s2var/ (2.*self.ndim*self.dt)**2) # nm^2 / (dt * ps)
@@ -462,7 +480,7 @@ class Dcov():
             g.write("Your chosen diffusion coefficient at {} ps: {} nm^2/ps\n".format(tc,self.D[itc]))
             g.write("DIFFUSION COEFFICIENT OUTPUT SUMMARY:\n")
             g.write("t[ps] D[nm^2/ps] varD[nm^4/ps^2] Q\n")
-            for t,step in enumerate(range(self.tmin, self.tmax)):
+            for t,step in enumerate(range(self.tmin, self.tmax+1)):
                 g.write("{:.4g} {:.5g} {:.5g} {:.5f}\n".format(step*self.dt,self.D[t],self.Dstd[t]**2,self.q_m[t]))
             if self.ndim > 1:
                 g.write("\nDIFFUSION COEFFICIENT PER DIMENSION:\n")
@@ -493,10 +511,7 @@ class Dcov():
 
     def finite_size_correction(self, T=300, eta=None, L=None, boxtype='cubic', tc=10):
         """ T in Kelvin, eta in Pa*s, L in nm"""
-        if tc % self.dt != 0:
-            raise ValueError(f'tc [{tc}] must be a multiple of dt [{self.dt}]!')
-
-        itc = int(tc/self.dt) - self.tmin
+        itc = self._timestep_index(tc)
         if self.ndim != 3:
             raise ValueError("Currently only 3D correction implemented")
         if L is None:
