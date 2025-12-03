@@ -114,3 +114,44 @@ def test_auto_tc(random_walk_file):
     # but we can check that it didn't crash and produced output.
     # Ideally we would check if the chosen Q is close to 0.5, but with random walk data it might vary.
     # Let's just ensure it runs.
+
+def test_short_trajectory_error(tmp_path):
+    # Create a short trajectory
+    # N=40, m=20, tmax=5.0 (5 steps).
+    # step=5. len = 40/5 = 8. 8 <= 20. Should fail.
+    traj = generate_random_walk(n_steps=40, dim=3)
+    file_path = tmp_path / "short_traj.dat"
+    np.savetxt(file_path, traj)
+    
+    with pytest.raises(ValueError, match="Trajectory too short"):
+        # tmax=5.0 means 5 steps (dt=1.0)
+        dcov = Dcov(fz=str(file_path), m=20, tmax=5.0, dt=1.0)
+        dcov.run_Dfit()
+
+def test_short_segment_error(tmp_path):
+    # Create a trajectory that is long enough overall, but segments are too short
+    # N=100. nseg=2. Segment length ~50.
+    # tmax=20.0 (20 steps). step=20.
+    # Segment len strided = 50 / 20 = 2.5 -> 2 or 3.
+    # m=5. 3 <= 5. Should fail.
+    traj = generate_random_walk(n_steps=100, dim=3)
+    file_path = tmp_path / "short_seg_traj.dat"
+    np.savetxt(file_path, traj)
+    
+    with pytest.raises(ValueError, match="Segment too short"):
+        dcov = Dcov(fz=str(file_path), m=5, tmax=20.0, dt=1.0, nseg=2)
+        dcov.run_Dfit()
+
+def test_convergence_warning(tmp_path, capsys):
+    # Force non-convergence by setting nitmax=1
+    # N=50, m=20, tmax=1.0 (1 step).
+    traj = generate_random_walk(n_steps=50, dim=3)
+    file_path = tmp_path / "conv_traj.dat"
+    np.savetxt(file_path, traj)
+    
+    dcov = Dcov(fz=str(file_path), m=20, tmax=1.0, dt=1.0, nitmax=1)
+    dcov.run_Dfit()
+    
+    captured = capsys.readouterr()
+    assert "WARNING: Optimizer did not converge" in captured.out
+    assert "Falling back to M=2" in captured.out
