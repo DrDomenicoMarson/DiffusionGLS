@@ -79,11 +79,12 @@ class Dcov():
             self.n = self.z.shape[0] - 1 # length of timeseries N+1
         print(f'N = {self.n}')
         print(f'ndim = {self.ndim}')
+        total_points = self.n + 1
         if self.multi:
             self.nseg = len(self.fz) # number of individual molecules
             self.nperseg = self.n # all molecules from trajectory with same length
         else:
-            auto_nseg = int((self.n+1) / (100. * self.tmax)) # number of segments
+            auto_nseg = int(total_points / (100. * self.tmax)) # number of segments
             if nseg is None:
                 if auto_nseg < 1:
                     raise ValueError('Timeseries too short! Reduce tmax or provide nseg >= 1')
@@ -96,7 +97,9 @@ class Dcov():
                     self.nseg = auto_nseg
                 else:
                     self.nseg = nseg
-            self.nperseg = int((self.n+1) / self.nseg) - 1 # length of segment timeseries Nperseg+1
+            self.nperseg = int(total_points / self.nseg) - 1 # length of segment timeseries Nperseg+1
+            if self.nperseg < 1:
+                raise ValueError(f'nseg={self.nseg} yields segment length < 2 points; reduce nseg or use a longer trajectory')
             self.a2full = np.zeros((self.tmax-self.tmin+1,self.ndim)) # full trajectory, per dim
             self.s2full = np.zeros((self.tmax-self.tmin+1,self.ndim)) # full trajectory, per dim
 

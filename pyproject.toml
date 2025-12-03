@@ -12,7 +12,7 @@ authors = [
   { name="Sören von Bülow", email="soeren.buelow@biophys.mpg.de" },
 ]
 license = { text = "GPLv3" }
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
@@ -20,9 +20,9 @@ classifiers = [
 ]
 dependencies = [
     "numpy",
-    "scipy>=0.19",
+    "scipy",
     "numba",
-    "MDAnalysis>=0.19.0",
+    "MDAnalysis",
     "matplotlib",
     "progressbar2",
 ]
