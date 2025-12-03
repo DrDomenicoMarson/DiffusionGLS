@@ -34,14 +34,14 @@ def test_reader_text(random_walk_file):
     assert len(trajs) == 1
     assert trajs[0].shape[0] == 5001
 
-def test_dcov_initialization(random_walk_file):
-    dcov = Dcov(fz=random_walk_file, m=10, tmax=20.0)
+def test_dcov_initialization(random_walk_file, tmp_path):
+    dcov = Dcov(fz=random_walk_file, m=10, tmax=20.0, fout=str(tmp_path / 'D_analysis'))
     assert dcov.ndim == 3
     assert dcov.n == 5000
     assert dcov.dt == 1.0
 
-def test_run_dfit(random_walk_file):
-    dcov = Dcov(fz=random_walk_file, m=10, tmax=20.0, nseg=5)
+def test_run_dfit(random_walk_file, tmp_path):
+    dcov = Dcov(fz=random_walk_file, m=10, tmax=20.0, nseg=5, fout=str(tmp_path / 'D_analysis'))
     dcov.run_Dfit()
     dcov.analysis(tc=10)
     
@@ -56,8 +56,8 @@ def test_run_dfit(random_walk_file):
     # Basic sanity check: D should be positive
     assert np.all(dcov.D > 0)
 
-def test_finite_size_correction(random_walk_file):
-    dcov = Dcov(fz=random_walk_file, m=10, tmax=20.0)
+def test_finite_size_correction(random_walk_file, tmp_path):
+    dcov = Dcov(fz=random_walk_file, m=10, tmax=20.0, fout=str(tmp_path / 'D_analysis'))
     dcov.run_Dfit()
     dcov.analysis(tc=10)
     
@@ -81,8 +81,8 @@ def test_finite_size_correction(random_walk_file):
     
     assert np.isclose(dcov.Dcor[itc], expected_Dcor)
 
-def test_timestep_index(random_walk_file):
-    dcov = Dcov(fz=random_walk_file, dt=0.5, tmin=1.0, tmax=10.0)
+def test_timestep_index(random_walk_file, tmp_path):
+    dcov = Dcov(fz=random_walk_file, dt=0.5, tmin=1.0, tmax=10.0, fout=str(tmp_path / 'D_analysis'))
     
     # Valid tc
     idx = dcov._timestep_index(2.0) # 2.0 / 0.5 = 4 steps. tmin is 2 steps (idx 0). So 4 steps is idx 2?
@@ -100,15 +100,15 @@ def test_timestep_index(random_walk_file):
     with pytest.raises(ValueError, match="outside"):
         dcov._timestep_index(1000.0)
 
-def test_auto_tc(random_walk_file):
-    dcov = Dcov(fz=random_walk_file, m=10, tmax=20.0)
+def test_auto_tc(random_walk_file, tmp_path):
+    dcov = Dcov(fz=random_walk_file, m=10, tmax=20.0, fout=str(tmp_path / 'D_analysis'))
     dcov.run_Dfit()
     
     # Run with auto
     dcov.analysis(tc='auto')
     
     # Check if output file exists
-    assert os.path.exists('D_analysis.dat')
+    assert os.path.exists(tmp_path / 'D_analysis.dat')
     
     # We can't easily assert WHICH tc was chosen without parsing stdout or checking internals,
     # but we can check that it didn't crash and produced output.
@@ -125,7 +125,8 @@ def test_short_trajectory_error(tmp_path):
     
     with pytest.raises(ValueError, match="Trajectory too short"):
         # tmax=5.0 means 5 steps (dt=1.0)
-        dcov = Dcov(fz=str(file_path), m=20, tmax=5.0, dt=1.0)
+        # Pass nseg=1 to bypass "Timeseries too short" check in init
+        dcov = Dcov(fz=str(file_path), m=20, tmax=5.0, dt=1.0, nseg=1, fout=str(tmp_path / 'D_analysis'))
         dcov.run_Dfit()
 
 def test_short_segment_error(tmp_path):
@@ -139,7 +140,7 @@ def test_short_segment_error(tmp_path):
     np.savetxt(file_path, traj)
     
     with pytest.raises(ValueError, match="Segment too short"):
-        dcov = Dcov(fz=str(file_path), m=5, tmax=20.0, dt=1.0, nseg=2)
+        dcov = Dcov(fz=str(file_path), m=5, tmax=20.0, dt=1.0, nseg=2, fout=str(tmp_path / 'D_analysis'))
         dcov.run_Dfit()
 
 def test_convergence_warning(tmp_path, capsys):
@@ -149,7 +150,7 @@ def test_convergence_warning(tmp_path, capsys):
     file_path = tmp_path / "conv_traj.dat"
     np.savetxt(file_path, traj)
     
-    dcov = Dcov(fz=str(file_path), m=20, tmax=1.0, dt=1.0, nitmax=1)
+    dcov = Dcov(fz=str(file_path), m=20, tmax=1.0, dt=1.0, nitmax=1, nseg=1, fout=str(tmp_path / 'D_analysis'))
     dcov.run_Dfit()
     
     captured = capsys.readouterr()

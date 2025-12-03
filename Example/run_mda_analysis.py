@@ -13,10 +13,14 @@ def analyze_system(name, tpr, xtc, selection, tmax=100, tc=10):
     u = mda.Universe(tpr, xtc)
     print(f"System: {len(u.atoms)} atoms")
     
+    # Determine output path relative to the script
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    output_path = os.path.join(script_dir, f"D_analysis_{name}")
+    
     # Initialize Dfit with MDAnalysis Universe
     # We use the selection to define what constitutes a "molecule" (segment)
     # The reader iterates over RESIDUES in the selection.
-    res = Dfit.Dcov(universe=u, selection=selection, tmax=tmax, fout=f"D_analysis_{name}")
+    res = Dfit.Dcov(universe=u, selection=selection, tmax=tmax, fout=output_path)
     
     # Run the fit
     res.run_Dfit()
