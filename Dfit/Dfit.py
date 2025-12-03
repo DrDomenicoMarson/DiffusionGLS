@@ -15,6 +15,7 @@ import concurrent.futures
 import os
 
 import matplotlib.pyplot as plt
+import seaborn as sns
 import numpy as np
 import progressbar as bar
 from scipy.special import gammainc
@@ -422,6 +423,7 @@ class Dcov():
         self.plot_results(tc)
 
     def plot_results(self, tc):
+        sns.set_context("paper", font_scale=0.5)
         fig, ax = plt.subplots(2,1,figsize=(6,6),sharex=True)
         xs = np.arange(self.tmin*self.dt,(self.tmax+1)*self.dt,self.dt)
         ax[0].plot(xs,self.D,color='C0',label=r'$D$')
@@ -430,7 +432,7 @@ class Dcov():
         ax[0].plot(xs,self.D+self.Dstd,color='black',linestyle='dotted')
         ax[0].fill_between(xs,self.D-self.Dempstd,self.D+self.Dempstd,color='C0',alpha=0.5, label = r'$\delta \overline{D}^\mathrm{empirical}$')
         ax[0].axvline(tc,color='tab:red',linestyle='dashed')
-        ax[0].set(ylabel='diff. coeff. $D$ [nm$^2$ ps$^{-1}$]')
+        ax[0].set(ylabel=r'$D(t)$ [nm$^2$ ps$^{-1}$]')
         ax[0].set(xlim=(self.tmin*self.dt,self.tmax*self.dt))
         ax[0].ticklabel_format(style='scientific',scilimits=(-3,4))
         ax[0].legend(ncol=2)
@@ -438,8 +440,8 @@ class Dcov():
         ax[1].fill_between(xs,self.q_m-self.q_std,self.q_m+self.q_std,color='C0',alpha=0.5)
         ax[1].axhline(0.5,linestyle='dashed',color='gray',linewidth=1.2)
         ax[1].axvline(tc,color='tab:red',linestyle='dashed')
-        ax[1].set(ylabel='quality factor Q')
-        ax[1].set(xlabel='time step size [ps]')
+        ax[1].set(ylabel=r'$Q(t)$')
+        ax[1].set(xlabel=r'lag time $t$ [ps]')
         ax[1].set(ylim=(0,1))
         fig.tight_layout(h_pad=0.1)
         fig.savefig(f'{self.fout}.{self.imgfmt}',dpi=300)

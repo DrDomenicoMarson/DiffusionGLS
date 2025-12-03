@@ -122,7 +122,7 @@ class MDAnalysisReader(TrajectoryReader):
         if self.ag.n_atoms == self.n_trajs:
             print("Optimization: Single-atom residues detected. Using atom positions directly.")
             for i_frame, ts in enumerate(self.u.trajectory):
-                trajs[:, i_frame, :] = self.ag.positions
+                trajs[:, i_frame, :] = self.ag.positions * 0.1 # Convert Angstrom to nm
         else:
             # Iterate trajectory once
             for i_frame, ts in enumerate(self.u.trajectory):
@@ -136,11 +136,12 @@ class MDAnalysisReader(TrajectoryReader):
                 # MDAnalysis 2.0+ supports compound='residues'
                 try:
                     coms = self.ag.center_of_mass(compound='residues')
-                    trajs[:, i_frame, :] = coms
+                    trajs[:, i_frame, :] = coms * 0.1 # Convert Angstrom to nm
                 except (TypeError, ValueError):
                     # Fallback for older MDA or if compound not supported
+                    # This is slow
                     for i, res in enumerate(self.ag.residues):
-                        trajs[i, i_frame, :] = res.atoms.center_of_mass()
+                        trajs[i, i_frame, :] = res.atoms.center_of_mass() * 0.1 # Convert Angstrom to nm
         
         # Yield them
         for i in range(self.n_trajs):
