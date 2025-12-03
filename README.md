@@ -33,6 +33,7 @@ Optional:
 * nseg (int): Number of segments (default: N / (100*tmax)).
 * fout (str): Name for output files w/o extension (default 'D_analysis').
 * imgfmt (str): Output format for plot. Choose 'pdf' or 'png' (default: 'pdf').
+* n_jobs (int): Number of parallel jobs to run. -1 means using all processors (default: -1).
 
 Run res.run_Dfit() without additional arguments (everything is stored in `self`).
 

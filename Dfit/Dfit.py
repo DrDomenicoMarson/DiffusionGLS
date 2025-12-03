@@ -46,7 +46,8 @@ class Dcov():
     def __init__(self, fz: TrajectoryInput = None, universe=None, selection=None,
                  m: int = 20, tmin: float = None, tmax: float = 100.0, dt: float = 1.0,
                  d2max: float = 1e-10, nitmax: int = 100,
-                 nseg: int | None = None, imgfmt: str = 'pdf', fout: str = 'D_analysis'):
+                 nseg: int | None = None, imgfmt: str = 'pdf', fout: str = 'D_analysis',
+                 n_jobs: int = -1):
 
         # Initialize Reader
         self.reader: TrajectoryReader = get_reader(fz=fz, universe=universe, selection=selection)
@@ -81,6 +82,7 @@ class Dcov():
             raise TypeError("Error! Choose 'pdf' or 'png' as output format.")
         self.imgfmt = imgfmt
         self.fout = fout
+        self.n_jobs = n_jobs
 
         print(f'Num trajectories/molecules = {self.reader.n_trajs}')
         print(f'Num steps (num frames -1) = {self.n}')
@@ -208,8 +210,13 @@ class Dcov():
                 # For segments, length is n_per_seg_step + 1 points.
                 # n passed to calc_gls is len(z) - 1 = n_per_seg_step.
                 
-                c2_pre = math_utils.setupc(2, n_per_seg_step)
-                cm_pre = math_utils.setupc(self.m, n_per_seg_step)
+                c2_pre = None
+                if n_per_seg_step >= 2:
+                    c2_pre = math_utils.setupc(2, n_per_seg_step)
+                
+                cm_pre = None
+                if n_per_seg_step >= self.m:
+                    cm_pre = math_utils.setupc(self.m, n_per_seg_step)
                 
                 def analyze_segment(s):
                     msds = np.zeros((self.ndim, self.m))
@@ -262,7 +269,8 @@ class Dcov():
 
                 # Use ThreadPoolExecutor for parallel processing
                 # Numba releases GIL, so threads are effective
-                with concurrent.futures.ThreadPoolExecutor() as executor:
+                max_workers = self.n_jobs if self.n_jobs > 0 else None
+                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                     futures = [executor.submit(analyze_segment, s) for s in range(self.nseg)]
                     for future in concurrent.futures.as_completed(futures):
                         try:
