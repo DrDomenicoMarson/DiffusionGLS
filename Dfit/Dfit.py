@@ -251,6 +251,7 @@ class Dcov():
                     if not self.multi:
                         # In single mode, all_trajs has 1 element
                         full_z = all_trajs[0]
+                        converged_all_dims = True
                         for d in range(self.ndim):
                             z_dim = full_z[:, d]
                             z_strided = z_dim[::step]
@@ -259,7 +260,9 @@ class Dcov():
                             n = len(z_strided) - 1
                             msd = math_utils.compute_MSD_1D_via_correlation(z_strided)[1:(self.m+1)]
                             self.a2full[t,d], self.s2full[t,d], converged = math_utils.calc_gls(n, self.m, msd, self.d2max, self.nitmax)
-                            if not converged: non_converged_count += 1
+                            if not converged: converged_all_dims = False
+                        
+                        if not converged_all_dims: non_converged_count += 1
                         
                         a2full_3D = np.sum(self.a2full[t])
                         s2full_3D = np.sum(self.s2full[t])
@@ -338,7 +341,9 @@ class Dcov():
                     progbar.update(t)
         
         if non_converged_count > 0:
-            print(f"WARNING: Optimizer did not converge in {non_converged_count} cases. Falling back to M=2 for those cases.")
+            total_cases = (self.tmax - self.tmin + 1) * (self.nseg + (1 if not self.multi else 0))
+            percent_failed = (non_converged_count / total_cases) * 100
+            print(f"WARNING: Optimizer did not converge in {non_converged_count} cases ({percent_failed:.1f}% of Total {total_cases}). Falling back to M=2 for those cases.")
 
     # Output and plotting
     def analysis(self, tc: float | str = 10):
