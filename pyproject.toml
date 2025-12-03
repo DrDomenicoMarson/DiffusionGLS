@@ -5,11 +5,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "Dfit"
-version = "0.2.1"
+version = "0.3"
 description = "Diffusion Coefficient Fitting using Generalized Least Squares"
 readme = "README.md"
 authors = [
   { name="Sören von Bülow", email="soeren.buelow@biophys.mpg.de" },
+  { name="Domenico Marson", email="domenico87@gmail.com" },
 ]
 license = { text = "GPLv3" }
 requires-python = ">=3.11"
@@ -26,9 +27,6 @@ dependencies = [
     "matplotlib",
     "progressbar2",
 ]
-
-[project.urls]
-"Homepage" = "https://github.com/hummerlab/DiffusionGLS"
 
 [tool.pytest.ini_options]
 minversion = "6.0"
