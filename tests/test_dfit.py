@@ -35,13 +35,13 @@ def test_reader_text(random_walk_file):
     assert trajs[0].shape[0] == 5001
 
 def test_dcov_initialization(random_walk_file):
-    dcov = Dcov(fz=random_walk_file, m=10, tmax=20)
+    dcov = Dcov(fz=random_walk_file, m=10, tmax=20.0)
     assert dcov.ndim == 3
     assert dcov.n == 5000
     assert dcov.dt == 1.0
 
 def test_run_dfit(random_walk_file):
-    dcov = Dcov(fz=random_walk_file, m=10, tmax=20, nseg=5)
+    dcov = Dcov(fz=random_walk_file, m=10, tmax=20.0, nseg=5)
     dcov.run_Dfit()
     dcov.analysis(tc=10)
     
@@ -57,7 +57,7 @@ def test_run_dfit(random_walk_file):
     assert np.all(dcov.D > 0)
 
 def test_finite_size_correction(random_walk_file):
-    dcov = Dcov(fz=random_walk_file, m=10, tmax=20)
+    dcov = Dcov(fz=random_walk_file, m=10, tmax=20.0)
     dcov.run_Dfit()
     dcov.analysis(tc=10)
     
@@ -82,7 +82,7 @@ def test_finite_size_correction(random_walk_file):
     assert np.isclose(dcov.Dcor[itc], expected_Dcor)
 
 def test_timestep_index(random_walk_file):
-    dcov = Dcov(fz=random_walk_file, dt=0.5, tmin=2, tmax=20)
+    dcov = Dcov(fz=random_walk_file, dt=0.5, tmin=1.0, tmax=10.0)
     
     # Valid tc
     idx = dcov._timestep_index(2.0) # 2.0 / 0.5 = 4 steps. tmin is 2 steps (idx 0). So 4 steps is idx 2?
@@ -99,3 +99,18 @@ def test_timestep_index(random_walk_file):
     # Invalid tc (out of range)
     with pytest.raises(ValueError, match="outside"):
         dcov._timestep_index(1000.0)
+
+def test_auto_tc(random_walk_file):
+    dcov = Dcov(fz=random_walk_file, m=10, tmax=20.0)
+    dcov.run_Dfit()
+    
+    # Run with auto
+    dcov.analysis(tc='auto')
+    
+    # Check if output file exists
+    assert os.path.exists('D_analysis.dat')
+    
+    # We can't easily assert WHICH tc was chosen without parsing stdout or checking internals,
+    # but we can check that it didn't crash and produced output.
+    # Ideally we would check if the chosen Q is close to 0.5, but with random walk data it might vary.
+    # Let's just ensure it runs.

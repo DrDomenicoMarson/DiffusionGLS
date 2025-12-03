@@ -125,11 +125,13 @@ def calc_gls(n,m,v,d2max,nitmax):
     a2est, s2est, _s2varest = gls_closed(n,v)
     a2, s2, nit = gls_iter(n,m,v,a2est,s2est,d2max,nitmax)
 
+    converged = True
     if nit >= nitmax:
-        print('WARNING: Optimizer did not converge. Falling back to M=2.')
+        # print('WARNING: Optimizer did not converge. Falling back to M=2.')
         a2, s2 = a2est, s2est # use M=2 result
+        converged = False
 
-    return a2, s2
+    return a2, s2, converged
 
 @nb.jit(nopython=True)
 def calc_chi2(m,a2_3D,s2_3D,msds_3D,cinv,ndim):

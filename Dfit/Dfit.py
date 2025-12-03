@@ -43,7 +43,7 @@ def calc_q(n,m,a2_3D,s2_3D,msds_3D,a2full_3D,s2full_3D,ndim):
 
 class Dcov():
     def __init__(self, fz: TrajectoryInput = None, universe=None, selection=None,
-                 m: int = 20, tmin: int = 1, tmax: int = 100, dt: float = 1.0,
+                 m: int = 20, tmin: float = None, tmax: float = 100.0, dt: float = 1.0,
                  d2max: float = 1e-10, nitmax: int = 100,
                  nseg: int | None = None, imgfmt: str = 'pdf', fout: str = 'D_analysis'):
 
@@ -54,19 +54,25 @@ class Dcov():
         self.ndim = self.reader.ndim
         self.n = self.reader.n_frames - 1 # N is steps, n_frames is points
         
-        # If reader has dt (from MDAnalysis), use it unless overridden?
-        # For now, keep explicit dt as primary if provided, but maybe warn if mismatch?
-        # The original code defaulted dt=1.0. 
-        # Let's trust the user provided dt if it's the default 1.0, but if reader has a real dt, maybe use that?
-        # For backward compatibility, we keep self.dt logic simple.
         self.dt = dt 
-        
         if not math.isclose(self.dt, self.reader.dt, rel_tol=1e-5):
              warnings.warn(f"User provided dt ({self.dt}) differs from reader's dt ({self.reader.dt}). Using provided dt.", UserWarning)
 
         self.m = m
-        self.tmin = tmin
-        self.tmax = tmax
+        
+        # Convert tmin/tmax from ps to steps
+        if tmin is None:
+            self.tmin = 1
+        else:
+            self.tmin = int(round(tmin / self.dt))
+            if self.tmin < 1:
+                self.tmin = 1
+                
+        if tmax is None:
+            self.tmax = int(round(100.0 / self.dt)) # Default 100 ps
+        else:
+            self.tmax = int(round(tmax / self.dt))
+            
         self.d2max = d2max
         self.nitmax = nitmax
 
@@ -163,6 +169,8 @@ class Dcov():
         
         all_trajs = list(self.reader) # List of (N_frames, ndim) arrays
         
+        non_converged_count = 0
+        
         with bar.ProgressBar(max_value=self.tmax-self.tmin+1) as progbar:
             for t, step in enumerate(range(self.tmin, self.tmax+1)):
                 
@@ -173,9 +181,12 @@ class Dcov():
                     for d in range(self.ndim):
                         z_dim = full_z[:, d]
                         z_strided = z_dim[::step]
+                        if len(z_strided) <= self.m:
+                             raise ValueError(f"Trajectory too short (length N={len(z_strided)}) to calculate m={self.m} MSD points at lag time step={step} (t={step*self.dt} ps). Please reduce tmax or m, or use a longer trajectory.")
                         n = len(z_strided) - 1
                         msd = math_utils.compute_MSD_1D_via_correlation(z_strided)[1:(self.m+1)]
-                        self.a2full[t,d], self.s2full[t,d] = math_utils.calc_gls(n, self.m, msd, self.d2max, self.nitmax)
+                        self.a2full[t,d], self.s2full[t,d], converged = math_utils.calc_gls(n, self.m, msd, self.d2max, self.nitmax)
+                        if not converged: non_converged_count += 1
                     
                     a2full_3D = np.sum(self.a2full[t])
                     s2full_3D = np.sum(self.s2full[t])
@@ -206,7 +217,8 @@ class Dcov():
                     for d in range(self.ndim):
                         z_dim = z_analyzed[:, d]
                         msds[d] = math_utils.compute_MSD_1D_via_correlation(z_dim)[1:(self.m+1)]
-                        self.a2[t,s,d], self.s2[t,s,d] = math_utils.calc_gls(n_per_seg_step, self.m, msds[d], self.d2max, self.nitmax)
+                        self.a2[t,s,d], self.s2[t,s,d], converged = math_utils.calc_gls(n_per_seg_step, self.m, msds[d], self.d2max, self.nitmax)
+                        if not converged: non_converged_count += 1
                     
                     msds_3D = np.sum(msds, axis=0)
                     a2_3D = np.sum(self.a2[t,s])
@@ -232,10 +244,13 @@ class Dcov():
                     self.s2full[t] /= step
                 
                 progbar.update(t)
+        
+        if non_converged_count > 0:
+            print(f"WARNING: Optimizer did not converge in {non_converged_count} cases. Falling back to M=2 for those cases.")
 
     # Output and plotting
-    def analysis(self,tc=10):
-        itc = self._timestep_index(tc)
+    def analysis(self, tc: float | str = 10):
+        # Calculate statistics first
         Dseg = self.s2.sum(axis=2) # across dims
         self.Dseg = np.mean(Dseg, axis=1) / (2.*self.ndim*self.dt) # mean across segs, nm^2 / (dt * ps)
         self.Dstd = np.sqrt(self.s2var/ (2.*self.ndim*self.dt)**2) # nm^2 / (dt * ps)
@@ -253,6 +268,25 @@ class Dcov():
         self.q_m = np.mean(self.q, axis=1)
         self.q_std = np.std(self.q, axis=1)
 
+        if tc == 'auto':
+            # Find index where q_m is closest to 0.5
+            # self.q_m is array of shape (tmax-tmin+1,)
+            # We want to minimize abs(q_m - 0.5)
+            # Note: q_m indices correspond to steps tmin...tmax
+            
+            diff = np.abs(self.q_m - 0.5)
+            idx_min = np.argmin(diff)
+            itc = idx_min
+            
+            # Calculate actual tc value for reporting
+            # itc is 0-indexed relative to self.tmin
+            step = self.tmin + itc
+            tc = step * self.dt
+            
+            print(f"Automatically selected tc = {tc:.4g} ps (Q = {self.q_m[itc]:.4f})")
+        else:
+            itc = self._timestep_index(tc)
+
         with open(f'{self.fout}.dat','w') as g:
             g.write("DIFFUSION COEFFICIENT ESTIMATE\n")
             g.write("INPUT:\n")
@@ -263,11 +297,19 @@ class Dcov():
             g.write("Total number of trajectory data points per dim.: {}\n".format(self.n+1))
             g.write("Data points per segment and dim.: {}\n".format(self.nperseg+1))
 
-            g.write("Your chosen diffusion coefficient at {} ps: {} nm^2/ps\n".format(tc,self.D[itc]))
+            g.write("Your chosen diffusion coefficient at {} ps: {:.4e} nm^2/ps\n".format(tc, self.D[itc]))
+            g.write("Your chosen diffusion coefficient at {} ps: {:.4e} cm^2/s\n".format(tc, self.D[itc]*0.01))
             g.write("DIFFUSION COEFFICIENT OUTPUT SUMMARY:\n")
-            g.write("t[ps] D[nm^2/ps] varD[nm^4/ps^2] Q\n")
+            g.write("t[ps] D[nm^2/ps] varD[nm^4/ps^2] Q D[cm^2/s] varD[cm^4/s^2]\n")
             for t,step in enumerate(range(self.tmin, self.tmax+1)):
-                g.write("{:.4g} {:.5g} {:.5g} {:.5f}\n".format(step*self.dt,self.D[t],self.Dstd[t]**2,self.q_m[t]))
+                g.write("{:.4g} {:.5g} {:.5g} {:.5f} {:.5g} {:.5g}\n".format(
+                    step*self.dt,
+                    self.D[t],
+                    self.Dstd[t]**2,
+                    self.q_m[t],
+                    self.D[t]*0.01,
+                    (self.Dstd[t]**2)*0.0001
+                ))
             if self.ndim > 1:
                 g.write("\nDIFFUSION COEFFICIENT PER DIMENSION:\n")
                 g.write("TIMESTEP Dx[nm^2/ps] Dy[nm^2/ps] ...\n")
