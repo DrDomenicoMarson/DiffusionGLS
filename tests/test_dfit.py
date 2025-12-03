@@ -3,6 +3,7 @@ import pytest
 import numpy as np
 import os
 from Dfit.Dfit import Dcov, XI_CUBIC, BOLTZMANN_K
+from Dfit.trajectory_reader import NumpyTextReader
 
 # Mock data generation
 def generate_random_walk(n_steps, dim=3, diffusion_coeff=1.0, dt=1.0):
@@ -22,6 +23,16 @@ def random_walk_file(tmp_path):
     file_path = tmp_path / "test_traj.dat"
     np.savetxt(file_path, traj)
     return str(file_path)
+
+def test_reader_text(random_walk_file):
+    reader = NumpyTextReader(random_walk_file)
+    assert reader.n_segments == 1
+    assert reader.ndim == 3
+    
+    # Iterate
+    trajs = list(reader)
+    assert len(trajs) == 1
+    assert trajs[0].shape[0] == 5001
 
 def test_dcov_initialization(random_walk_file):
     dcov = Dcov(fz=random_walk_file, m=10, tmax=20)
@@ -88,4 +99,3 @@ def test_timestep_index(random_walk_file):
     # Invalid tc (out of range)
     with pytest.raises(ValueError, match="outside"):
         dcov._timestep_index(1000.0)
-

@@ -17,6 +17,7 @@ import progressbar as bar
 from scipy.special import gammainc
 
 from . import math_utils
+from .trajectory_reader import get_reader, TrajectoryReader
 
 TrajectoryInput = str | Path | Sequence[str | Path] | None
 
@@ -40,20 +41,25 @@ def calc_q(n,m,a2_3D,s2_3D,msds_3D,a2full_3D,s2full_3D,ndim):
     return q
 
 class Dcov():
-    def __init__(self, fz: TrajectoryInput = None,
+    def __init__(self, fz: TrajectoryInput = None, universe=None, selection=None,
                  m: int = 20, tmin: int = 1, tmax: int = 100, dt: float = 1.0,
                  d2max: float = 1e-10, nitmax: int = 100,
                  nseg: int | None = None, imgfmt: str = 'pdf', fout: str = 'D_analysis'):
 
-        self.fz = fz
-        if isinstance(self.fz, Sequence) and not isinstance(self.fz, (str, bytes, Path)):
-            self.multi = True
-            print('Analyzing trajectories of multiple molecules from the same simulation.')
-        else:
-            self.multi = False
-            print('Analyzing single trajectory.')
+        # Initialize Reader
+        self.reader: TrajectoryReader = get_reader(fz=fz, universe=universe, selection=selection)
+        
+        # Use reader properties
+        self.ndim = self.reader.ndim
+        self.n = self.reader.n_frames - 1 # N is steps, n_frames is points
+        
+        # If reader has dt (from MDAnalysis), use it unless overridden?
+        # For now, keep explicit dt as primary if provided, but maybe warn if mismatch?
+        # The original code defaulted dt=1.0. 
+        # Let's trust the user provided dt if it's the default 1.0, but if reader has a real dt, maybe use that?
+        # For backward compatibility, we keep self.dt logic simple.
+        self.dt = dt 
 
-        self.dt = dt # Trajecotory timestep in ps
         self.m = m
         self.tmin = tmin
         self.tmax = tmax
@@ -65,26 +71,26 @@ class Dcov():
         self.imgfmt = imgfmt
         self.fout = fout
 
-        if self.multi:
-            self.zs = [np.loadtxt(f).T for f in self.fz]
-            self.z = self.zs[0]  # This is only to determine ndim and n
-        else:
-            self.z = np.loadtxt(self.fz).T # read in timeseries (rows) for each dimensions (columns)
-
-        if len(self.z.shape) > 1: # 2D data or more
-            self.ndim = self.z.shape[0] # number of dimensions
-            self.n = self.z.shape[1] - 1 # length of timeseries N+1
-        else:
-            self.ndim = 1
-            self.n = self.z.shape[0] - 1 # length of timeseries N+1
         print(f'N = {self.n}')
         print(f'ndim = {self.ndim}')
-        total_points = self.n + 1
-        if self.multi:
-            self.nseg = len(self.fz) # number of individual molecules
-            self.nperseg = self.n # all molecules from trajectory with same length
+        
+        # Segment Logic
+        # Case 1: Multiple molecules (from list or MDAnalysis residues)
+        # Case 2: Single long trajectory to be segmented
+        
+        self.n_molecules = self.reader.n_segments
+        
+        if self.n_molecules > 1:
+            print(f'Analyzing trajectories of {self.n_molecules} molecules.')
+            self.multi = True # Keep flag for internal logic if needed, or refactor it away
+            self.nseg = self.n_molecules
+            self.nperseg = self.n
         else:
-            auto_nseg = int(total_points / (100. * self.tmax)) # number of segments
+            print('Analyzing single trajectory.')
+            self.multi = False
+            total_points = self.n + 1
+            auto_nseg = int(total_points / (100. * self.tmax))
+            
             if nseg is None:
                 if auto_nseg < 1:
                     raise ValueError('Timeseries too short! Reduce tmax or provide nseg >= 1')
@@ -92,27 +98,30 @@ class Dcov():
             else:
                 if nseg < 1:
                     raise ValueError('nseg must be at least 1')
-                if auto_nseg > 0 and nseg > auto_nseg: # too many segments chosen
+                if auto_nseg > 0 and nseg > auto_nseg:
                     print(f"Warning, too many segments chosen, falling back to nseg = {auto_nseg}")
                     self.nseg = auto_nseg
                 else:
                     self.nseg = nseg
-            self.nperseg = int(total_points / self.nseg) - 1 # length of segment timeseries Nperseg+1
+            
+            self.nperseg = int(total_points / self.nseg) - 1
             if self.nperseg < 1:
                 raise ValueError(f'nseg={self.nseg} yields segment length < 2 points; reduce nseg or use a longer trajectory')
-            self.a2full = np.zeros((self.tmax-self.tmin+1,self.ndim)) # full trajectory, per dim
-            self.s2full = np.zeros((self.tmax-self.tmin+1,self.ndim)) # full trajectory, per dim
 
         if self.m > self.nperseg:
-            self.m = self.nperseg # force self.m to not be larger than Nperseg
+            self.m = self.nperseg
 
-        self.a2 = np.zeros((self.tmax-self.tmin+1,self.nseg,self.ndim))  # per segment and dims
-        self.s2 = np.zeros((self.tmax-self.tmin+1,self.nseg,self.ndim))  # per segment and dims
+        # Arrays
+        self.a2full = np.zeros((self.tmax-self.tmin+1, self.ndim))
+        self.s2full = np.zeros((self.tmax-self.tmin+1, self.ndim))
 
-        self.s2var = np.zeros((self.tmax-self.tmin+1)) # mean across all segments and dims
-        self.q = np.zeros((self.tmax-self.tmin+1,self.nseg)) # per segment, mean across dims
+        self.a2 = np.zeros((self.tmax-self.tmin+1, self.nseg, self.ndim))
+        self.s2 = np.zeros((self.tmax-self.tmin+1, self.nseg, self.ndim))
 
-        # initialize som stuff that will be computed within the analysis method
+        self.s2var = np.zeros((self.tmax-self.tmin+1))
+        self.q = np.zeros((self.tmax-self.tmin+1, self.nseg))
+
+        # Results
         self.Dseg = None
         self.Dstd = None
         self.Dperdim = None
@@ -132,64 +141,91 @@ class Dcov():
         return itc
 
     def run_Dfit(self):
-        """ Main Function to calculate the stepsize sigma^2 and offset a^2 of a 
-            random walk with noise.
-        """
+        """ Main Function to calculate the stepsize sigma^2 and offset a^2. """
+        
+        # Pre-load data if it fits in memory or iterate?
+        # The original code loaded everything. 
+        # Our reader yields full trajectories.
+        # To avoid re-reading for every 'step' in the outer loop, we should probably load it once
+        # IF we can afford it.
+        # The outer loop iterates over 'step' (lag time).
+        # We need the full trajectory for every lag time calculation?
+        # Actually, the original code sliced: z[::step].
+        
+        # Optimization: Read all data into a list of arrays once.
+        # If memory is an issue, we would need to re-read from disk/MDA every time, which is slow.
+        # Let's assume we load it.
+        
+        all_trajs = list(self.reader) # List of (N_frames, ndim) arrays
+        
         with bar.ProgressBar(max_value=self.tmax-self.tmin+1) as progbar:
-            for t,step in enumerate(range(self.tmin,self.tmax+1)):
-                # Full trajectory s2, a2
+            for t, step in enumerate(range(self.tmin, self.tmax+1)):
+                
+                # 1. Full Trajectory Analysis (Only for Single Trajectory mode)
                 if not self.multi:
+                    # In single mode, all_trajs has 1 element
+                    full_z = all_trajs[0]
                     for d in range(self.ndim):
-                        if self.ndim == 1:
-                            z = self.z[::step] # full traj
-                        else:
-                            z = self.z[d,::step] # full traj
-                        n = len(z) - 1
-                        msd = math_utils.compute_MSD_1D_via_correlation(z)[1:(self.m+1)]
-                        self.a2full[t,d], self.s2full[t,d] = math_utils.calc_gls(n,self.m,msd,self.d2max,self.nitmax)
-
-                    a2full_3D = np.sum(self.a2full[t]) # sum across dims
-                    s2full_3D = np.sum(self.s2full[t]) # sum across dims
-
-                # segments
-                n = int(self.nperseg / step) # per segment for given timestep
-                # print('length N per seg = {}'.format(n))
+                        z_dim = full_z[:, d]
+                        z_strided = z_dim[::step]
+                        n = len(z_strided) - 1
+                        msd = math_utils.compute_MSD_1D_via_correlation(z_strided)[1:(self.m+1)]
+                        self.a2full[t,d], self.s2full[t,d] = math_utils.calc_gls(n, self.m, msd, self.d2max, self.nitmax)
+                    
+                    a2full_3D = np.sum(self.a2full[t])
+                    s2full_3D = np.sum(self.s2full[t])
+                
+                # 2. Segment Analysis
+                # If multi: iterate over molecules
+                # If single: iterate over segments of the single trajectory
+                
+                n_per_seg_step = int(self.nperseg / step)
+                
                 for s in range(self.nseg):
-                    msds = np.zeros((self.ndim,self.m)) # dimensions
-                    if self.multi: 
-                        self.z = self.zs[s]
-                        zstart = None
-                        zend = None
-                    else:
-                        zstart = s * (self.nperseg+1)
-                        zend = (s+1) * (self.nperseg+1)
-                    for d in range(self.ndim):
-                        if self.ndim == 1:
-                            z = self.z[zstart:zend:step] # copy segment from trajectory
-                        else:
-                            z = self.z[d,zstart:zend:step] # copy segment from trajectory
-                        msds[d] = math_utils.compute_MSD_1D_via_correlation(z)[1:(self.m+1)]
-                        self.a2[t,s,d], self.s2[t,s,d] = math_utils.calc_gls(n,self.m,msds[d],self.d2max,self.nitmax)
-                    msds_3D = np.sum(msds,axis=0) # --> MSD_3D per deltaT and segment
-                    a2_3D = np.sum(self.a2[t,s]) # sum across dims
-                    s2_3D = np.sum(self.s2[t,s]) # sum across dims
-
+                    msds = np.zeros((self.ndim, self.m))
+                    
+                    # Get the segment data
                     if self.multi:
-                        self.q[t,s] = calc_q(n,self.m,a2_3D,s2_3D,msds_3D,a2_3D,s2_3D,self.ndim) # no 'full' trajectory to use
+                        # Segment s is molecule s
+                        seg_z = all_trajs[s]
+                        # Stride it
+                        z_analyzed = seg_z[::step, :]
                     else:
-                        self.q[t,s] = calc_q(n,self.m,a2_3D,s2_3D,msds_3D,a2full_3D,s2full_3D,self.ndim) # use a2full_3D and s2full_3D from 'full' trajectory for cinv
+                        # Segment s is a slice of the single trajectory
+                        full_z = all_trajs[0]
+                        zstart = s * (self.nperseg + 1)
+                        zend = (s + 1) * (self.nperseg + 1)
+                        z_analyzed = full_z[zstart:zend:step, :]
 
-                a2m = np.mean(self.a2[t],axis=0) # mean across segments, per dim
-                s2m = np.mean(self.s2[t],axis=0) # mean across segments, per dim
+                    # Analyze per dimension
+                    for d in range(self.ndim):
+                        z_dim = z_analyzed[:, d]
+                        msds[d] = math_utils.compute_MSD_1D_via_correlation(z_dim)[1:(self.m+1)]
+                        self.a2[t,s,d], self.s2[t,s,d] = math_utils.calc_gls(n_per_seg_step, self.m, msds[d], self.d2max, self.nitmax)
+                    
+                    msds_3D = np.sum(msds, axis=0)
+                    a2_3D = np.sum(self.a2[t,s])
+                    s2_3D = np.sum(self.s2[t,s])
+                    
+                    if self.multi:
+                        self.q[t,s] = calc_q(n_per_seg_step, self.m, a2_3D, s2_3D, msds_3D, a2_3D, s2_3D, self.ndim)
+                    else:
+                        self.q[t,s] = calc_q(n_per_seg_step, self.m, a2_3D, s2_3D, msds_3D, a2full_3D, s2full_3D, self.ndim)
 
-                self.s2var[t] = math_utils.eval_vars(n,self.m,a2m,s2m,self.ndim) # a2 and s2 are mean over segments, but still per dim (and for given timestp)
-            
+                # 3. Averaging
+                a2m = np.mean(self.a2[t], axis=0)
+                s2m = np.mean(self.s2[t], axis=0)
+                
+                self.s2var[t] = math_utils.eval_vars(n_per_seg_step, self.m, a2m, s2m, self.ndim)
+                
+                # Normalize by step
                 self.a2[t] /= step
                 self.s2[t] /= step
                 self.s2var[t] /= step**2
                 if not self.multi:
                     self.a2full[t] /= step
                     self.s2full[t] /= step
+                
                 progbar.update(t)
 
     # Output and plotting
@@ -215,7 +251,7 @@ class Dcov():
         with open(f'{self.fout}.dat','w') as g:
             g.write("DIFFUSION COEFFICIENT ESTIMATE\n")
             g.write("INPUT:\n")
-            g.write("Trajectory: {}\n".format(self.fz))
+            # g.write("Trajectory: {}\n".format(self.fz)) # fz might be None now
             g.write("Number of dimensions : {}\n".format(self.ndim))
             g.write("Min/max timestep: {}/{}\n".format(self.tmin,self.tmax))
             g.write("Number of segments: {}\n".format(self.nseg))
