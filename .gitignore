@@ -1,2 +1,12 @@
 Dfit/__pycache__/*.pyc
 .DS_Store
+.venv/lib64
+.venv/pyvenv.cfg
+.venv/bin/python
+.venv/bin/python3
+.venv/bin/python3.12
+Dfit.egg-info/dependency_links.txt
+Dfit.egg-info/PKG-INFO
+Dfit.egg-info/requires.txt
+Dfit.egg-info/SOURCES.txt
+Dfit.egg-info/top_level.txt

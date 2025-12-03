@@ -12,13 +12,13 @@ authors = [
   { name="Sören von Bülow", email="soeren.buelow@biophys.mpg.de" },
   { name="Domenico Marson", email="domenico87@gmail.com" },
 ]
-license = { text = "GPLv3" }
+license = { text = "GPL-3.0-only" }
 requires-python = ">=3.11"
 classifiers = [
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
     "Operating System :: OS Independent",
 ]
+
 dependencies = [
     "numpy",
     "scipy",
@@ -27,6 +27,10 @@ dependencies = [
     "matplotlib",
     "progressbar2",
 ]
+
+[tool.setuptools.packages.find]
+include = ["Dfit*"]
+exclude = ["Example*"]
 
 [tool.pytest.ini_options]
 minversion = "6.0"
