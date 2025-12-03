@@ -213,6 +213,23 @@ class Dcov():
                         zend = (s + 1) * (self.nperseg + 1)
                         z_analyzed = full_z[zstart:zend:step, :]
 
+                    if len(z_analyzed) <= self.m:
+                        # Calculate suggestions
+                        # Max m possible: len(z_analyzed) - 1
+                        max_m_possible = len(z_analyzed) - 1
+                        
+                        # Max tmax possible for current m:
+                        # len = N_seg / step. We need len > m.
+                        # N_seg / step > m => step < N_seg / m
+                        # t = step * dt < (N_seg / m) * dt
+                        max_tmax_possible = (self.nperseg / self.m) * self.dt
+                        
+                        raise ValueError(f"Segment too short (length N={len(z_analyzed)}) to calculate m={self.m} MSD points at lag time step={step} (t={step*self.dt} ps).\n"
+                                         f"Suggestions:\n"
+                                         f"  - Reduce m to at most {max_m_possible}\n"
+                                         f"  - Reduce tmax to less than {max_tmax_possible:.1f} ps\n"
+                                         f"  - Use a longer trajectory")
+
                     # Analyze per dimension
                     for d in range(self.ndim):
                         z_dim = z_analyzed[:, d]
