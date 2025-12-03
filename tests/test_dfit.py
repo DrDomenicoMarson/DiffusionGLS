@@ -26,7 +26,7 @@ def random_walk_file(tmp_path):
 
 def test_reader_text(random_walk_file):
     reader = NumpyTextReader(random_walk_file)
-    assert reader.n_segments == 1
+    assert reader.n_trajs == 1
     assert reader.ndim == 3
     
     # Iterate

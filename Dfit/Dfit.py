@@ -10,6 +10,7 @@
 import math
 from collections.abc import Sequence
 from pathlib import Path
+import warnings
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -59,6 +60,9 @@ class Dcov():
         # Let's trust the user provided dt if it's the default 1.0, but if reader has a real dt, maybe use that?
         # For backward compatibility, we keep self.dt logic simple.
         self.dt = dt 
+        
+        if not math.isclose(self.dt, self.reader.dt, rel_tol=1e-5):
+             warnings.warn(f"User provided dt ({self.dt}) differs from reader's dt ({self.reader.dt}). Using provided dt.", UserWarning)
 
         self.m = m
         self.tmin = tmin
@@ -71,14 +75,15 @@ class Dcov():
         self.imgfmt = imgfmt
         self.fout = fout
 
-        print(f'N = {self.n}')
-        print(f'ndim = {self.ndim}')
+        print(f'Num trajectories/molecules = {self.reader.n_trajs}')
+        print(f'Num steps (num frames -1) = {self.n}')
+        print(f'Num dimensions = {self.ndim}')
         
         # Segment Logic
         # Case 1: Multiple molecules (from list or MDAnalysis residues)
         # Case 2: Single long trajectory to be segmented
         
-        self.n_molecules = self.reader.n_segments
+        self.n_molecules = self.reader.n_trajs
         
         if self.n_molecules > 1:
             print(f'Analyzing trajectories of {self.n_molecules} molecules.')

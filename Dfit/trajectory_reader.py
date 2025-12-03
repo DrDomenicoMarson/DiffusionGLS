@@ -15,7 +15,7 @@ class TrajectoryReader:
     def __init__(self):
         self.n_frames = 0
         self.ndim = 3
-        self.n_segments = 0
+        self.n_trajs = 0
         self.dt = 1.0 # Default, can be overridden
 
     def __iter__(self) -> Iterator[np.ndarray]:
@@ -34,10 +34,10 @@ class NumpyTextReader(TrajectoryReader):
         else:
             raise TypeError(f"Invalid input type for NumpyTextReader: {type(fz)}")
         
-        self.n_segments = len(self.files)
+        self.n_trajs = len(self.files)
         
         # Read first file to determine properties
-        if self.n_segments > 0:
+        if self.n_trajs > 0:
             first_traj = np.loadtxt(self.files[0])
             # Handle 1D vs Multi-D
             if len(first_traj.shape) == 1:
@@ -51,9 +51,13 @@ class NumpyTextReader(TrajectoryReader):
         for f in self.files:
             data = np.loadtxt(f)
             if len(data.shape) == 1:
-                yield data.reshape(-1, 1) # Ensure (N, 1) for 1D
-            else:
-                yield data
+                data = data.reshape(-1, 1) # Ensure (N, 1) for 1D, as np.loadtxt returns (N,)
+
+            # Check consistency
+            if data.shape[1] != self.ndim:
+                raise ValueError(f"Trajectory file {f} has {data.shape[1]} dimensions, expected {self.ndim} based on first file.")
+                
+            yield data
 
 class MDAnalysisReader(TrajectoryReader):
     """Reads trajectories using MDAnalysis."""
@@ -85,9 +89,9 @@ class MDAnalysisReader(TrajectoryReader):
         # We treat each RESIDUE in the selection as a separate segment/molecule
         # This is a common assumption for diffusion (e.g. water, lipids, proteins)
         # If the selection is a single large molecule (like a protein), n_segments=1
-        self.n_segments = self.ag.n_residues
+        self.n_trajs = self.ag.n_residues
         
-        if self.n_segments == 0:
+        if self.n_trajs == 0:
             warnings.warn("Selection contains 0 residues.")
 
     def __iter__(self) -> Iterator[np.ndarray]:
@@ -109,35 +113,45 @@ class MDAnalysisReader(TrajectoryReader):
         # Let's try a smarter way using MDAnalysis's built-in analysis if possible,
         # or just iterate frames and accumulate.
         
-        trajs = np.zeros((self.n_segments, self.n_frames, 3), dtype=np.float32)
+        trajs = np.zeros((self.n_trajs, self.n_frames, 3), dtype=np.float32)
         
         # Map residues to indices
         res_indices = {r.resindex: i for i, r in enumerate(self.ag.residues)}
         
-        # Iterate trajectory once
-        for i_frame, ts in enumerate(self.u.trajectory):
-            # Calculate COM for each residue in the selection
-            # This loop over residues might be slow in Python for 10k waters.
-            # Faster: self.ag.center_of_mass(compound='residues')
-            
-            # Note: compound='residues' returns (n_residues, 3)
-            # We need to make sure the order matches our iteration
-            
-            # MDAnalysis 2.0+ supports compound='residues'
-            try:
-                coms = self.ag.center_of_mass(compound='residues')
-                trajs[:, i_frame, :] = coms
-            except (TypeError, ValueError):
-                # Fallback for older MDA or if compound not supported
-                for i, res in enumerate(self.ag.residues):
-                    trajs[i, i_frame, :] = res.atoms.center_of_mass()
+        # Check for single-atom residues optimization
+        if self.ag.n_atoms == self.n_trajs:
+            print("Optimization: Single-atom residues detected. Using atom positions directly.")
+            for i_frame, ts in enumerate(self.u.trajectory):
+                trajs[:, i_frame, :] = self.ag.positions
+        else:
+            # Iterate trajectory once
+            for i_frame, ts in enumerate(self.u.trajectory):
+                # Calculate COM for each residue in the selection
+                # This loop over residues might be slow in Python for 10k waters.
+                # Faster: self.ag.center_of_mass(compound='residues')
+                
+                # Note: compound='residues' returns (n_residues, 3)
+                # We need to make sure the order matches our iteration
+                
+                # MDAnalysis 2.0+ supports compound='residues'
+                try:
+                    coms = self.ag.center_of_mass(compound='residues')
+                    trajs[:, i_frame, :] = coms
+                except (TypeError, ValueError):
+                    # Fallback for older MDA or if compound not supported
+                    for i, res in enumerate(self.ag.residues):
+                        trajs[i, i_frame, :] = res.atoms.center_of_mass()
         
         # Yield them
-        for i in range(self.n_segments):
+        for i in range(self.n_trajs):
             yield trajs[i]
 
 def get_reader(fz=None, universe=None, selection=None) -> TrajectoryReader:
     """Factory function to get the appropriate reader."""
+    if fz is not None and universe is not None:
+        raise ValueError("Cannot provide both 'fz' and 'universe'.")
+    if fz is not None and selection is not None:
+        warnings.warn("'selection' is ignored when 'fz' is provided.")
     if universe is not None:
         return MDAnalysisReader(universe, selection)
     elif fz is not None:
