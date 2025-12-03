@@ -78,13 +78,14 @@ def calc_a2s2(m,v,cinv, a2, s2):
     d2=(s2n-s2)**2+(a2n-a2)**2
     return a2n, s2n, d2
 
-def gls_closed(n,v):
+def gls_closed(n,v, c=None):
     """
     Closed-form GLS estimation of offset a^2 and variance sigma^2.
     """
 
     # c = setupc(2,n)
-    c = setupc(2,n) # setups of cov matrix
+    if c is None:
+        c = setupc(2,n) # setups of cov matrix
 
     s2 = v[1]-v[0]
     a2 = 2*v[0] - v[1]
@@ -97,7 +98,7 @@ def gls_closed(n,v):
 
     return a2, s2, s2var
 
-def gls_iter(n,m,v,a2,s2,d2max,nitmax):
+def gls_iter(n,m,v,a2,s2,d2max,nitmax, c=None):
     """
     Iteratively optimize offset a^2 and variance sigma^2
     of fit to MSD for Gaussian random walk with noise
@@ -107,7 +108,8 @@ def gls_iter(n,m,v,a2,s2,d2max,nitmax):
     nit = 0
     d2 = d2max + 1.e5
 
-    c = setupc(m,n) # setups of cov matrix
+    if c is None:
+        c = setupc(m,n) # setups of cov matrix
 
     while (nit < nitmax) and (d2 > d2max):
         nit = nit+1
@@ -121,9 +123,9 @@ def gls_iter(n,m,v,a2,s2,d2max,nitmax):
 
     return a2, s2, nit
 
-def calc_gls(n,m,v,d2max,nitmax):
-    a2est, s2est, _s2varest = gls_closed(n,v)
-    a2, s2, nit = gls_iter(n,m,v,a2est,s2est,d2max,nitmax)
+def calc_gls(n,m,v,d2max,nitmax, c2=None, cm=None):
+    a2est, s2est, _s2varest = gls_closed(n,v, c=c2)
+    a2, s2, nit = gls_iter(n,m,v,a2est,s2est,d2max,nitmax, c=cm)
 
     converged = True
     if nit >= nitmax:

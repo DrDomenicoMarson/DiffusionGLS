@@ -11,6 +11,7 @@ import math
 from collections.abc import Sequence
 from pathlib import Path
 import warnings
+import concurrent.futures
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -195,10 +196,26 @@ class Dcov():
                 # If multi: iterate over molecules
                 # If single: iterate over segments of the single trajectory
                 
+                # 2. Segment Analysis
+                # If multi: iterate over molecules
+                # If single: iterate over segments of the single trajectory
+                
                 n_per_seg_step = int(self.nperseg / step)
                 
-                for s in range(self.nseg):
+                # Pre-calculate covariance matrices for this step
+                # We need c2 (m=2) and cm (m=self.m)
+                # n depends on segment length.
+                # For segments, length is n_per_seg_step + 1 points.
+                # n passed to calc_gls is len(z) - 1 = n_per_seg_step.
+                
+                c2_pre = math_utils.setupc(2, n_per_seg_step)
+                cm_pre = math_utils.setupc(self.m, n_per_seg_step)
+                
+                def analyze_segment(s):
                     msds = np.zeros((self.ndim, self.m))
+                    res_a2 = np.zeros(self.ndim)
+                    res_s2 = np.zeros(self.ndim)
+                    res_converged = True
                     
                     # Get the segment data
                     if self.multi:
@@ -215,13 +232,7 @@ class Dcov():
 
                     if len(z_analyzed) <= self.m:
                         # Calculate suggestions
-                        # Max m possible: len(z_analyzed) - 1
                         max_m_possible = len(z_analyzed) - 1
-                        
-                        # Max tmax possible for current m:
-                        # len = N_seg / step. We need len > m.
-                        # N_seg / step > m => step < N_seg / m
-                        # t = step * dt < (N_seg / m) * dt
                         max_tmax_possible = (self.nperseg / self.m) * self.dt
                         
                         raise ValueError(f"Segment too short (length N={len(z_analyzed)}) to calculate m={self.m} MSD points at lag time step={step} (t={step*self.dt} ps).\n"
@@ -234,17 +245,34 @@ class Dcov():
                     for d in range(self.ndim):
                         z_dim = z_analyzed[:, d]
                         msds[d] = math_utils.compute_MSD_1D_via_correlation(z_dim)[1:(self.m+1)]
-                        self.a2[t,s,d], self.s2[t,s,d], converged = math_utils.calc_gls(n_per_seg_step, self.m, msds[d], self.d2max, self.nitmax)
-                        if not converged: non_converged_count += 1
+                        # Pass pre-calculated matrices
+                        res_a2[d], res_s2[d], conv = math_utils.calc_gls(n_per_seg_step, self.m, msds[d], self.d2max, self.nitmax, c2=c2_pre, cm=cm_pre)
+                        if not conv: res_converged = False
                     
                     msds_3D = np.sum(msds, axis=0)
-                    a2_3D = np.sum(self.a2[t,s])
-                    s2_3D = np.sum(self.s2[t,s])
+                    a2_3D = np.sum(res_a2)
+                    s2_3D = np.sum(res_s2)
                     
                     if self.multi:
-                        self.q[t,s] = calc_q(n_per_seg_step, self.m, a2_3D, s2_3D, msds_3D, a2_3D, s2_3D, self.ndim)
+                        q_val = calc_q(n_per_seg_step, self.m, a2_3D, s2_3D, msds_3D, a2_3D, s2_3D, self.ndim)
                     else:
-                        self.q[t,s] = calc_q(n_per_seg_step, self.m, a2_3D, s2_3D, msds_3D, a2full_3D, s2full_3D, self.ndim)
+                        q_val = calc_q(n_per_seg_step, self.m, a2_3D, s2_3D, msds_3D, a2full_3D, s2full_3D, self.ndim)
+                        
+                    return s, res_a2, res_s2, q_val, res_converged
+
+                # Use ThreadPoolExecutor for parallel processing
+                # Numba releases GIL, so threads are effective
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    futures = [executor.submit(analyze_segment, s) for s in range(self.nseg)]
+                    for future in concurrent.futures.as_completed(futures):
+                        try:
+                            s, res_a2, res_s2, q_val, res_converged = future.result()
+                            self.a2[t,s] = res_a2
+                            self.s2[t,s] = res_s2
+                            self.q[t,s] = q_val
+                            if not res_converged: non_converged_count += 1
+                        except Exception as exc:
+                            raise exc
 
                 # 3. Averaging
                 a2m = np.mean(self.a2[t], axis=0)
