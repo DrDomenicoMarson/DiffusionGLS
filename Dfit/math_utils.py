@@ -51,6 +51,13 @@ def calc_cov(n,m,c,a2,s2):
 
 @nb.jit(nopython=True)
 def inv_mat(A):
+    # Regularization to prevent singularity
+    # We need to copy A to avoid modifying the input if it's used elsewhere
+    # But A is usually created in calc_cov.
+    # Let's add epsilon to diagonal.
+    n = A.shape[0]
+    for i in range(n):
+        A[i,i] += 1e-6
     cinv = np.linalg.inv(A)
     return cinv
 
