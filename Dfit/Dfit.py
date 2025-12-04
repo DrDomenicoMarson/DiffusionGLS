@@ -332,7 +332,7 @@ class Dcov():
                         self.a2full[t] /= step
                         self.s2full[t] /= step
                     
-                    progbar.update(t)
+                    progbar.update(t+1)
         
         self.non_converged_count = non_converged_count
         self.total_cases = (self.tmax - self.tmin + 1) * (self.nseg + (1 if not self.multi else 0))
