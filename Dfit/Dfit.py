@@ -434,13 +434,15 @@ class Dcov():
             # Calculate actual tc value for reporting
             # itc is 0-indexed relative to self.tmin
             step = self.tmin + itc
-            tc = step * self.dt
-            tc_disp = tc / self.time_scale
+            tc_ps = step * self.dt  # ps
+            tc_disp = tc_ps / self.time_scale  # user unit
             
             print(f"Automatically selected tc = {tc_disp:.4g} {self.time_unit} (Q = {self.q_m[itc]:.4f})")
         else:
             itc = self._timestep_index(tc)
-            tc_disp = tc / self.time_scale
+            step = self.tmin + itc
+            tc_ps = step * self.dt  # ps
+            tc_disp = tc_ps / self.time_scale  # user unit
 
         # store selected tc for later access
         self.tc_selected_idx = itc
@@ -484,7 +486,7 @@ class Dcov():
                 for step, Dt in zip(range(self.tmin, self.tmax+1), self.Dperdim):
                     g.write(f"{(step*self.dt)/self.time_scale:.4f} {Dperdim_out[step-self.tmin]}\n")
         
-        self.plot_results(tc)
+        self.plot_results(tc_ps)
 
     def plot_results(self, tc):
         sns.set_context("paper", font_scale=0.5)
