@@ -101,10 +101,10 @@ class Dcov():
                  m: int = 20, tmin: float = None, tmax: float = 100.0, dt: float = 1.0,
                  d2max: float = 1e-10, nitmax: int = 100,
                  nseg: int | None = None, imgfmt: str = 'pdf', fout: str = 'D_analysis',
-                 n_jobs: int = -1):
+                 n_jobs: int = -1, normalize_lengths: bool = False):
 
         # Initialize Reader
-        self.reader: TrajectoryReader = get_reader(fz=fz, universe=universe, selection=selection)
+        self.reader: TrajectoryReader = get_reader(fz=fz, universe=universe, selection=selection, normalize_lengths=normalize_lengths)
         
         # Use reader properties
         self.ndim = self.reader.ndim
@@ -112,8 +112,9 @@ class Dcov():
 
         if hasattr(self.reader, 'lengths'):
             unique_lengths = set(self.reader.lengths)
-            if len(unique_lengths) > 1:
-                raise ValueError(f"All input trajectories must have the same length. Found lengths: {sorted(unique_lengths)}")
+            if len(unique_lengths) > 1 and not getattr(self.reader, 'normalized', False):
+                raise ValueError(f"All input trajectories must have the same length. Found lengths: {sorted(unique_lengths)}. "
+                                 f"Use normalize_lengths=True to truncate to the shortest trajectory.")
         
         self.dt = dt 
         if not math.isclose(self.dt, self.reader.dt, rel_tol=1e-5):

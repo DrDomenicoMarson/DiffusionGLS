@@ -126,6 +126,25 @@ def test_mismatched_lengths_error(tmp_path):
     with pytest.raises(ValueError, match="length"):
         Dcov(fz=[str(file1), str(file2)])
 
+def test_mismatched_lengths_normalize(tmp_path):
+    n1 = 200
+    n2 = 150
+    traj1 = generate_random_walk(n_steps=n1, dim=3)
+    traj2 = generate_random_walk(n_steps=n2, dim=3)
+    file1 = tmp_path / "traj1.dat"
+    file2 = tmp_path / "traj2.dat"
+    np.savetxt(file1, traj1)
+    np.savetxt(file2, traj2)
+
+    min_len = min(n1, n2) + 1  # frames = steps + 1
+    with pytest.warns(UserWarning, match="normalize_lengths"):
+        dcov = Dcov(fz=[str(file1), str(file2)], normalize_lengths=True, m=10, tmax=10.0, fout=str(tmp_path / 'D_analysis_norm'))
+    assert dcov.reader.n_frames == min_len
+    assert dcov.n == min_len - 1
+
+    dcov.run_Dfit()
+    dcov.analysis(tc=10)
+
 def test_short_trajectory_error(tmp_path):
     # Create a short trajectory
     # N=40, m=20, tmax=5.0 (5 steps).

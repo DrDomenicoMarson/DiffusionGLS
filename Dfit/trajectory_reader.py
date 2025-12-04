@@ -24,10 +24,12 @@ class TrajectoryReader:
 
 class NumpyTextReader(TrajectoryReader):
     """Reads trajectories from text files (legacy format)."""
-    def __init__(self, fz: str | Path | Sequence[str | Path]):
+    def __init__(self, fz: str | Path | Sequence[str | Path], normalize_lengths: bool = False):
         super().__init__()
         self.files = []
         self.lengths = []
+        self.normalize_lengths = normalize_lengths
+        self.normalized = False
         if isinstance(fz, (str, Path)):
             self.files = [fz]
         elif isinstance(fz, Sequence):
@@ -54,11 +56,20 @@ class NumpyTextReader(TrajectoryReader):
                 data = np.loadtxt(f)
                 if len(data.shape) == 1:
                     data = data.reshape(-1, 1)
-                if data.shape[0] != self.n_frames:
-                    raise ValueError(f"Trajectory file {f} length {data.shape[0]} differs from first file length {self.n_frames}")
                 if data.shape[1] != self.ndim:
                     raise ValueError(f"Trajectory file {f} has {data.shape[1]} dimensions, expected {self.ndim} based on first file.")
                 self.lengths.append(data.shape[0])
+
+            unique_lengths = set(self.lengths)
+            if len(unique_lengths) > 1:
+                if not self.normalize_lengths:
+                    raise ValueError(f"All input trajectories must have the same length. Found lengths: {sorted(unique_lengths)}. "
+                                     f"Set normalize_lengths=True to truncate to the shortest trajectory.")
+                self.normalized = True
+                min_len = min(self.lengths)
+                warnings.warn(f"normalize_lengths=True: truncating all {self.n_trajs} trajectories to {min_len} frames "
+                              f"(original lengths: {sorted(unique_lengths)}).", UserWarning)
+                self.n_frames = min_len
 
     def __iter__(self) -> Iterator[np.ndarray]:
         for f in self.files:
@@ -69,8 +80,11 @@ class NumpyTextReader(TrajectoryReader):
             # Check consistency
             if data.shape[1] != self.ndim:
                 raise ValueError(f"Trajectory file {f} has {data.shape[1]} dimensions, expected {self.ndim} based on first file.")
-                
-            yield data
+            
+            if self.normalized:
+                yield data[:self.n_frames]
+            else:
+                yield data
 
 class MDAnalysisReader(TrajectoryReader):
     """Reads trajectories using MDAnalysis."""
@@ -160,15 +174,17 @@ class MDAnalysisReader(TrajectoryReader):
         for i in range(self.n_trajs):
             yield trajs[i]
 
-def get_reader(fz=None, universe=None, selection=None) -> TrajectoryReader:
+def get_reader(fz=None, universe=None, selection=None, normalize_lengths: bool = False) -> TrajectoryReader:
     """Factory function to get the appropriate reader."""
     if fz is not None and universe is not None:
         raise ValueError("Cannot provide both 'fz' and 'universe'.")
     if fz is not None and selection is not None:
         warnings.warn("'selection' is ignored when 'fz' is provided.")
     if universe is not None:
+        if normalize_lengths:
+            warnings.warn("'normalize_lengths' is ignored for MDAnalysis inputs.", UserWarning)
         return MDAnalysisReader(universe, selection)
     elif fz is not None:
-        return NumpyTextReader(fz)
+        return NumpyTextReader(fz, normalize_lengths=normalize_lengths)
     else:
         raise ValueError("Must provide either 'fz' (files) or 'universe' (MDAnalysis).")
