@@ -27,6 +27,7 @@ class NumpyTextReader(TrajectoryReader):
     def __init__(self, fz: str | Path | Sequence[str | Path]):
         super().__init__()
         self.files = []
+        self.lengths = []
         if isinstance(fz, (str, Path)):
             self.files = [fz]
         elif isinstance(fz, Sequence):
@@ -46,6 +47,18 @@ class NumpyTextReader(TrajectoryReader):
             else:
                 self.n_frames = first_traj.shape[0]
                 self.ndim = first_traj.shape[1]
+            self.lengths.append(self.n_frames)
+
+            # Validate remaining files have matching length and dims
+            for f in self.files[1:]:
+                data = np.loadtxt(f)
+                if len(data.shape) == 1:
+                    data = data.reshape(-1, 1)
+                if data.shape[0] != self.n_frames:
+                    raise ValueError(f"Trajectory file {f} length {data.shape[0]} differs from first file length {self.n_frames}")
+                if data.shape[1] != self.ndim:
+                    raise ValueError(f"Trajectory file {f} has {data.shape[1]} dimensions, expected {self.ndim} based on first file.")
+                self.lengths.append(data.shape[0])
 
     def __iter__(self) -> Iterator[np.ndarray]:
         for f in self.files:

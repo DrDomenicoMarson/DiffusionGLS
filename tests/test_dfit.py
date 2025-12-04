@@ -115,6 +115,17 @@ def test_auto_tc(random_walk_file, tmp_path):
     # Ideally we would check if the chosen Q is close to 0.5, but with random walk data it might vary.
     # Let's just ensure it runs.
 
+def test_mismatched_lengths_error(tmp_path):
+    traj1 = generate_random_walk(n_steps=100, dim=3)
+    traj2 = generate_random_walk(n_steps=120, dim=3)
+    file1 = tmp_path / "traj1.dat"
+    file2 = tmp_path / "traj2.dat"
+    np.savetxt(file1, traj1)
+    np.savetxt(file2, traj2)
+
+    with pytest.raises(ValueError, match="length"):
+        Dcov(fz=[str(file1), str(file2)])
+
 def test_short_trajectory_error(tmp_path):
     # Create a short trajectory
     # N=40, m=20, tmax=5.0 (5 steps).

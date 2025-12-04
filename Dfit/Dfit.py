@@ -109,6 +109,11 @@ class Dcov():
         # Use reader properties
         self.ndim = self.reader.ndim
         self.n = self.reader.n_frames - 1 # N is steps, n_frames is points
+
+        if hasattr(self.reader, 'lengths'):
+            unique_lengths = set(self.reader.lengths)
+            if len(unique_lengths) > 1:
+                raise ValueError(f"All input trajectories must have the same length. Found lengths: {sorted(unique_lengths)}")
         
         self.dt = dt 
         if not math.isclose(self.dt, self.reader.dt, rel_tol=1e-5):
