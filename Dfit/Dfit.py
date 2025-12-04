@@ -227,19 +227,6 @@ class Dcov():
         all_trajs = list(self.reader) # List of (N_frames, ndim) arrays
         
         non_converged_count = 0
-        
-        with bar.ProgressBar(max_value=self.tmax-self.tmin+1) as progbar:
-            for t, step in enumerate(range(self.tmin, self.tmax+1)):
-                
-                # 1. Full Trajectory Analysis (Only for Single Trajectory mode)
-                if not self.multi:
-                    # In single mode, all_trajs has 1 element
-                    full_z = all_trajs[0]
-                    for d in range(self.ndim):
-                        z_dim = full_z[:, d]
-                        z_strided = z_dim[::step]
-                        if len(z_strided) <= self.m:
-                             raise ValueError(f"Trajectory too short (length N={len(z_strided)}) to calculate m={self.m} MSD points at lag time step={step} (t={step*self.dt} ps). Please reduce tmax or m, or use a longer trajectory.")
         # Initialize ProcessPoolExecutor outside the loop
         # Use ProcessPoolExecutor to bypass GIL
         max_workers = self.n_jobs if self.n_jobs > 0 else None

@@ -1,5 +1,10 @@
-Dfit/__pycache__/*.pyc
+__pycache__/
+*.pyc
 .DS_Store
 Dfit.egg-info/
 build/
 .venv/
+
+# Generated analysis artifacts
+D_analysis.*
+Example/D_analysis*
