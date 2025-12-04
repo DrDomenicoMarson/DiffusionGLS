@@ -17,7 +17,7 @@ import os
 import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
-import progressbar as bar
+from tqdm import tqdm
 from scipy.special import gammainc
 
 from . import math_utils
@@ -111,7 +111,7 @@ class Dcov():
                  d2max: float = 1e-10, nitmax: int = 100,
                  nseg: int | None = None, imgfmt: str = 'pdf', fout: str = 'D_analysis',
                  n_jobs: int = -1, normalize_lengths: bool = False, time_unit: str = 'ps',
-                 diffusion_unit: str = 'cm2/s'):
+                 diffusion_unit: str = 'cm2/s', progress: bool = True):
 
         # Initialize Reader
         self.reader: TrajectoryReader = get_reader(fz=fz, universe=universe, selection=selection, normalize_lengths=normalize_lengths)
@@ -139,6 +139,7 @@ class Dcov():
             raise ValueError(f"Unsupported diffusion_unit '{diffusion_unit}'. Use 'nm2/ps' or 'cm2/s'.")
         self.diffusion_unit = diffusion_unit
         self.diff_scale = diff_map[diffusion_unit]  # scale from nm^2/ps to desired unit
+        self.progress = progress
         
         self.dt = dt * self.time_scale  # internal dt in ps
         if not math.isclose(self.dt, self.reader.dt, rel_tol=1e-5):
@@ -281,8 +282,10 @@ class Dcov():
         # Use threads to avoid pickling large trajectory chunks; numba kernels release the GIL
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             
-            with bar.ProgressBar(max_value=self.tmax-self.tmin+1) as progbar:
-                for t, step in enumerate(range(self.tmin, self.tmax+1)):
+            step_iter = range(self.tmin, self.tmax+1)
+            if self.progress:
+                step_iter = tqdm(step_iter, total=self.tmax-self.tmin+1, desc="lag steps")
+            for t, step in enumerate(step_iter):
                     
                     # 1. Full Trajectory Analysis (Only for Single Trajectory mode)
                     if not self.multi:
@@ -375,7 +378,7 @@ class Dcov():
                         self.a2full[t] /= step
                         self.s2full[t] /= step
                     
-                    progbar.update(t+1)
+                    # tqdm auto-updates via iteration; no manual update needed
         
         self.non_converged_count = non_converged_count
         self.total_cases = (self.tmax - self.tmin + 1) * (self.nseg + (1 if not self.multi else 0))
