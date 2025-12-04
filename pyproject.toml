@@ -26,6 +26,7 @@ dependencies = [
     "MDAnalysis",
     "matplotlib",
     "progressbar2",
+    "seaborn",
 ]
 
 [tool.setuptools.packages.find]
