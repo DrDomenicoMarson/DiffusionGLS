@@ -54,14 +54,15 @@ def analyze_chunk_task(chunk_data, step, m, dt, nperseg, multi, ndim, d2max, nit
         if len(z_analyzed) <= m:
             # Calculate suggestions
             max_m_possible = len(z_analyzed) - 1
-            max_tmax_possible = (nperseg / m) * dt
+            max_lag_steps = max(1, nperseg // m)
+            max_tmax_possible = max_lag_steps * dt
             
             # We can't raise here easily without crashing the worker.
             # Return error info.
-            return None, ValueError(f"Segment too short (length N={len(z_analyzed)}) to calculate m={m} MSD points at lag time step={step} (t={step*dt} ps).\n"
+            return None, ValueError(f"Segment too short (length N={len(z_analyzed)}) to calculate m={m} MSD points at lag step={step} (t={step*dt} ps).\n"
                                     f"Suggestions:\n"
                                     f"  - Reduce m to at most {max_m_possible}\n"
-                                    f"  - Reduce tmax to less than {max_tmax_possible:.1f} ps\n"
+                                    f"  - Reduce tmax below {max_lag_steps} steps (~{max_tmax_possible:.1f} ps)\n"
                                     f"  - Use a longer trajectory")
 
         msds = np.zeros((ndim, m))
@@ -97,11 +98,19 @@ def analyze_chunk_task(chunk_data, step, m, dt, nperseg, multi, ndim, d2max, nit
     return results, None
 
 class Dcov():
+    """
+    Diffusion coefficient estimator using GLS on mean-squared displacement.
+    
+    Parameters of interest:
+    - m (int): number of MSD points used per lag step (unitless). For a given lag step s,
+      the fit uses MSD values at times s*dt, 2*s*dt, ..., m*s*dt. Larger m widens the
+      lag-time window (m*s*dt) but requires longer segments and increases cost.
+    """
     def __init__(self, fz: TrajectoryInput = None, universe=None, selection=None,
                  m: int = 20, tmin: float = None, tmax: float = 100.0, dt: float = 1.0,
                  d2max: float = 1e-10, nitmax: int = 100,
                  nseg: int | None = None, imgfmt: str = 'pdf', fout: str = 'D_analysis',
-                 n_jobs: int = -1, normalize_lengths: bool = False):
+                 n_jobs: int = -1, normalize_lengths: bool = False, time_unit: str = 'ps'):
 
         # Initialize Reader
         self.reader: TrajectoryReader = get_reader(fz=fz, universe=universe, selection=selection, normalize_lengths=normalize_lengths)
@@ -115,10 +124,17 @@ class Dcov():
             if len(unique_lengths) > 1 and not getattr(self.reader, 'normalized', False):
                 raise ValueError(f"All input trajectories must have the same length. Found lengths: {sorted(unique_lengths)}. "
                                  f"Use normalize_lengths=True to truncate to the shortest trajectory.")
+
+        # Time unit handling: accept inputs in ps or ns, convert to ps internally
+        unit_map = {'ps': 1.0, 'ns': 1e3}
+        if time_unit not in unit_map:
+            raise ValueError(f"Unsupported time_unit '{time_unit}'. Use 'ps' or 'ns'.")
+        self.time_unit = time_unit
+        self.time_scale = unit_map[time_unit] # multiplier to convert chosen unit to ps
         
-        self.dt = dt 
+        self.dt = dt * self.time_scale  # internal dt in ps
         if not math.isclose(self.dt, self.reader.dt, rel_tol=1e-5):
-             warnings.warn(f"User provided dt ({self.dt}) differs from reader's dt ({self.reader.dt}). Using provided dt.", UserWarning)
+             warnings.warn(f"User provided dt ({dt} {self.time_unit}) differs from reader's dt ({self.reader.dt} ps). Using provided dt.", UserWarning)
 
         self.m = m
         
@@ -126,14 +142,14 @@ class Dcov():
         if tmin is None:
             self.tmin = 1
         else:
-            self.tmin = int(round(tmin / self.dt))
+            self.tmin = int(round((tmin * self.time_scale) / self.dt))
             if self.tmin < 1:
                 self.tmin = 1
                 
         if tmax is None:
-            self.tmax = int(round(100.0 / self.dt)) # Default 100 ps
+            self.tmax = int(round((100.0 * self.time_scale) / self.dt)) # Default 100 in chosen unit
         else:
-            self.tmax = int(round(tmax / self.dt))
+            self.tmax = int(round((tmax * self.time_scale) / self.dt))
             
         self.d2max = d2max
         self.nitmax = nitmax
@@ -203,9 +219,11 @@ class Dcov():
         self.Dempstd = None
         self.q_m = None
         self.q_std = None
+        self.tc_selected = None  # selected tc in chosen time unit
+        self.tc_selected_idx = None  # index into lag arrays
 
     def _timestep_index(self, tc: float) -> int:
-        steps = tc / self.dt
+        steps = (tc * self.time_scale) / self.dt
         steps_int = round(steps)
         if not math.isclose(steps, steps_int, rel_tol=1e-9, abs_tol=1e-12):
             raise ValueError(f'tc [{tc}] must be a multiple of dt [{self.dt}] within numerical tolerance')
@@ -393,10 +411,16 @@ class Dcov():
             # itc is 0-indexed relative to self.tmin
             step = self.tmin + itc
             tc = step * self.dt
+            tc_disp = tc / self.time_scale
             
-            print(f"Automatically selected tc = {tc:.4g} ps (Q = {self.q_m[itc]:.4f})")
+            print(f"Automatically selected tc = {tc_disp:.4g} {self.time_unit} (Q = {self.q_m[itc]:.4f})")
         else:
             itc = self._timestep_index(tc)
+            tc_disp = tc / self.time_scale
+
+        # store selected tc for later access
+        self.tc_selected_idx = itc
+        self.tc_selected = tc_disp
 
         with open(f'{self.fout}.dat','w') as g:
             g.write("DIFFUSION COEFFICIENT ESTIMATE\n")
@@ -404,8 +428,9 @@ class Dcov():
             # g.write("Trajectory: {}\n".format(self.fz)) # fz might be None now
             g.write(f"Number of dimensions : {self.ndim}\n")
             g.write(f"Min/max lag time [steps]: {self.tmin}/{self.tmax}\n")
-            g.write(f"Min/max lag time [ps]: {self.tmin*self.dt}/{self.tmax*self.dt}\n")
-            g.write(f"Parameter m: {self.m}\n")
+            g.write(f"Min/max lag time [{self.time_unit}]: {self.tmin*self.dt/self.time_scale}/{self.tmax*self.dt/self.time_scale}\n")
+            g.write(f"Parameter m (MSD points per lag step): {self.m}\n")
+            g.write(f"MSD window per lag step t: [{self.time_unit}] t to {self.m}*t (e.g., at t={self.tmin*self.dt/self.time_scale:.4g} {self.time_unit}, window spans up to {(self.m*self.tmin*self.dt)/self.time_scale:.4g} {self.time_unit})\n")
             
             if self.multi:
                 g.write(f"Number of molecules: {self.nseg}\n")
@@ -418,40 +443,45 @@ class Dcov():
             if hasattr(self, 'non_converged_count'):
                  g.write(f"Optimizer convergence failures: {self.non_converged_count} ({self.percent_failed:.1f}% of {self.total_cases})\n")
 
-            g.write(f"Your chosen diffusion coefficient at {tc} ps: {self.D[itc]:.4e} nm^2/ps\n")
-            g.write(f"Your chosen diffusion coefficient at {tc} ps: {self.D[itc]*0.01:.4e} cm^2/s\n")
+            # Summary at chosen tc
+            g.write(f"Your chosen diffusion coefficient at {tc_disp} {self.time_unit}: {self.D[itc]:.4e} nm^2/ps\n")
+            g.write(f"Standard deviation at {tc_disp} {self.time_unit}: {self.Dstd[itc]:.4e} nm^2/ps\n")
+            g.write(f"Empirical std at {tc_disp} {self.time_unit}: {self.Dempstd[itc]:.4e} nm^2/ps\n")
+            g.write(f"Q-factor at {tc_disp} {self.time_unit}: {self.q_m[itc]:.4f}\n")
+            g.write(f"Your chosen diffusion coefficient at {tc_disp} {self.time_unit}: {self.D[itc]*0.01:.4e} cm^2/s\n")
             g.write("DIFFUSION COEFFICIENT OUTPUT SUMMARY:\n")
-            g.write("t[ps] D[nm^2/ps] varD[nm^4/ps^2] Q D[cm^2/s] varD[cm^4/s^2]\n")
+            g.write(f"t[{self.time_unit}] D[nm^2/ps] varD[nm^4/ps^2] Q D[cm^2/s] varD[cm^4/s^2]\n")
             for t,step in enumerate(range(self.tmin, self.tmax+1)):
-                g.write(f"{step*self.dt:.4g} {self.D[t]:.5g} {self.Dstd[t]**2:.5g} {self.q_m[t]:.5f} {self.D[t]*0.01:.5g} {(self.Dstd[t]**2)*0.0001:.5g}\n")
+                g.write(f"{(step*self.dt)/self.time_scale:.4g} {self.D[t]:.5g} {self.Dstd[t]**2:.5g} {self.q_m[t]:.5f} {self.D[t]*0.01:.5g} {(self.Dstd[t]**2)*0.0001:.5g}\n")
             if self.ndim > 1:
                 g.write("\nDIFFUSION COEFFICIENT PER DIMENSION:\n")
-                g.write("TIMESTEP Dx[nm^2/ps] Dy[nm^2/ps] ...\n")
-                for t, Dt in zip( (range(self.tmin,self.tmax+1)), self.Dperdim):
-                    g.write(f"{t:.4f} {Dt}\n")
+                g.write(f"t[{self.time_unit}] Dx[nm^2/ps] Dy[nm^2/ps] ...\n")
+                for step, Dt in zip(range(self.tmin, self.tmax+1), self.Dperdim):
+                    g.write(f"{(step*self.dt)/self.time_scale:.4f} {Dt}\n")
         
         self.plot_results(tc)
 
     def plot_results(self, tc):
         sns.set_context("paper", font_scale=0.5)
         fig, ax = plt.subplots(2,1,figsize=(6,6),sharex=True)
-        xs = np.arange(self.tmin*self.dt,(self.tmax+1)*self.dt,self.dt)
+        xs = np.arange(self.tmin*self.dt,(self.tmax+1)*self.dt,self.dt) / self.time_scale
         ax[0].plot(xs,self.D,color='C0',label=r'$D$')
         # ax[0].plot(xs,Dseg,color='tab:orange', label= 'mean D segm')
         ax[0].plot(xs,self.D-self.Dstd,color='black',linestyle='dotted', label=r'$\delta \overline{D}^\mathrm{predicted}$')
         ax[0].plot(xs,self.D+self.Dstd,color='black',linestyle='dotted')
         ax[0].fill_between(xs,self.D-self.Dempstd,self.D+self.Dempstd,color='C0',alpha=0.5, label = r'$\delta \overline{D}^\mathrm{empirical}$')
-        ax[0].axvline(tc,color='tab:red',linestyle='dashed')
+        ax[0].axvline(tc/self.time_scale,color='tab:red',linestyle='dashed')
         ax[0].set(ylabel=r'$D(t)$ [nm$^2$ ps$^{-1}$]')
-        ax[0].set(xlim=(self.tmin*self.dt,self.tmax*self.dt))
+        ax[0].set(xlim=(self.tmin*self.dt/self.time_scale,self.tmax*self.dt/self.time_scale))
         ax[0].ticklabel_format(style='scientific',scilimits=(-3,4))
         ax[0].legend(ncol=2)
+        ax[0].set_title(f"MSD window per lag: t .. {self.m}×t [{self.time_unit}]")
         ax[1].plot(xs,self.q_m,color='C0')
         ax[1].fill_between(xs,self.q_m-self.q_std,self.q_m+self.q_std,color='C0',alpha=0.5)
         ax[1].axhline(0.5,linestyle='dashed',color='gray',linewidth=1.2)
-        ax[1].axvline(tc,color='tab:red',linestyle='dashed')
+        ax[1].axvline(tc/self.time_scale,color='tab:red',linestyle='dashed')
         ax[1].set(ylabel=r'$Q(t)$')
-        ax[1].set(xlabel=r'lag time $t$ [ps]')
+        ax[1].set(xlabel=fr'lag time $t$ [{self.time_unit}]')
         ax[1].set(ylim=(0,1))
         fig.tight_layout(h_pad=0.1)
         fig.savefig(f'{self.fout}.{self.imgfmt}',dpi=300)

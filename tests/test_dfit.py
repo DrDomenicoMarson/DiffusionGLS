@@ -204,3 +204,12 @@ def test_n_jobs(random_walk_file, tmp_path):
     dcov.run_Dfit()
     dcov.analysis(tc=10)
     assert os.path.exists(tmp_path / 'D_analysis_0.dat')
+
+def test_time_unit_ns(random_walk_file, tmp_path):
+    # Data have dt=1 ps; using time_unit=ns means inputs are in ns
+    dcov = Dcov(fz=random_walk_file, dt=0.001, tmax=0.02, m=5, time_unit='ns', fout=str(tmp_path / 'D_analysis_ns'))
+    dcov.run_Dfit()
+    dcov.analysis(tc=0.01)
+    assert os.path.exists(tmp_path / 'D_analysis_ns.dat')
+    # tmax=0.02 ns -> 20 ps -> 20 lag steps (tmin=1)
+    assert len(dcov.D) == 20
