@@ -198,3 +198,9 @@ def test_n_jobs(random_walk_file, tmp_path):
     dcov.run_Dfit()
     dcov.analysis(tc=10)
     assert os.path.exists(tmp_path / 'D_analysis_2.dat')
+
+    # n_jobs=0 should be treated as serial (1 worker)
+    dcov = Dcov(fz=random_walk_file, m=10, tmax=20.0, n_jobs=0, fout=str(tmp_path / 'D_analysis_0'))
+    dcov.run_Dfit()
+    dcov.analysis(tc=10)
+    assert os.path.exists(tmp_path / 'D_analysis_0.dat')

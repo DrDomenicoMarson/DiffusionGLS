@@ -231,12 +231,29 @@ class Dcov():
         # Let's assume we load it.
         
         all_trajs = list(self.reader) # List of (N_frames, ndim) arrays
+
+        # Warm up numba-compiled kernels once to avoid a slow first step
+        try:
+            dummy = np.zeros(8)
+            _ = math_utils.compute_MSD_1D_via_correlation(dummy)
+            _ = math_utils.calc_gls(5, 3, np.arange(3, dtype=np.float64), self.d2max, 2,
+                                   c2=math_utils.setupc(2, 5), cm=math_utils.setupc(3, 5))
+        except Exception:
+            # If warm-up fails for any reason, continue; main computation will trigger JIT anyway.
+            pass
         
         non_converged_count = 0
-        # Initialize ProcessPoolExecutor outside the loop
-        # Use ProcessPoolExecutor to bypass GIL
-        max_workers = self.n_jobs if self.n_jobs > 0 else None
-        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+
+        # Determine worker count (treat n_jobs=0 as serial)
+        if self.n_jobs is None or self.n_jobs < 0:
+            max_workers = None
+        elif self.n_jobs == 0:
+            max_workers = 1
+        else:
+            max_workers = self.n_jobs
+
+        # Use threads to avoid pickling large trajectory chunks; numba kernels release the GIL
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             
             with bar.ProgressBar(max_value=self.tmax-self.tmin+1) as progbar:
                 for t, step in enumerate(range(self.tmin, self.tmax+1)):
@@ -273,9 +290,9 @@ class Dcov():
                     if n_per_seg_step >= self.m:
                         cm_pre = math_utils.setupc(self.m, n_per_seg_step)
                     
-                    # Prepare chunks
+                    # Prepare chunks (coarser to reduce overhead)
                     n_workers_count = max_workers if max_workers else (os.cpu_count() or 1)
-                    chunk_size = max(1, self.nseg // (n_workers_count * 4))
+                    chunk_size = max(1, math.ceil(self.nseg / n_workers_count))
                     
                     # Prepare full trajectory values if single mode
                     a2full_3D_val = 0.0
