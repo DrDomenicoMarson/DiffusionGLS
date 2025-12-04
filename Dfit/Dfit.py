@@ -11,8 +11,11 @@ import math
 from collections.abc import Sequence
 from pathlib import Path
 import warnings
+import concurrent.futures
+import os
 
 import matplotlib.pyplot as plt
+import seaborn as sns
 import numpy as np
 import progressbar as bar
 from scipy.special import gammainc
@@ -41,11 +44,64 @@ def calc_q(n,m,a2_3D,s2_3D,msds_3D,a2full_3D,s2full_3D,ndim):
         q = 1-gammainc( (m-2)/2.,chi2/2.) # goodness-of-fit Q
     return q
 
+def analyze_chunk_task(chunk_data, step, m, dt, nperseg, multi, ndim, d2max, nitmax, c2_pre, cm_pre, a2full_3D=0.0, s2full_3D=0.0):
+    results = []
+    
+    for s_idx, seg_z in enumerate(chunk_data):
+        # Stride it
+        z_analyzed = seg_z[::step, :]
+
+        if len(z_analyzed) <= m:
+            # Calculate suggestions
+            max_m_possible = len(z_analyzed) - 1
+            max_tmax_possible = (nperseg / m) * dt
+            
+            # We can't raise here easily without crashing the worker.
+            # Return error info.
+            return None, ValueError(f"Segment too short (length N={len(z_analyzed)}) to calculate m={m} MSD points at lag time step={step} (t={step*dt} ps).\n"
+                                    f"Suggestions:\n"
+                                    f"  - Reduce m to at most {max_m_possible}\n"
+                                    f"  - Reduce tmax to less than {max_tmax_possible:.1f} ps\n"
+                                    f"  - Use a longer trajectory")
+
+        msds = np.zeros((ndim, m))
+        res_a2 = np.zeros(ndim)
+        res_s2 = np.zeros(ndim)
+        res_converged = True
+        
+        n_per_seg_step = len(z_analyzed) - 1
+
+        # Analyze per dimension
+        for d in range(ndim):
+            z_dim = z_analyzed[:, d]
+            msds[d] = math_utils.compute_MSD_1D_via_correlation(z_dim)[1:(m+1)]
+            
+            # Check if pre-calculated matrices match current n
+            use_c2 = c2_pre
+            use_cm = cm_pre
+            
+            res_a2[d], res_s2[d], conv = math_utils.calc_gls(n_per_seg_step, m, msds[d], d2max, nitmax, c2=use_c2, cm=use_cm)
+            if not conv: res_converged = False
+        
+        msds_3D = np.sum(msds, axis=0)
+        a2_3D_val = np.sum(res_a2)
+        s2_3D_val = np.sum(res_s2)
+        
+        if multi:
+            q_val = calc_q(n_per_seg_step, m, a2_3D_val, s2_3D_val, msds_3D, a2_3D_val, s2_3D_val, ndim)
+        else:
+            q_val = calc_q(n_per_seg_step, m, a2_3D_val, s2_3D_val, msds_3D, a2full_3D, s2full_3D, ndim)
+            
+        results.append((res_a2, res_s2, q_val, res_converged))
+        
+    return results, None
+
 class Dcov():
     def __init__(self, fz: TrajectoryInput = None, universe=None, selection=None,
                  m: int = 20, tmin: float = None, tmax: float = 100.0, dt: float = 1.0,
                  d2max: float = 1e-10, nitmax: int = 100,
-                 nseg: int | None = None, imgfmt: str = 'pdf', fout: str = 'D_analysis'):
+                 nseg: int | None = None, imgfmt: str = 'pdf', fout: str = 'D_analysis',
+                 n_jobs: int = -1):
 
         # Initialize Reader
         self.reader: TrajectoryReader = get_reader(fz=fz, universe=universe, selection=selection)
@@ -80,6 +136,7 @@ class Dcov():
             raise TypeError("Error! Choose 'pdf' or 'png' as output format.")
         self.imgfmt = imgfmt
         self.fout = fout
+        self.n_jobs = n_jobs
 
         print(f'Num trajectories/molecules = {self.reader.n_trajs}')
         print(f'Num steps (num frames -1) = {self.n}')
@@ -183,87 +240,114 @@ class Dcov():
                         z_strided = z_dim[::step]
                         if len(z_strided) <= self.m:
                              raise ValueError(f"Trajectory too short (length N={len(z_strided)}) to calculate m={self.m} MSD points at lag time step={step} (t={step*self.dt} ps). Please reduce tmax or m, or use a longer trajectory.")
-                        n = len(z_strided) - 1
-                        msd = math_utils.compute_MSD_1D_via_correlation(z_strided)[1:(self.m+1)]
-                        self.a2full[t,d], self.s2full[t,d], converged = math_utils.calc_gls(n, self.m, msd, self.d2max, self.nitmax)
-                        if not converged: non_converged_count += 1
+        # Initialize ProcessPoolExecutor outside the loop
+        # Use ProcessPoolExecutor to bypass GIL
+        max_workers = self.n_jobs if self.n_jobs > 0 else None
+        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+            
+            with bar.ProgressBar(max_value=self.tmax-self.tmin+1) as progbar:
+                for t, step in enumerate(range(self.tmin, self.tmax+1)):
                     
-                    a2full_3D = np.sum(self.a2full[t])
-                    s2full_3D = np.sum(self.s2full[t])
-                
-                # 2. Segment Analysis
-                # If multi: iterate over molecules
-                # If single: iterate over segments of the single trajectory
-                
-                n_per_seg_step = int(self.nperseg / step)
-                
-                for s in range(self.nseg):
-                    msds = np.zeros((self.ndim, self.m))
-                    
-                    # Get the segment data
-                    if self.multi:
-                        # Segment s is molecule s
-                        seg_z = all_trajs[s]
-                        # Stride it
-                        z_analyzed = seg_z[::step, :]
-                    else:
-                        # Segment s is a slice of the single trajectory
+                    # 1. Full Trajectory Analysis (Only for Single Trajectory mode)
+                    if not self.multi:
+                        # In single mode, all_trajs has 1 element
                         full_z = all_trajs[0]
-                        zstart = s * (self.nperseg + 1)
-                        zend = (s + 1) * (self.nperseg + 1)
-                        z_analyzed = full_z[zstart:zend:step, :]
-
-                    if len(z_analyzed) <= self.m:
-                        # Calculate suggestions
-                        # Max m possible: len(z_analyzed) - 1
-                        max_m_possible = len(z_analyzed) - 1
+                        converged_all_dims = True
+                        for d in range(self.ndim):
+                            z_dim = full_z[:, d]
+                            z_strided = z_dim[::step]
+                            if len(z_strided) <= self.m:
+                                 raise ValueError(f"Trajectory too short (length N={len(z_strided)}) to calculate m={self.m} MSD points at lag time step={step} (t={step*self.dt} ps). Please reduce tmax or m, or use a longer trajectory.")
+                            n = len(z_strided) - 1
+                            msd = math_utils.compute_MSD_1D_via_correlation(z_strided)[1:(self.m+1)]
+                            self.a2full[t,d], self.s2full[t,d], converged = math_utils.calc_gls(n, self.m, msd, self.d2max, self.nitmax)
+                            if not converged: converged_all_dims = False
                         
-                        # Max tmax possible for current m:
-                        # len = N_seg / step. We need len > m.
-                        # N_seg / step > m => step < N_seg / m
-                        # t = step * dt < (N_seg / m) * dt
-                        max_tmax_possible = (self.nperseg / self.m) * self.dt
+                        if not converged_all_dims: non_converged_count += 1
                         
-                        raise ValueError(f"Segment too short (length N={len(z_analyzed)}) to calculate m={self.m} MSD points at lag time step={step} (t={step*self.dt} ps).\n"
-                                         f"Suggestions:\n"
-                                         f"  - Reduce m to at most {max_m_possible}\n"
-                                         f"  - Reduce tmax to less than {max_tmax_possible:.1f} ps\n"
-                                         f"  - Use a longer trajectory")
-
-                    # Analyze per dimension
-                    for d in range(self.ndim):
-                        z_dim = z_analyzed[:, d]
-                        msds[d] = math_utils.compute_MSD_1D_via_correlation(z_dim)[1:(self.m+1)]
-                        self.a2[t,s,d], self.s2[t,s,d], converged = math_utils.calc_gls(n_per_seg_step, self.m, msds[d], self.d2max, self.nitmax)
-                        if not converged: non_converged_count += 1
+                        a2full_3D = np.sum(self.a2full[t])
+                        s2full_3D = np.sum(self.s2full[t])
                     
-                    msds_3D = np.sum(msds, axis=0)
-                    a2_3D = np.sum(self.a2[t,s])
-                    s2_3D = np.sum(self.s2[t,s])
+                    # 2. Segment Analysis
+                    n_per_seg_step = int(self.nperseg / step)
                     
-                    if self.multi:
-                        self.q[t,s] = calc_q(n_per_seg_step, self.m, a2_3D, s2_3D, msds_3D, a2_3D, s2_3D, self.ndim)
-                    else:
-                        self.q[t,s] = calc_q(n_per_seg_step, self.m, a2_3D, s2_3D, msds_3D, a2full_3D, s2full_3D, self.ndim)
+                    # Pre-calculate covariance matrices for this step
+                    c2_pre = None
+                    if n_per_seg_step >= 2:
+                        c2_pre = math_utils.setupc(2, n_per_seg_step)
+                    
+                    cm_pre = None
+                    if n_per_seg_step >= self.m:
+                        cm_pre = math_utils.setupc(self.m, n_per_seg_step)
+                    
+                    # Prepare chunks
+                    n_workers_count = max_workers if max_workers else (os.cpu_count() or 1)
+                    chunk_size = max(1, self.nseg // (n_workers_count * 4))
+                    
+                    # Prepare full trajectory values if single mode
+                    a2full_3D_val = 0.0
+                    s2full_3D_val = 0.0
+                    if not self.multi:
+                        a2full_3D_val = np.sum(self.a2full[t])
+                        s2full_3D_val = np.sum(self.s2full[t])
+                    
+                    future_to_range = {}
+                    for s_start in range(0, self.nseg, chunk_size):
+                        s_end = min(s_start + chunk_size, self.nseg)
+                        
+                        chunk_data = []
+                        if self.multi:
+                            chunk_data = all_trajs[s_start:s_end]
+                        else:
+                            # Slice the single trajectory
+                            full_z = all_trajs[0]
+                            for s in range(s_start, s_end):
+                                zstart = s * (self.nperseg + 1)
+                                zend = (s + 1) * (self.nperseg + 1)
+                                chunk_data.append(full_z[zstart:zend])
+                                
+                        fut = executor.submit(analyze_chunk_task, chunk_data, step, self.m, self.dt, self.nperseg, self.multi, self.ndim, self.d2max, self.nitmax, c2_pre, cm_pre, a2full_3D_val, s2full_3D_val)
+                        future_to_range[fut] = (s_start, s_end)
+                    
+                    for future in concurrent.futures.as_completed(future_to_range):
+                        s_start, s_end = future_to_range[future]
+                        try:
+                            chunk_results, error = future.result()
+                            if error:
+                                raise error
+                            
+                            for i, (res_a2, res_s2, q_val, res_converged) in enumerate(chunk_results):
+                                s = s_start + i
+                                self.a2[t,s] = res_a2
+                                self.s2[t,s] = res_s2
+                                self.q[t,s] = q_val
+                                if not res_converged: non_converged_count += 1
+                        except Exception as exc:
+                            raise exc
 
-                # 3. Averaging
-                a2m = np.mean(self.a2[t], axis=0)
-                s2m = np.mean(self.s2[t], axis=0)
-                
-                self.s2var[t] = math_utils.eval_vars(n_per_seg_step, self.m, a2m, s2m, self.ndim)
-                
-                # Normalize by step
-                self.a2[t] /= step
-                self.s2[t] /= step
-                self.s2var[t] /= step**2
-                if not self.multi:
-                    self.a2full[t] /= step
-                    self.s2full[t] /= step
-                
-                progbar.update(t)
+                    # 3. Averaging
+                    a2m = np.mean(self.a2[t], axis=0)
+                    s2m = np.mean(self.s2[t], axis=0)
+                    
+                    self.s2var[t] = math_utils.eval_vars(n_per_seg_step, self.m, a2m, s2m, self.ndim)
+                    
+                    # Normalize by step
+                    self.a2[t] /= step
+                    self.s2[t] /= step
+                    self.s2var[t] /= step**2
+                    if not self.multi:
+                        self.a2full[t] /= step
+                        self.s2full[t] /= step
+                    
+                    progbar.update(t)
+        
+        self.non_converged_count = non_converged_count
+        self.total_cases = (self.tmax - self.tmin + 1) * (self.nseg + (1 if not self.multi else 0))
+        self.percent_failed = 0.0
         
         if non_converged_count > 0:
-            print(f"WARNING: Optimizer did not converge in {non_converged_count} cases. Falling back to M=2 for those cases.")
+            self.percent_failed = (non_converged_count / self.total_cases) * 100
+            print(f"WARNING: Optimizer did not converge in {non_converged_count} cases ({self.percent_failed:.1f}% of Total {self.total_cases}). Falling back to M=2 for those cases.")
 
     # Output and plotting
     def analysis(self, tc: float | str = 10):
@@ -308,34 +392,38 @@ class Dcov():
             g.write("DIFFUSION COEFFICIENT ESTIMATE\n")
             g.write("INPUT:\n")
             # g.write("Trajectory: {}\n".format(self.fz)) # fz might be None now
-            g.write("Number of dimensions : {}\n".format(self.ndim))
-            g.write("Min/max timestep: {}/{}\n".format(self.tmin,self.tmax))
-            g.write("Number of segments: {}\n".format(self.nseg))
-            g.write("Total number of trajectory data points per dim.: {}\n".format(self.n+1))
-            g.write("Data points per segment and dim.: {}\n".format(self.nperseg+1))
+            g.write(f"Number of dimensions : {self.ndim}\n")
+            g.write(f"Min/max lag time [steps]: {self.tmin}/{self.tmax}\n")
+            g.write(f"Min/max lag time [ps]: {self.tmin*self.dt}/{self.tmax*self.dt}\n")
+            g.write(f"Parameter m: {self.m}\n")
+            
+            if self.multi:
+                g.write(f"Number of molecules: {self.nseg}\n")
+            else:
+                g.write(f"Number of segments: {self.nseg}\n")
+                
+            g.write(f"Total number of trajectory data points per dim.: {self.n+1}\n")
+            g.write(f"Data points per segment and dim.: {self.nperseg+1}\n")
+            
+            if hasattr(self, 'non_converged_count'):
+                 g.write(f"Optimizer convergence failures: {self.non_converged_count} ({self.percent_failed:.1f}% of {self.total_cases})\n")
 
-            g.write("Your chosen diffusion coefficient at {} ps: {:.4e} nm^2/ps\n".format(tc, self.D[itc]))
-            g.write("Your chosen diffusion coefficient at {} ps: {:.4e} cm^2/s\n".format(tc, self.D[itc]*0.01))
+            g.write(f"Your chosen diffusion coefficient at {tc} ps: {self.D[itc]:.4e} nm^2/ps\n")
+            g.write(f"Your chosen diffusion coefficient at {tc} ps: {self.D[itc]*0.01:.4e} cm^2/s\n")
             g.write("DIFFUSION COEFFICIENT OUTPUT SUMMARY:\n")
             g.write("t[ps] D[nm^2/ps] varD[nm^4/ps^2] Q D[cm^2/s] varD[cm^4/s^2]\n")
             for t,step in enumerate(range(self.tmin, self.tmax+1)):
-                g.write("{:.4g} {:.5g} {:.5g} {:.5f} {:.5g} {:.5g}\n".format(
-                    step*self.dt,
-                    self.D[t],
-                    self.Dstd[t]**2,
-                    self.q_m[t],
-                    self.D[t]*0.01,
-                    (self.Dstd[t]**2)*0.0001
-                ))
+                g.write(f"{step*self.dt:.4g} {self.D[t]:.5g} {self.Dstd[t]**2:.5g} {self.q_m[t]:.5f} {self.D[t]*0.01:.5g} {(self.Dstd[t]**2)*0.0001:.5g}\n")
             if self.ndim > 1:
                 g.write("\nDIFFUSION COEFFICIENT PER DIMENSION:\n")
                 g.write("TIMESTEP Dx[nm^2/ps] Dy[nm^2/ps] ...\n")
                 for t, Dt in zip( (range(self.tmin,self.tmax+1)), self.Dperdim):
-                    g.write("{:.4f} {}\n".format(t, Dt))
+                    g.write(f"{t:.4f} {Dt}\n")
         
         self.plot_results(tc)
 
     def plot_results(self, tc):
+        sns.set_context("paper", font_scale=0.5)
         fig, ax = plt.subplots(2,1,figsize=(6,6),sharex=True)
         xs = np.arange(self.tmin*self.dt,(self.tmax+1)*self.dt,self.dt)
         ax[0].plot(xs,self.D,color='C0',label=r'$D$')
@@ -344,7 +432,7 @@ class Dcov():
         ax[0].plot(xs,self.D+self.Dstd,color='black',linestyle='dotted')
         ax[0].fill_between(xs,self.D-self.Dempstd,self.D+self.Dempstd,color='C0',alpha=0.5, label = r'$\delta \overline{D}^\mathrm{empirical}$')
         ax[0].axvline(tc,color='tab:red',linestyle='dashed')
-        ax[0].set(ylabel='diff. coeff. $D$ [nm$^2$ ps$^{-1}$]')
+        ax[0].set(ylabel=r'$D(t)$ [nm$^2$ ps$^{-1}$]')
         ax[0].set(xlim=(self.tmin*self.dt,self.tmax*self.dt))
         ax[0].ticklabel_format(style='scientific',scilimits=(-3,4))
         ax[0].legend(ncol=2)
@@ -352,11 +440,11 @@ class Dcov():
         ax[1].fill_between(xs,self.q_m-self.q_std,self.q_m+self.q_std,color='C0',alpha=0.5)
         ax[1].axhline(0.5,linestyle='dashed',color='gray',linewidth=1.2)
         ax[1].axvline(tc,color='tab:red',linestyle='dashed')
-        ax[1].set(ylabel='quality factor Q')
-        ax[1].set(xlabel='time step size [ps]')
+        ax[1].set(ylabel=r'$Q(t)$')
+        ax[1].set(xlabel=r'lag time $t$ [ps]')
         ax[1].set(ylim=(0,1))
         fig.tight_layout(h_pad=0.1)
-        fig.savefig('{}.{}'.format(self.fout,self.imgfmt),dpi=300)
+        fig.savefig(f'{self.fout}.{self.imgfmt}',dpi=300)
         plt.close(fig)
 
     def finite_size_correction(self, T=300, eta=None, L=None, boxtype='cubic', tc=10):
@@ -373,4 +461,4 @@ class Dcov():
 
         kbT = T * BOLTZMANN_K # J
         self.Dcor = self.D + kbT * XI_CUBIC * 1e15 / (6. * np.pi * eta * L) # nm^2 / ps
-        print("Finite-size corrected diffusion coefficient D_t for timestep {} ps: {:.4g} nm^2/ps with standard dev. {:.4g} nm^2/ps".format(tc,self.Dcor[itc],self.Dstd[itc]))
+        print(f"Finite-size corrected diffusion coefficient D_t for timestep {tc} ps: {self.Dcor[itc]:.4g} nm^2/ps with standard dev. {self.Dstd[itc]:.4g} nm^2/ps")

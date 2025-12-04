@@ -154,5 +154,17 @@ def test_convergence_warning(tmp_path, capsys):
     dcov.run_Dfit()
     
     captured = capsys.readouterr()
-    assert "WARNING: Optimizer did not converge" in captured.out
+    assert "WARNING: Optimizer did not converge in 2 cases (100.0% of Total 2)" in captured.out
     assert "Falling back to M=2" in captured.out
+
+def test_n_jobs(random_walk_file, tmp_path):
+    # Test running with specific n_jobs
+    dcov = Dcov(fz=random_walk_file, m=10, tmax=20.0, n_jobs=1, fout=str(tmp_path / 'D_analysis_1'))
+    dcov.run_Dfit()
+    dcov.analysis(tc=10)
+    assert os.path.exists(tmp_path / 'D_analysis_1.dat')
+    
+    dcov = Dcov(fz=random_walk_file, m=10, tmax=20.0, n_jobs=2, fout=str(tmp_path / 'D_analysis_2'))
+    dcov.run_Dfit()
+    dcov.analysis(tc=10)
+    assert os.path.exists(tmp_path / 'D_analysis_2.dat')

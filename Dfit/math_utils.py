@@ -51,6 +51,13 @@ def calc_cov(n,m,c,a2,s2):
 
 @nb.jit(nopython=True)
 def inv_mat(A):
+    # Regularization to prevent singularity
+    # We need to copy A to avoid modifying the input if it's used elsewhere
+    # But A is usually created in calc_cov.
+    # Let's add epsilon to diagonal.
+    n = A.shape[0]
+    for i in range(n):
+        A[i,i] += 1e-6
     cinv = np.linalg.inv(A)
     return cinv
 
@@ -78,13 +85,14 @@ def calc_a2s2(m,v,cinv, a2, s2):
     d2=(s2n-s2)**2+(a2n-a2)**2
     return a2n, s2n, d2
 
-def gls_closed(n,v):
+def gls_closed(n,v, c=None):
     """
     Closed-form GLS estimation of offset a^2 and variance sigma^2.
     """
 
     # c = setupc(2,n)
-    c = setupc(2,n) # setups of cov matrix
+    if c is None:
+        c = setupc(2,n) # setups of cov matrix
 
     s2 = v[1]-v[0]
     a2 = 2*v[0] - v[1]
@@ -97,7 +105,7 @@ def gls_closed(n,v):
 
     return a2, s2, s2var
 
-def gls_iter(n,m,v,a2,s2,d2max,nitmax):
+def gls_iter(n,m,v,a2,s2,d2max,nitmax, c=None):
     """
     Iteratively optimize offset a^2 and variance sigma^2
     of fit to MSD for Gaussian random walk with noise
@@ -107,7 +115,8 @@ def gls_iter(n,m,v,a2,s2,d2max,nitmax):
     nit = 0
     d2 = d2max + 1.e5
 
-    c = setupc(m,n) # setups of cov matrix
+    if c is None:
+        c = setupc(m,n) # setups of cov matrix
 
     while (nit < nitmax) and (d2 > d2max):
         nit = nit+1
@@ -121,9 +130,9 @@ def gls_iter(n,m,v,a2,s2,d2max,nitmax):
 
     return a2, s2, nit
 
-def calc_gls(n,m,v,d2max,nitmax):
-    a2est, s2est, _s2varest = gls_closed(n,v)
-    a2, s2, nit = gls_iter(n,m,v,a2est,s2est,d2max,nitmax)
+def calc_gls(n,m,v,d2max,nitmax, c2=None, cm=None):
+    a2est, s2est, _s2varest = gls_closed(n,v, c=c2)
+    a2, s2, nit = gls_iter(n,m,v,a2est,s2est,d2max,nitmax, c=cm)
 
     converged = True
     if nit >= nitmax:
@@ -173,29 +182,39 @@ def eval_vars(n,m,a2m,s2m,ndim):
         s2var += calc_var(n,m,a2m[d],s2m[d]) # using mean across segments but per dim
     return s2var
 
-def compute_correlation_via_fft(x, y=None):
+def compute_autocorrelation_via_fft(x):
     """
-    Correlation of two arrays calculated via FFT.
+    Autocorrelation of array calculated via FFT.
     """
-    x   = np.array(x)
-    l   = len(x)
+    # x is assumed to be a numpy array (float64)
+    l = len(x)
+    
+    # FFT
     xft = np.fft.fft(x, 2*l)
-
-    if y is None:
-        yft = xft
-    else:
-        y   = np.array(y)
-        yft = np.fft.fft(y, 2*l)
-    corr    = np.real(np.fft.ifft(np.conjugate(xft)*yft))
-    norm    = l - np.arange(l)
-    corr    = corr[:l]/norm
+    
+    # Autocorrelation: ifft( |xft|^2 )
+    # np.abs(xft)**2 is real, but ifft expects complex? 
+    # Actually correlation is ifft( conj(xft) * xft ) = ifft( |xft|^2 )
+    # |xft|^2 is real.
+    
+    # Numba supports basic arithmetic on complex arrays
+    spec = np.abs(xft)**2
+    corr = np.real(np.fft.ifft(spec))
+    
+    # Normalization
+    norm = l - np.arange(l)
+    # Avoid division by zero if l=0 (unlikely)
+    # Numba handles array division
+    
+    # Slice to length l
+    corr = corr[:l]/norm
     return corr
 
 def compute_MSD_1D_via_correlation(x):
     """
     One-dimensional MSD calculated via FFT-based auto-correlation.
     """
-    corrx  = compute_correlation_via_fft(x)
+    corrx = compute_autocorrelation_via_fft(x)
     nt     = len(x)
     dsq    = x**2
     sumsq  = 2*np.sum(dsq)
