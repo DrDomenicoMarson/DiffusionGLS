@@ -107,7 +107,7 @@ class Dcov():
       lag-time window (m*s*dt) but requires longer segments and increases cost.
     """
     def __init__(self, fz: TrajectoryInput = None, universe=None, selection=None,
-                 m: int = 20, tmin: float = None, tmax: float = 100.0, dt: float = 1.0,
+                 m: int = 20, tmin: float | None = None, tmax: float = 100.0, dt: float = 1.0,
                  d2max: float = 1e-10, nitmax: int = 100,
                  nseg: int | None = None, imgfmt: str = 'pdf', fout: str = 'D_analysis',
                  n_jobs: int = -1, normalize_lengths: bool = False, time_unit: str = 'ps'):
