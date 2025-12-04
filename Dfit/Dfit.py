@@ -390,7 +390,11 @@ class Dcov():
         # Calculate statistics first
         Dseg = self.s2.sum(axis=2) # across dims
         self.Dseg = np.mean(Dseg, axis=1) / (2.*self.ndim*self.dt) # mean across segs, nm^2 / (dt * ps)
-        self.Dstd = np.sqrt(self.s2var/ (2.*self.ndim*self.dt)**2) # nm^2 / (dt * ps)
+
+        if np.any(self.s2var < 0):
+            warnings.warn("Negative variance encountered; clamping to zero.", RuntimeWarning)
+        s2var_clamped = np.maximum(self.s2var, 0.0)
+        self.Dstd = np.sqrt(s2var_clamped/ (2.*self.ndim*self.dt)**2) # nm^2 / (dt * ps)
 
         if self.multi: # no 'full' run available
             self.D = self.Dseg # nm^2 / (dt * ps)
@@ -401,7 +405,10 @@ class Dcov():
 
         Dempstd = np.var(self.s2, axis=1) # across segments per dim
         Dempstd = np.sum(Dempstd, axis=1) # across dims
-        self.Dempstd = np.sqrt(Dempstd) / (2.*self.ndim*self.dt)
+        if np.any(Dempstd < 0):
+            warnings.warn("Negative empirical variance encountered; clamping to zero.", RuntimeWarning)
+        Dempstd_clamped = np.maximum(Dempstd, 0.0)
+        self.Dempstd = np.sqrt(Dempstd_clamped) / (2.*self.ndim*self.dt)
         self.q_m = np.mean(self.q, axis=1)
         self.q_std = np.std(self.q, axis=1)
 
