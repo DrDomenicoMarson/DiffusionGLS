@@ -110,7 +110,8 @@ class Dcov():
                  m: int = 20, tmin: float | None = None, tmax: float = 100.0, dt: float = 1.0,
                  d2max: float = 1e-10, nitmax: int = 100,
                  nseg: int | None = None, imgfmt: str = 'pdf', fout: str = 'D_analysis',
-                 n_jobs: int = -1, normalize_lengths: bool = False, time_unit: str = 'ps'):
+                 n_jobs: int = -1, normalize_lengths: bool = False, time_unit: str = 'ps',
+                 diffusion_unit: str = 'cm2/s'):
 
         # Initialize Reader
         self.reader: TrajectoryReader = get_reader(fz=fz, universe=universe, selection=selection, normalize_lengths=normalize_lengths)
@@ -131,6 +132,13 @@ class Dcov():
             raise ValueError(f"Unsupported time_unit '{time_unit}'. Use 'ps' or 'ns'.")
         self.time_unit = time_unit
         self.time_scale = unit_map[time_unit] # multiplier to convert chosen unit to ps
+
+        # Diffusion unit handling: internal nm^2/ps; allow reporting in cm^2/s
+        diff_map = {'nm2/ps': 1.0, 'cm2/s': 0.01}
+        if diffusion_unit not in diff_map:
+            raise ValueError(f"Unsupported diffusion_unit '{diffusion_unit}'. Use 'nm2/ps' or 'cm2/s'.")
+        self.diffusion_unit = diffusion_unit
+        self.diff_scale = diff_map[diffusion_unit]  # scale from nm^2/ps to desired unit
         
         self.dt = dt * self.time_scale  # internal dt in ps
         if not math.isclose(self.dt, self.reader.dt, rel_tol=1e-5):
@@ -397,6 +405,12 @@ class Dcov():
         self.q_m = np.mean(self.q, axis=1)
         self.q_std = np.std(self.q, axis=1)
 
+        # Scaled values for reporting
+        D_out = self.D * self.diff_scale
+        Dstd_out = self.Dstd * self.diff_scale
+        Dempstd_out = self.Dempstd * self.diff_scale
+        Dperdim_out = self.Dperdim * self.diff_scale
+
         if tc == 'auto':
             # Find index where q_m is closest to 0.5
             # self.q_m is array of shape (tmax-tmin+1,)
@@ -444,20 +458,21 @@ class Dcov():
                  g.write(f"Optimizer convergence failures: {self.non_converged_count} ({self.percent_failed:.1f}% of {self.total_cases})\n")
 
             # Summary at chosen tc
-            g.write(f"Your chosen diffusion coefficient at {tc_disp} {self.time_unit}: {self.D[itc]:.4e} nm^2/ps\n")
-            g.write(f"Standard deviation at {tc_disp} {self.time_unit}: {self.Dstd[itc]:.4e} nm^2/ps\n")
-            g.write(f"Empirical std at {tc_disp} {self.time_unit}: {self.Dempstd[itc]:.4e} nm^2/ps\n")
+            g.write(f"Your chosen diffusion coefficient at {tc_disp} {self.time_unit}: {D_out[itc]:.4e} {self.diffusion_unit}\n")
+            g.write(f"Standard deviation at {tc_disp} {self.time_unit}: {Dstd_out[itc]:.4e} {self.diffusion_unit}\n")
+            g.write(f"Empirical std at {tc_disp} {self.time_unit}: {Dempstd_out[itc]:.4e} {self.diffusion_unit}\n")
             g.write(f"Q-factor at {tc_disp} {self.time_unit}: {self.q_m[itc]:.4f}\n")
-            g.write(f"Your chosen diffusion coefficient at {tc_disp} {self.time_unit}: {self.D[itc]*0.01:.4e} cm^2/s\n")
+            if self.diffusion_unit != 'cm2/s':
+                g.write(f"Your chosen diffusion coefficient at {tc_disp} {self.time_unit}: {self.D[itc]*0.01:.4e} cm^2/s\n")
             g.write("DIFFUSION COEFFICIENT OUTPUT SUMMARY:\n")
-            g.write(f"t[{self.time_unit}] D[nm^2/ps] varD[nm^4/ps^2] Q D[cm^2/s] varD[cm^4/s^2]\n")
+            g.write(f"t[{self.time_unit}] D[{self.diffusion_unit}] varD[{self.diffusion_unit}^2] Q\n")
             for t,step in enumerate(range(self.tmin, self.tmax+1)):
-                g.write(f"{(step*self.dt)/self.time_scale:.4g} {self.D[t]:.5g} {self.Dstd[t]**2:.5g} {self.q_m[t]:.5f} {self.D[t]*0.01:.5g} {(self.Dstd[t]**2)*0.0001:.5g}\n")
+                g.write(f"{(step*self.dt)/self.time_scale:.4g} {D_out[t]:.5g} {(Dstd_out[t]**2):.5g} {self.q_m[t]:.5f}\n")
             if self.ndim > 1:
                 g.write("\nDIFFUSION COEFFICIENT PER DIMENSION:\n")
-                g.write(f"t[{self.time_unit}] Dx[nm^2/ps] Dy[nm^2/ps] ...\n")
+                g.write(f"t[{self.time_unit}] Dx[{self.diffusion_unit}] Dy[{self.diffusion_unit}] ...\n")
                 for step, Dt in zip(range(self.tmin, self.tmax+1), self.Dperdim):
-                    g.write(f"{(step*self.dt)/self.time_scale:.4f} {Dt}\n")
+                    g.write(f"{(step*self.dt)/self.time_scale:.4f} {Dperdim_out[step-self.tmin]}\n")
         
         self.plot_results(tc)
 
@@ -465,13 +480,16 @@ class Dcov():
         sns.set_context("paper", font_scale=0.5)
         fig, ax = plt.subplots(2,1,figsize=(6,6),sharex=True)
         xs = np.arange(self.tmin*self.dt,(self.tmax+1)*self.dt,self.dt) / self.time_scale
-        ax[0].plot(xs,self.D,color='C0',label=r'$D$')
-        # ax[0].plot(xs,Dseg,color='tab:orange', label= 'mean D segm')
-        ax[0].plot(xs,self.D-self.Dstd,color='black',linestyle='dotted', label=r'$\delta \overline{D}^\mathrm{predicted}$')
-        ax[0].plot(xs,self.D+self.Dstd,color='black',linestyle='dotted')
-        ax[0].fill_between(xs,self.D-self.Dempstd,self.D+self.Dempstd,color='C0',alpha=0.5, label = r'$\delta \overline{D}^\mathrm{empirical}$')
+        D_out = self.D * self.diff_scale
+        Dstd_out = self.Dstd * self.diff_scale
+        Dempstd_out = self.Dempstd * self.diff_scale
+
+        ax[0].plot(xs,D_out,color='C0',label=r'$D$')
+        ax[0].plot(xs,D_out-Dstd_out,color='black',linestyle='dotted', label=r'$\delta \overline{D}^\mathrm{predicted}$')
+        ax[0].plot(xs,D_out+Dstd_out,color='black',linestyle='dotted')
+        ax[0].fill_between(xs,D_out-Dempstd_out,D_out+Dempstd_out,color='C0',alpha=0.5, label = r'$\delta \overline{D}^\mathrm{empirical}$')
         ax[0].axvline(tc/self.time_scale,color='tab:red',linestyle='dashed')
-        ax[0].set(ylabel=r'$D(t)$ [nm$^2$ ps$^{-1}$]')
+        ax[0].set(ylabel=fr'$D(t)$ [{self.diffusion_unit}]')
         ax[0].set(xlim=(self.tmin*self.dt/self.time_scale,self.tmax*self.dt/self.time_scale))
         ax[0].ticklabel_format(style='scientific',scilimits=(-3,4))
         ax[0].legend(ncol=2)
