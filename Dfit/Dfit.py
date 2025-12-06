@@ -210,6 +210,22 @@ class Dcov():
         if self.m > self.nperseg:
             self.m = self.nperseg
 
+        # In multi-traj mode, ensure tmax is feasible given segment length and m
+        if self.multi:
+            max_tmax_steps = max(1, self.nperseg // self.m)
+            if self.tmax > max_tmax_steps:
+                warnings.warn(
+                    f"tmax ({self.tmax * self.dt / self.time_scale:.4g} {self.time_unit}) is too long for segment length; "
+                    f"reducing to {max_tmax_steps * self.dt / self.time_scale:.4g} {self.time_unit}.",
+                    UserWarning
+                )
+                self.tmax = max_tmax_steps
+            if self.tmin > self.tmax:
+                raise ValueError(
+                    f"tmin ({self.tmin * self.dt / self.time_scale:.4g} {self.time_unit}) exceeds max feasible tmax "
+                    f"({self.tmax * self.dt / self.time_scale:.4g} {self.time_unit}) for m={self.m} and trajectory length {self.nperseg+1}."
+                )
+
         # Arrays
         self.a2full = np.zeros((self.tmax-self.tmin+1, self.ndim))
         self.s2full = np.zeros((self.tmax-self.tmin+1, self.ndim))

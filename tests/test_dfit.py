@@ -213,3 +213,17 @@ def test_time_unit_ns(random_walk_file, tmp_path):
     assert os.path.exists(tmp_path / 'D_analysis_ns.dat')
     # tmax=0.02 ns -> 20 ps -> 20 lag steps (tmin=1)
     assert len(dcov.D) == 20
+
+def test_multi_tmax_clamp(tmp_path):
+    # Two short trajectories; m and tmax too large should trigger clamp in multi mode
+    traj1 = generate_random_walk(n_steps=50, dim=3)
+    traj2 = generate_random_walk(n_steps=50, dim=3)
+    file1 = tmp_path / "traj1.dat"
+    file2 = tmp_path / "traj2.dat"
+    np.savetxt(file1, traj1)
+    np.savetxt(file2, traj2)
+
+    with pytest.warns(UserWarning, match="tmax"):
+        dcov = Dcov(fz=[str(file1), str(file2)], m=10, tmax=100.0, dt=1.0, fout=str(tmp_path / 'D_analysis_clamp'))
+    # tmax should be clamped to nperseg // m
+    assert dcov.tmax == dcov.nperseg // dcov.m
