@@ -115,6 +115,36 @@ def test_auto_tc(random_walk_file, tmp_path):
     # Ideally we would check if the chosen Q is close to 0.5, but with random walk data it might vary.
     # Let's just ensure it runs.
 
+def test_mismatched_lengths_error(tmp_path):
+    traj1 = generate_random_walk(n_steps=100, dim=3)
+    traj2 = generate_random_walk(n_steps=120, dim=3)
+    file1 = tmp_path / "traj1.dat"
+    file2 = tmp_path / "traj2.dat"
+    np.savetxt(file1, traj1)
+    np.savetxt(file2, traj2)
+
+    with pytest.raises(ValueError, match="length"):
+        Dcov(fz=[str(file1), str(file2)])
+
+def test_mismatched_lengths_normalize(tmp_path):
+    n1 = 200
+    n2 = 150
+    traj1 = generate_random_walk(n_steps=n1, dim=3)
+    traj2 = generate_random_walk(n_steps=n2, dim=3)
+    file1 = tmp_path / "traj1.dat"
+    file2 = tmp_path / "traj2.dat"
+    np.savetxt(file1, traj1)
+    np.savetxt(file2, traj2)
+
+    min_len = min(n1, n2) + 1  # frames = steps + 1
+    with pytest.warns(UserWarning, match="normalize_lengths"):
+        dcov = Dcov(fz=[str(file1), str(file2)], normalize_lengths=True, m=10, tmax=10.0, fout=str(tmp_path / 'D_analysis_norm'))
+    assert dcov.reader.n_frames == min_len
+    assert dcov.n == min_len - 1
+
+    dcov.run_Dfit()
+    dcov.analysis(tc=10)
+
 def test_short_trajectory_error(tmp_path):
     # Create a short trajectory
     # N=40, m=20, tmax=5.0 (5 steps).
@@ -168,3 +198,32 @@ def test_n_jobs(random_walk_file, tmp_path):
     dcov.run_Dfit()
     dcov.analysis(tc=10)
     assert os.path.exists(tmp_path / 'D_analysis_2.dat')
+
+    # n_jobs=0 should be treated as serial (1 worker)
+    dcov = Dcov(fz=random_walk_file, m=10, tmax=20.0, n_jobs=0, fout=str(tmp_path / 'D_analysis_0'))
+    dcov.run_Dfit()
+    dcov.analysis(tc=10)
+    assert os.path.exists(tmp_path / 'D_analysis_0.dat')
+
+def test_time_unit_ns(random_walk_file, tmp_path):
+    # Data have dt=1 ps; using time_unit=ns means inputs are in ns
+    dcov = Dcov(fz=random_walk_file, dt=0.001, tmax=0.02, m=5, time_unit='ns', fout=str(tmp_path / 'D_analysis_ns'))
+    dcov.run_Dfit()
+    dcov.analysis(tc=0.01)
+    assert os.path.exists(tmp_path / 'D_analysis_ns.dat')
+    # tmax=0.02 ns -> 20 ps -> 20 lag steps (tmin=1)
+    assert len(dcov.D) == 20
+
+def test_multi_tmax_clamp(tmp_path):
+    # Two short trajectories; m and tmax too large should trigger clamp in multi mode
+    traj1 = generate_random_walk(n_steps=50, dim=3)
+    traj2 = generate_random_walk(n_steps=50, dim=3)
+    file1 = tmp_path / "traj1.dat"
+    file2 = tmp_path / "traj2.dat"
+    np.savetxt(file1, traj1)
+    np.savetxt(file2, traj2)
+
+    with pytest.warns(UserWarning, match="tmax"):
+        dcov = Dcov(fz=[str(file1), str(file2)], m=10, tmax=100.0, dt=1.0, fout=str(tmp_path / 'D_analysis_clamp'))
+    # tmax should be clamped to nperseg // m
+    assert dcov.tmax == dcov.nperseg // dcov.m

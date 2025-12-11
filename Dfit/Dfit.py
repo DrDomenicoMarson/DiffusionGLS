@@ -17,7 +17,7 @@ import os
 import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
-import progressbar as bar
+from tqdm import tqdm
 from scipy.special import gammainc
 
 from . import math_utils
@@ -54,14 +54,15 @@ def analyze_chunk_task(chunk_data, step, m, dt, nperseg, multi, ndim, d2max, nit
         if len(z_analyzed) <= m:
             # Calculate suggestions
             max_m_possible = len(z_analyzed) - 1
-            max_tmax_possible = (nperseg / m) * dt
+            max_lag_steps = max(1, nperseg // m)
+            max_tmax_possible = max_lag_steps * dt
             
             # We can't raise here easily without crashing the worker.
             # Return error info.
-            return None, ValueError(f"Segment too short (length N={len(z_analyzed)}) to calculate m={m} MSD points at lag time step={step} (t={step*dt} ps).\n"
+            return None, ValueError(f"Segment too short (length N={len(z_analyzed)}) to calculate m={m} MSD points at lag step={step} (t={step*dt} ps).\n"
                                     f"Suggestions:\n"
                                     f"  - Reduce m to at most {max_m_possible}\n"
-                                    f"  - Reduce tmax to less than {max_tmax_possible:.1f} ps\n"
+                                    f"  - Reduce tmax below {max_lag_steps} steps (~{max_tmax_possible:.1f} ps)\n"
                                     f"  - Use a longer trajectory")
 
         msds = np.zeros((ndim, m))
@@ -97,22 +98,52 @@ def analyze_chunk_task(chunk_data, step, m, dt, nperseg, multi, ndim, d2max, nit
     return results, None
 
 class Dcov():
+    """
+    Diffusion coefficient estimator using GLS on mean-squared displacement.
+    
+    Parameters of interest:
+    - m (int): number of MSD points used per lag step (unitless). For a given lag step s,
+      the fit uses MSD values at times s*dt, 2*s*dt, ..., m*s*dt. Larger m widens the
+      lag-time window (m*s*dt) but requires longer segments and increases cost.
+    """
     def __init__(self, fz: TrajectoryInput = None, universe=None, selection=None,
-                 m: int = 20, tmin: float = None, tmax: float = 100.0, dt: float = 1.0,
+                 m: int = 20, tmin: float | None = None, tmax: float = 100.0, dt: float = 1.0,
                  d2max: float = 1e-10, nitmax: int = 100,
                  nseg: int | None = None, imgfmt: str = 'pdf', fout: str = 'D_analysis',
-                 n_jobs: int = -1):
+                 n_jobs: int = -1, normalize_lengths: bool = False, time_unit: str = 'ps',
+                 diffusion_unit: str = 'cm2/s', progress: bool = True):
 
         # Initialize Reader
-        self.reader: TrajectoryReader = get_reader(fz=fz, universe=universe, selection=selection)
+        self.reader: TrajectoryReader = get_reader(fz=fz, universe=universe, selection=selection, normalize_lengths=normalize_lengths)
         
         # Use reader properties
         self.ndim = self.reader.ndim
         self.n = self.reader.n_frames - 1 # N is steps, n_frames is points
+
+        if hasattr(self.reader, 'lengths'):
+            unique_lengths = set(self.reader.lengths)
+            if len(unique_lengths) > 1 and not getattr(self.reader, 'normalized', False):
+                raise ValueError(f"All input trajectories must have the same length. Found lengths: {sorted(unique_lengths)}. "
+                                 f"Use normalize_lengths=True to truncate to the shortest trajectory.")
+
+        # Time unit handling: accept inputs in ps or ns, convert to ps internally
+        unit_map = {'ps': 1.0, 'ns': 1e3}
+        if time_unit not in unit_map:
+            raise ValueError(f"Unsupported time_unit '{time_unit}'. Use 'ps' or 'ns'.")
+        self.time_unit = time_unit
+        self.time_scale = unit_map[time_unit] # multiplier to convert chosen unit to ps
+
+        # Diffusion unit handling: internal nm^2/ps; allow reporting in cm^2/s
+        diff_map = {'nm2/ps': 1.0, 'cm2/s': 0.01}
+        if diffusion_unit not in diff_map:
+            raise ValueError(f"Unsupported diffusion_unit '{diffusion_unit}'. Use 'nm2/ps' or 'cm2/s'.")
+        self.diffusion_unit = diffusion_unit
+        self.diff_scale = diff_map[diffusion_unit]  # scale from nm^2/ps to desired unit
+        self.progress = progress
         
-        self.dt = dt 
+        self.dt = dt * self.time_scale  # internal dt in ps
         if not math.isclose(self.dt, self.reader.dt, rel_tol=1e-5):
-             warnings.warn(f"User provided dt ({self.dt}) differs from reader's dt ({self.reader.dt}). Using provided dt.", UserWarning)
+             warnings.warn(f"User provided dt ({dt} {self.time_unit}) differs from reader's dt ({self.reader.dt} ps). Using provided dt.", UserWarning)
 
         self.m = m
         
@@ -120,14 +151,14 @@ class Dcov():
         if tmin is None:
             self.tmin = 1
         else:
-            self.tmin = int(round(tmin / self.dt))
+            self.tmin = int(round((tmin * self.time_scale) / self.dt))
             if self.tmin < 1:
                 self.tmin = 1
                 
         if tmax is None:
-            self.tmax = int(round(100.0 / self.dt)) # Default 100 ps
+            self.tmax = int(round((100.0 * self.time_scale) / self.dt)) # Default 100 in chosen unit
         else:
-            self.tmax = int(round(tmax / self.dt))
+            self.tmax = int(round((tmax * self.time_scale) / self.dt))
             
         self.d2max = d2max
         self.nitmax = nitmax
@@ -179,6 +210,22 @@ class Dcov():
         if self.m > self.nperseg:
             self.m = self.nperseg
 
+        # In multi-traj mode, ensure tmax is feasible given segment length and m
+        if self.multi:
+            max_tmax_steps = max(1, self.nperseg // self.m)
+            if self.tmax > max_tmax_steps:
+                warnings.warn(
+                    f"tmax ({self.tmax * self.dt / self.time_scale:.4g} {self.time_unit}) is too long for segment length; "
+                    f"reducing to {max_tmax_steps * self.dt / self.time_scale:.4g} {self.time_unit}.",
+                    UserWarning
+                )
+                self.tmax = max_tmax_steps
+            if self.tmin > self.tmax:
+                raise ValueError(
+                    f"tmin ({self.tmin * self.dt / self.time_scale:.4g} {self.time_unit}) exceeds max feasible tmax "
+                    f"({self.tmax * self.dt / self.time_scale:.4g} {self.time_unit}) for m={self.m} and trajectory length {self.nperseg+1}."
+                )
+
         # Arrays
         self.a2full = np.zeros((self.tmax-self.tmin+1, self.ndim))
         self.s2full = np.zeros((self.tmax-self.tmin+1, self.ndim))
@@ -197,9 +244,11 @@ class Dcov():
         self.Dempstd = None
         self.q_m = None
         self.q_std = None
+        self.tc_selected = None  # selected tc in chosen time unit
+        self.tc_selected_idx = None  # index into lag arrays
 
     def _timestep_index(self, tc: float) -> int:
-        steps = tc / self.dt
+        steps = (tc * self.time_scale) / self.dt
         steps_int = round(steps)
         if not math.isclose(steps, steps_int, rel_tol=1e-9, abs_tol=1e-12):
             raise ValueError(f'tc [{tc}] must be a multiple of dt [{self.dt}] within numerical tolerance')
@@ -225,28 +274,34 @@ class Dcov():
         # Let's assume we load it.
         
         all_trajs = list(self.reader) # List of (N_frames, ndim) arrays
+
+        # Warm up numba-compiled kernels once to avoid a slow first step
+        try:
+            dummy = np.zeros(8)
+            _ = math_utils.compute_MSD_1D_via_correlation(dummy)
+            _ = math_utils.calc_gls(5, 3, np.arange(3, dtype=np.float64), self.d2max, 2,
+                                   c2=math_utils.setupc(2, 5), cm=math_utils.setupc(3, 5))
+        except Exception:
+            # If warm-up fails for any reason, continue; main computation will trigger JIT anyway.
+            pass
         
         non_converged_count = 0
-        
-        with bar.ProgressBar(max_value=self.tmax-self.tmin+1) as progbar:
-            for t, step in enumerate(range(self.tmin, self.tmax+1)):
-                
-                # 1. Full Trajectory Analysis (Only for Single Trajectory mode)
-                if not self.multi:
-                    # In single mode, all_trajs has 1 element
-                    full_z = all_trajs[0]
-                    for d in range(self.ndim):
-                        z_dim = full_z[:, d]
-                        z_strided = z_dim[::step]
-                        if len(z_strided) <= self.m:
-                             raise ValueError(f"Trajectory too short (length N={len(z_strided)}) to calculate m={self.m} MSD points at lag time step={step} (t={step*self.dt} ps). Please reduce tmax or m, or use a longer trajectory.")
-        # Initialize ProcessPoolExecutor outside the loop
-        # Use ProcessPoolExecutor to bypass GIL
-        max_workers = self.n_jobs if self.n_jobs > 0 else None
-        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+
+        # Determine worker count (treat n_jobs=0 as serial)
+        if self.n_jobs is None or self.n_jobs < 0:
+            max_workers = None
+        elif self.n_jobs == 0:
+            max_workers = 1
+        else:
+            max_workers = self.n_jobs
+
+        # Use threads to avoid pickling large trajectory chunks; numba kernels release the GIL
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             
-            with bar.ProgressBar(max_value=self.tmax-self.tmin+1) as progbar:
-                for t, step in enumerate(range(self.tmin, self.tmax+1)):
+            step_iter = range(self.tmin, self.tmax+1)
+            if self.progress:
+                step_iter = tqdm(step_iter, total=self.tmax-self.tmin+1, desc="lag steps")
+            for t, step in enumerate(step_iter):
                     
                     # 1. Full Trajectory Analysis (Only for Single Trajectory mode)
                     if not self.multi:
@@ -280,9 +335,9 @@ class Dcov():
                     if n_per_seg_step >= self.m:
                         cm_pre = math_utils.setupc(self.m, n_per_seg_step)
                     
-                    # Prepare chunks
+                    # Prepare chunks (coarser to reduce overhead)
                     n_workers_count = max_workers if max_workers else (os.cpu_count() or 1)
-                    chunk_size = max(1, self.nseg // (n_workers_count * 4))
+                    chunk_size = max(1, math.ceil(self.nseg / n_workers_count))
                     
                     # Prepare full trajectory values if single mode
                     a2full_3D_val = 0.0
@@ -339,7 +394,7 @@ class Dcov():
                         self.a2full[t] /= step
                         self.s2full[t] /= step
                     
-                    progbar.update(t)
+                    # tqdm auto-updates via iteration; no manual update needed
         
         self.non_converged_count = non_converged_count
         self.total_cases = (self.tmax - self.tmin + 1) * (self.nseg + (1 if not self.multi else 0))
@@ -354,7 +409,11 @@ class Dcov():
         # Calculate statistics first
         Dseg = self.s2.sum(axis=2) # across dims
         self.Dseg = np.mean(Dseg, axis=1) / (2.*self.ndim*self.dt) # mean across segs, nm^2 / (dt * ps)
-        self.Dstd = np.sqrt(self.s2var/ (2.*self.ndim*self.dt)**2) # nm^2 / (dt * ps)
+
+        if np.any(self.s2var < 0):
+            warnings.warn("Negative variance encountered; clamping to zero.", RuntimeWarning)
+        s2var_clamped = np.maximum(self.s2var, 0.0)
+        self.Dstd = np.sqrt(s2var_clamped/ (2.*self.ndim*self.dt)**2) # nm^2 / (dt * ps)
 
         if self.multi: # no 'full' run available
             self.D = self.Dseg # nm^2 / (dt * ps)
@@ -365,9 +424,18 @@ class Dcov():
 
         Dempstd = np.var(self.s2, axis=1) # across segments per dim
         Dempstd = np.sum(Dempstd, axis=1) # across dims
-        self.Dempstd = np.sqrt(Dempstd) / (2.*self.ndim*self.dt)
+        if np.any(Dempstd < 0):
+            warnings.warn("Negative empirical variance encountered; clamping to zero.", RuntimeWarning)
+        Dempstd_clamped = np.maximum(Dempstd, 0.0)
+        self.Dempstd = np.sqrt(Dempstd_clamped) / (2.*self.ndim*self.dt)
         self.q_m = np.mean(self.q, axis=1)
         self.q_std = np.std(self.q, axis=1)
+
+        # Scaled values for reporting
+        D_out = self.D * self.diff_scale
+        Dstd_out = self.Dstd * self.diff_scale
+        Dempstd_out = self.Dempstd * self.diff_scale
+        Dperdim_out = self.Dperdim * self.diff_scale
 
         if tc == 'auto':
             # Find index where q_m is closest to 0.5
@@ -382,11 +450,19 @@ class Dcov():
             # Calculate actual tc value for reporting
             # itc is 0-indexed relative to self.tmin
             step = self.tmin + itc
-            tc = step * self.dt
+            tc_ps = step * self.dt  # ps
+            tc_disp = tc_ps / self.time_scale  # user unit
             
-            print(f"Automatically selected tc = {tc:.4g} ps (Q = {self.q_m[itc]:.4f})")
+            print(f"Automatically selected tc = {tc_disp:.4g} {self.time_unit} (Q = {self.q_m[itc]:.4f})")
         else:
             itc = self._timestep_index(tc)
+            step = self.tmin + itc
+            tc_ps = step * self.dt  # ps
+            tc_disp = tc_ps / self.time_scale  # user unit
+
+        # store selected tc for later access
+        self.tc_selected_idx = itc
+        self.tc_selected = tc_disp
 
         with open(f'{self.fout}.dat','w') as g:
             g.write("DIFFUSION COEFFICIENT ESTIMATE\n")
@@ -394,8 +470,9 @@ class Dcov():
             # g.write("Trajectory: {}\n".format(self.fz)) # fz might be None now
             g.write(f"Number of dimensions : {self.ndim}\n")
             g.write(f"Min/max lag time [steps]: {self.tmin}/{self.tmax}\n")
-            g.write(f"Min/max lag time [ps]: {self.tmin*self.dt}/{self.tmax*self.dt}\n")
-            g.write(f"Parameter m: {self.m}\n")
+            g.write(f"Min/max lag time [{self.time_unit}]: {self.tmin*self.dt/self.time_scale}/{self.tmax*self.dt/self.time_scale}\n")
+            g.write(f"Parameter m (MSD points per lag step): {self.m}\n")
+            g.write(f"MSD window per lag step t: [{self.time_unit}] t to {self.m}*t (e.g., at t={self.tmin*self.dt/self.time_scale:.4g} {self.time_unit}, window spans up to {(self.m*self.tmin*self.dt)/self.time_scale:.4g} {self.time_unit})\n")
             
             if self.multi:
                 g.write(f"Number of molecules: {self.nseg}\n")
@@ -408,40 +485,49 @@ class Dcov():
             if hasattr(self, 'non_converged_count'):
                  g.write(f"Optimizer convergence failures: {self.non_converged_count} ({self.percent_failed:.1f}% of {self.total_cases})\n")
 
-            g.write(f"Your chosen diffusion coefficient at {tc} ps: {self.D[itc]:.4e} nm^2/ps\n")
-            g.write(f"Your chosen diffusion coefficient at {tc} ps: {self.D[itc]*0.01:.4e} cm^2/s\n")
+            # Summary at chosen tc
+            g.write(f"Your chosen diffusion coefficient at {tc_disp} {self.time_unit}: {D_out[itc]:.4e} {self.diffusion_unit}\n")
+            g.write(f"Standard deviation at {tc_disp} {self.time_unit}: {Dstd_out[itc]:.4e} {self.diffusion_unit}\n")
+            g.write(f"Empirical std at {tc_disp} {self.time_unit}: {Dempstd_out[itc]:.4e} {self.diffusion_unit}\n")
+            g.write(f"Q-factor at {tc_disp} {self.time_unit}: {self.q_m[itc]:.4f}\n")
+            if self.diffusion_unit != 'cm2/s':
+                g.write(f"Your chosen diffusion coefficient at {tc_disp} {self.time_unit}: {self.D[itc]*0.01:.4e} cm^2/s\n")
             g.write("DIFFUSION COEFFICIENT OUTPUT SUMMARY:\n")
-            g.write("t[ps] D[nm^2/ps] varD[nm^4/ps^2] Q D[cm^2/s] varD[cm^4/s^2]\n")
+            g.write(f"t[{self.time_unit}] D[{self.diffusion_unit}] varD[{self.diffusion_unit}^2] Q\n")
             for t,step in enumerate(range(self.tmin, self.tmax+1)):
-                g.write(f"{step*self.dt:.4g} {self.D[t]:.5g} {self.Dstd[t]**2:.5g} {self.q_m[t]:.5f} {self.D[t]*0.01:.5g} {(self.Dstd[t]**2)*0.0001:.5g}\n")
+                g.write(f"{(step*self.dt)/self.time_scale:.4g} {D_out[t]:.5g} {(Dstd_out[t]**2):.5g} {self.q_m[t]:.5f}\n")
             if self.ndim > 1:
                 g.write("\nDIFFUSION COEFFICIENT PER DIMENSION:\n")
-                g.write("TIMESTEP Dx[nm^2/ps] Dy[nm^2/ps] ...\n")
-                for t, Dt in zip( (range(self.tmin,self.tmax+1)), self.Dperdim):
-                    g.write(f"{t:.4f} {Dt}\n")
+                g.write(f"t[{self.time_unit}] Dx[{self.diffusion_unit}] Dy[{self.diffusion_unit}] ...\n")
+                for step, Dt in zip(range(self.tmin, self.tmax+1), self.Dperdim):
+                    g.write(f"{(step*self.dt)/self.time_scale:.4f} {Dperdim_out[step-self.tmin]}\n")
         
-        self.plot_results(tc)
+        self.plot_results(tc_ps)
 
     def plot_results(self, tc):
         sns.set_context("paper", font_scale=0.5)
         fig, ax = plt.subplots(2,1,figsize=(6,6),sharex=True)
-        xs = np.arange(self.tmin*self.dt,(self.tmax+1)*self.dt,self.dt)
-        ax[0].plot(xs,self.D,color='C0',label=r'$D$')
-        # ax[0].plot(xs,Dseg,color='tab:orange', label= 'mean D segm')
-        ax[0].plot(xs,self.D-self.Dstd,color='black',linestyle='dotted', label=r'$\delta \overline{D}^\mathrm{predicted}$')
-        ax[0].plot(xs,self.D+self.Dstd,color='black',linestyle='dotted')
-        ax[0].fill_between(xs,self.D-self.Dempstd,self.D+self.Dempstd,color='C0',alpha=0.5, label = r'$\delta \overline{D}^\mathrm{empirical}$')
-        ax[0].axvline(tc,color='tab:red',linestyle='dashed')
-        ax[0].set(ylabel=r'$D(t)$ [nm$^2$ ps$^{-1}$]')
-        ax[0].set(xlim=(self.tmin*self.dt,self.tmax*self.dt))
+        xs = np.arange(self.tmin*self.dt,(self.tmax+1)*self.dt,self.dt) / self.time_scale
+        D_out = self.D * self.diff_scale
+        Dstd_out = self.Dstd * self.diff_scale
+        Dempstd_out = self.Dempstd * self.diff_scale
+
+        ax[0].plot(xs,D_out,color='C0',label=r'$D$')
+        ax[0].plot(xs,D_out-Dstd_out,color='black',linestyle='dotted', label=r'$\delta \overline{D}^\mathrm{predicted}$')
+        ax[0].plot(xs,D_out+Dstd_out,color='black',linestyle='dotted')
+        ax[0].fill_between(xs,D_out-Dempstd_out,D_out+Dempstd_out,color='C0',alpha=0.5, label = r'$\delta \overline{D}^\mathrm{empirical}$')
+        ax[0].axvline(tc/self.time_scale,color='tab:red',linestyle='dashed')
+        ax[0].set(ylabel=fr'$D(t)$ [{self.diffusion_unit}]')
+        ax[0].set(xlim=(self.tmin*self.dt/self.time_scale,self.tmax*self.dt/self.time_scale))
         ax[0].ticklabel_format(style='scientific',scilimits=(-3,4))
         ax[0].legend(ncol=2)
+        ax[0].set_title(f"MSD window per lag: t .. {self.m}×t [{self.time_unit}]")
         ax[1].plot(xs,self.q_m,color='C0')
         ax[1].fill_between(xs,self.q_m-self.q_std,self.q_m+self.q_std,color='C0',alpha=0.5)
         ax[1].axhline(0.5,linestyle='dashed',color='gray',linewidth=1.2)
-        ax[1].axvline(tc,color='tab:red',linestyle='dashed')
+        ax[1].axvline(tc/self.time_scale,color='tab:red',linestyle='dashed')
         ax[1].set(ylabel=r'$Q(t)$')
-        ax[1].set(xlabel=r'lag time $t$ [ps]')
+        ax[1].set(xlabel=fr'lag time $t$ [{self.time_unit}]')
         ax[1].set(ylim=(0,1))
         fig.tight_layout(h_pad=0.1)
         fig.savefig(f'{self.fout}.{self.imgfmt}',dpi=300)
