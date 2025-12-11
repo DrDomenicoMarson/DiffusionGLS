@@ -13,6 +13,7 @@ from pathlib import Path
 import warnings
 import concurrent.futures
 import os
+import pickle
 
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -247,6 +248,12 @@ class Dcov():
         self.tc_selected = None  # selected tc in chosen time unit
         self.tc_selected_idx = None  # index into lag arrays
 
+    @staticmethod
+    def load(filename: str) -> 'Dcov':
+        """Load a saved Dcov state from a pickle file."""
+        with open(filename, 'rb') as f:
+            return pickle.load(f)
+
     def _timestep_index(self, tc: float) -> int:
         steps = (tc * self.time_scale) / self.dt
         steps_int = round(steps)
@@ -257,7 +264,7 @@ class Dcov():
             raise ValueError(f'tc [{tc}] is outside the computed timestep range')
         return itc
 
-    def run_Dfit(self):
+    def run_Dfit(self, save_model: bool = False):
         """ Main Function to calculate the stepsize sigma^2 and offset a^2. """
         
         # Pre-load data if it fits in memory or iterate?
@@ -404,8 +411,13 @@ class Dcov():
             self.percent_failed = (non_converged_count / self.total_cases) * 100
             print(f"WARNING: Optimizer did not converge in {non_converged_count} cases ({self.percent_failed:.1f}% of Total {self.total_cases}). Falling back to M=2 for those cases.")
 
+        if save_model:
+            with open(f'{self.fout}.pkl', 'wb') as f:
+                pickle.dump(self, f)
+                print(f"Model saved to {self.fout}.pkl")
+
     # Output and plotting
-    def analysis(self, tc: float | str = 10):
+    def analysis(self, tc: float | str = 10, fout_prefix: str | None = None):
         # Calculate statistics first
         Dseg = self.s2.sum(axis=2) # across dims
         self.Dseg = np.mean(Dseg, axis=1) / (2.*self.ndim*self.dt) # mean across segs, nm^2 / (dt * ps)
@@ -463,8 +475,17 @@ class Dcov():
         # store selected tc for later access
         self.tc_selected_idx = itc
         self.tc_selected = tc_disp
+        
+        # Determine output filename base
+        if fout_prefix is not None:
+            out_base = fout_prefix
+        else:
+            # Format tc for filename to avoid slashes or dots if possible or just standard format
+            # Using fixed precision or string format if it was a string (though it's converted to float)
+            # tc_disp is float.
+            out_base = f"{self.fout}.tc_{tc_disp:.4g}"
 
-        with open(f'{self.fout}.dat','w') as g:
+        with open(f'{out_base}.dat','w') as g:
             g.write("DIFFUSION COEFFICIENT ESTIMATE\n")
             g.write("INPUT:\n")
             # g.write("Trajectory: {}\n".format(self.fz)) # fz might be None now
@@ -502,9 +523,9 @@ class Dcov():
                 for step, Dt in zip(range(self.tmin, self.tmax+1), self.Dperdim):
                     g.write(f"{(step*self.dt)/self.time_scale:.4f} {Dperdim_out[step-self.tmin]}\n")
         
-        self.plot_results(tc_ps)
+        self.plot_results(tc_ps, out_base)
 
-    def plot_results(self, tc):
+    def plot_results(self, tc, out_base):
         sns.set_context("paper", font_scale=0.5)
         fig, ax = plt.subplots(2,1,figsize=(6,6),sharex=True)
         xs = np.arange(self.tmin*self.dt,(self.tmax+1)*self.dt,self.dt) / self.time_scale
@@ -530,7 +551,7 @@ class Dcov():
         ax[1].set(xlabel=fr'lag time $t$ [{self.time_unit}]')
         ax[1].set(ylim=(0,1))
         fig.tight_layout(h_pad=0.1)
-        fig.savefig(f'{self.fout}.{self.imgfmt}',dpi=300)
+        fig.savefig(f'{out_base}.{self.imgfmt}',dpi=300)
         plt.close(fig)
 
     def finite_size_correction(self, T=300, eta=None, L=None, boxtype='cubic', tc=10):
