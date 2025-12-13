@@ -536,7 +536,9 @@ class Dcov():
         ax[0].plot(xs,D_out,color='C0',label=r'$D$')
         ax[0].plot(xs,D_out-Dstd_out,color='black',linestyle='dotted', label=r'$\delta \overline{D}^\mathrm{predicted}$')
         ax[0].plot(xs,D_out+Dstd_out,color='black',linestyle='dotted')
-        ax[0].fill_between(xs,D_out-Dempstd_out,D_out+Dempstd_out,color='C0',alpha=0.5, label = r'$\delta \overline{D}^\mathrm{empirical}$')
+        ax[0].fill_between(xs, D_out - Dempstd_out, D_out + Dempstd_out,
+                           color='C0', alpha=0.5, edgecolor='none', linewidth=0,
+                           label=r'$\delta \overline{D}^\mathrm{empirical}$')
         ax[0].axvline(tc/self.time_scale,color='tab:red',linestyle='dashed')
         ax[0].set(ylabel=fr'$D(t)$ [{self.diffusion_unit}]')
         ax[0].set(xlim=(self.tmin*self.dt/self.time_scale,self.tmax*self.dt/self.time_scale))
@@ -544,7 +546,8 @@ class Dcov():
         ax[0].legend(ncol=2)
         ax[0].set_title(f"MSD window per lag: t .. {self.m}×t [{self.time_unit}]")
         ax[1].plot(xs,self.q_m,color='C0')
-        ax[1].fill_between(xs,self.q_m-self.q_std,self.q_m+self.q_std,color='C0',alpha=0.5)
+        ax[1].fill_between(xs, self.q_m - self.q_std, self.q_m + self.q_std,
+                           color='C0', alpha=0.5, edgecolor='none', linewidth=0)
         ax[1].axhline(0.5,linestyle='dashed',color='gray',linewidth=1.2)
         ax[1].axvline(tc/self.time_scale,color='tab:red',linestyle='dashed')
         ax[1].set(ylabel=r'$Q(t)$')
