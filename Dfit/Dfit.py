@@ -596,20 +596,21 @@ class Dcov():
 
             d_mean = float(np.mean(D_seg_tc))
             d_median = float(np.median(D_seg_tc))
+            q05, q25, q75, q95 = np.percentile(D_seg_tc, [5, 25, 75, 95])
 
             ax2.axvline(D_out[itc], color='black', linestyle='solid', linewidth=1.2, label=r'$D(t_c)$ (estimate)')
             ax2.axvline(d_mean, color='C0', linestyle='dashed', linewidth=1.2, label=r'mean($D_i$)')
             ax2.axvline(d_median, color='C0', linestyle='solid', linewidth=1.2, label=r'median($D_i$)')
-            ax2.plot(D_seg_tc, np.zeros_like(D_seg_tc), '|', color='C0', alpha=0.6, markersize=14)
+            ax2.plot(D_seg_tc, np.zeros_like(D_seg_tc), '|', color='C0', alpha=0.3, markersize=10)
+            ax2.axvspan(q25, q75, color='C0', alpha=0.12, label='25–75%')
+            ax2.axvspan(q05, q95, color='C0', alpha=0.05, label='5–95%')
 
             # Cosmetic: y-axis has no physical meaning here; violin width encodes density.
-            ax2.set(yticks=[], ylabel=None)
+            ax2.set(yticks=[], ylabel='Density of $D_i$')
             ax2.set_ylim(-0.6, 0.6)
             ax2.ticklabel_format(style='scientific', scilimits=(-3, 4))
             ax2.set(xlabel=fr'$D$ [{self.diffusion_unit}]')
             ax2.set_title(f"Per-segment $D$ at $t_c={tc / self.time_scale:.4g}$ {self.time_unit} (n={self.nseg})")
-            ax2.text(0.01, 0.95, "Violin width ∝ density of $D_i$",
-                     transform=ax2.transAxes, ha='left', va='top', fontsize=8)
             ax2.legend(loc='best')
         else:
             ax2.axis('off')
