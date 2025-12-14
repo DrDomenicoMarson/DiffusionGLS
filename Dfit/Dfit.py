@@ -246,6 +246,8 @@ class Dcov():
         # Results
         self.Dseg = None
         self.Dstd = None
+        self.Dsem_pred = None
+        self.Dsem_emp = None
         self.Dperdim = None
         self.D = None
         self.Dempstd = None
@@ -449,10 +451,16 @@ class Dcov():
         self.q_m = np.mean(self.q, axis=1)
         self.q_std = np.std(self.q, axis=1)
 
+        sem_denom = math.sqrt(max(int(self.nseg), 1))
+        self.Dsem_pred = self.Dstd / sem_denom
+        self.Dsem_emp = self.Dempstd / sem_denom
+
         # Scaled values for reporting
         D_out = self.D * self.diff_scale
         Dstd_out = self.Dstd * self.diff_scale
         Dempstd_out = self.Dempstd * self.diff_scale
+        Dsem_pred_out = self.Dsem_pred * self.diff_scale
+        Dsem_emp_out = self.Dsem_emp * self.diff_scale
         Dperdim_out = self.Dperdim * self.diff_scale
 
         if tc == 'auto':
@@ -516,6 +524,8 @@ class Dcov():
             g.write(f"Your chosen diffusion coefficient at {tc_disp} {self.time_unit}: {D_out[itc]:.4e} {self.diffusion_unit}\n")
             g.write(f"Standard deviation at {tc_disp} {self.time_unit}: {Dstd_out[itc]:.4e} {self.diffusion_unit}\n")
             g.write(f"Empirical std at {tc_disp} {self.time_unit}: {Dempstd_out[itc]:.4e} {self.diffusion_unit}\n")
+            g.write(f"SEM (predicted) at {tc_disp} {self.time_unit} [n={self.nseg}]: {Dsem_pred_out[itc]:.4e} {self.diffusion_unit}\n")
+            g.write(f"SEM (empirical) at {tc_disp} {self.time_unit} [n={self.nseg}]: {Dsem_emp_out[itc]:.4e} {self.diffusion_unit}\n")
             g.write(f"Q-factor at {tc_disp} {self.time_unit}: {self.q_m[itc]:.4f}\n")
             if self.diffusion_unit != 'cm2/s':
                 g.write(f"Your chosen diffusion coefficient at {tc_disp} {self.time_unit}: {self.D[itc]*0.01:.4e} cm^2/s\n")
@@ -533,33 +543,78 @@ class Dcov():
 
     def plot_results(self, tc, out_base):
         sns.set_context("paper", font_scale=0.5)
-        fig, ax = plt.subplots(2,1,figsize=(6,6),sharex=True)
+        fig = plt.figure(figsize=(6,7.5))
+        gs = fig.add_gridspec(3, 1, height_ratios=(3.0, 2.0, 2.0))
+        ax0 = fig.add_subplot(gs[0, 0])
+        ax1 = fig.add_subplot(gs[1, 0], sharex=ax0)
+        ax2 = fig.add_subplot(gs[2, 0])
         xs = np.arange(self.tmin*self.dt,(self.tmax+1)*self.dt,self.dt) / self.time_scale
         D_out = self.D * self.diff_scale
         Dstd_out = self.Dstd * self.diff_scale
         Dempstd_out = self.Dempstd * self.diff_scale
 
-        ax[0].plot(xs,D_out,color='C0',label=r'$D$')
-        ax[0].plot(xs,D_out-Dstd_out,color='black',linestyle='dotted', label=r'$\delta \overline{D}^\mathrm{predicted}$')
-        ax[0].plot(xs,D_out+Dstd_out,color='black',linestyle='dotted')
-        ax[0].fill_between(xs, D_out - Dempstd_out, D_out + Dempstd_out,
-                           color='C0', alpha=0.5, edgecolor='none', linewidth=0,
-                           label=r'$\delta \overline{D}^\mathrm{empirical}$')
-        ax[0].axvline(tc/self.time_scale,color='tab:red',linestyle='dashed')
-        ax[0].set(ylabel=fr'$D(t)$ [{self.diffusion_unit}]')
-        ax[0].set(xlim=(self.tmin*self.dt/self.time_scale,self.tmax*self.dt/self.time_scale))
-        ax[0].ticklabel_format(style='scientific',scilimits=(-3,4))
-        ax[0].legend(ncol=2)
-        ax[0].set_title(f"MSD window per lag: t .. {self.m}×t [{self.time_unit}]")
-        ax[1].plot(xs,self.q_m,color='C0')
-        ax[1].fill_between(xs, self.q_m - self.q_std, self.q_m + self.q_std,
-                           color='C0', alpha=0.5, edgecolor='none', linewidth=0)
-        ax[1].axhline(0.5,linestyle='dashed',color='gray',linewidth=1.2)
-        ax[1].axvline(tc/self.time_scale,color='tab:red',linestyle='dashed')
-        ax[1].set(ylabel=r'$Q(t)$')
-        ax[1].set(xlabel=fr'lag time $t$ [{self.time_unit}]')
-        ax[1].set(ylim=(0,1))
-        fig.tight_layout(h_pad=0.1)
+        ax0.plot(xs, D_out, color='C0', label=r'$D$')
+        ax0.plot(xs, D_out - Dstd_out, color='black', linestyle='dotted', label=r'$\delta \overline{D}^\mathrm{predicted}$')
+        ax0.plot(xs, D_out + Dstd_out, color='black', linestyle='dotted')
+        ax0.fill_between(xs, D_out - Dempstd_out, D_out + Dempstd_out,
+                         color='C0', alpha=0.5, edgecolor='none', linewidth=0,
+                         label=r'$\delta \overline{D}^\mathrm{empirical}$')
+        ax0.axvline(tc / self.time_scale, color='tab:red', linestyle='dashed')
+        ax0.set(ylabel=fr'$D(t)$ [{self.diffusion_unit}]')
+        ax0.set(xlim=(self.tmin * self.dt / self.time_scale, self.tmax * self.dt / self.time_scale))
+        ax0.ticklabel_format(style='scientific', scilimits=(-3, 4))
+        ax0.legend(ncol=2)
+        ax0.set_title(f"MSD window per lag: t .. {self.m}×t [{self.time_unit}]")
+
+        ax1.plot(xs, self.q_m, color='C0')
+        ax1.fill_between(xs, self.q_m - self.q_std, self.q_m + self.q_std,
+                         color='C0', alpha=0.5, edgecolor='none', linewidth=0)
+        ax1.axhline(0.5, linestyle='dashed', color='gray', linewidth=1.2)
+        ax1.axvline(tc / self.time_scale, color='tab:red', linestyle='dashed')
+        ax1.set(ylabel=r'$Q(t)$')
+        ax1.set(xlabel=fr'lag time $t$ [{self.time_unit}]')
+        ax1.set(ylim=(0, 1))
+
+        # Distribution of per-segment/molecule estimates at the selected tc
+        itc = getattr(self, 'tc_selected_idx', None)
+        if itc is None:
+            step = int(round(tc / self.dt))
+            itc = step - self.tmin
+
+        if 0 <= itc < len(self.D) and self.nseg > 0:
+            D_seg_tc = self.s2[itc].sum(axis=1) / (2.0 * self.ndim * self.dt) * self.diff_scale
+            violin_kwargs = dict(positions=[0], showmeans=False, showextrema=False, showmedians=False)
+            try:
+                parts = ax2.violinplot([D_seg_tc], orientation='horizontal', **violin_kwargs)
+            except TypeError:
+                parts = ax2.violinplot([D_seg_tc], vert=False, **violin_kwargs)
+            for body in parts.get('bodies', []):
+                body.set_facecolor('C0')
+                body.set_alpha(0.5)
+                body.set_edgecolor('none')
+                body.set_linewidth(0.0)
+
+            d_mean = float(np.mean(D_seg_tc))
+            d_median = float(np.median(D_seg_tc))
+
+            ax2.axvline(D_out[itc], color='black', linestyle='solid', linewidth=1.2, label=r'$D(t_c)$ (estimate)')
+            ax2.axvline(d_mean, color='C0', linestyle='dashed', linewidth=1.2, label=r'mean($D_i$)')
+            ax2.axvline(d_median, color='C0', linestyle='solid', linewidth=1.2, label=r'median($D_i$)')
+            ax2.plot(D_seg_tc, np.zeros_like(D_seg_tc), '|', color='C0', alpha=0.6, markersize=14)
+
+            # Cosmetic: y-axis has no physical meaning here; violin width encodes density.
+            ax2.set(yticks=[], ylabel=None)
+            ax2.set_ylim(-0.6, 0.6)
+            ax2.ticklabel_format(style='scientific', scilimits=(-3, 4))
+            ax2.set(xlabel=fr'$D$ [{self.diffusion_unit}]')
+            ax2.set_title(f"Per-segment $D$ at $t_c={tc / self.time_scale:.4g}$ {self.time_unit} (n={self.nseg})")
+            ax2.text(0.01, 0.95, "Violin width ∝ density of $D_i$",
+                     transform=ax2.transAxes, ha='left', va='top', fontsize=8)
+            ax2.legend(loc='best')
+        else:
+            ax2.axis('off')
+
+        fig.tight_layout(h_pad=0.2)
         fig.savefig(f'{out_base}.{self.imgfmt}',dpi=300)
         plt.close(fig)
 

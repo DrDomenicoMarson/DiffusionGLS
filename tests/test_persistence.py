@@ -65,7 +65,7 @@ def test_flexible_analysis_output(random_walk_file, tmp_path):
     
     # Explicitly check for what we expect standard formatting to do for 5.0
     expected_suffix = f"{5.0:.4g}" # likely '5'
-    expected_base = f"{fout}_{expected_suffix}"
+    expected_base = f"{fout}.tc_{expected_suffix}"
     
     assert os.path.exists(f"{expected_base}.dat")
     assert os.path.exists(f"{expected_base}.pdf")
@@ -80,6 +80,6 @@ def test_auto_tc_naming(random_walk_file, tmp_path):
     # We need to find what tc was selected to verify the file
     tc_selected = dcov.tc_selected
     expected_suffix = f"{tc_selected:.4g}"
-    expected_path = f"{fout}_{expected_suffix}.dat"
+    expected_path = f"{fout}.tc_{expected_suffix}.dat"
     
     assert os.path.exists(expected_path)
