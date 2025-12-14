@@ -193,8 +193,14 @@ class Dcov():
             
             if nseg is None:
                 if auto_nseg < 1:
-                    raise ValueError('Timeseries too short! Reduce tmax or provide nseg >= 1')
-                self.nseg = auto_nseg
+                    warnings.warn(
+                        "Timeseries too short for automatic nseg heuristic; using nseg=1. "
+                        "Reduce tmax or set nseg explicitly to control segmentation.",
+                        UserWarning,
+                    )
+                    self.nseg = 1
+                else:
+                    self.nseg = auto_nseg
             else:
                 if nseg < 1:
                     raise ValueError('nseg must be at least 1')
