@@ -553,9 +553,9 @@ class Dcov():
         Dstd_out = self.Dstd * self.diff_scale
         Dempstd_out = self.Dempstd * self.diff_scale
 
-        ax0.plot(xs, D_out, color='C0', label=r'$D$')
-        ax0.plot(xs, D_out - Dstd_out, color='black', linestyle='dotted', label=r'$\delta \overline{D}^\mathrm{predicted}$')
-        ax0.plot(xs, D_out + Dstd_out, color='black', linestyle='dotted')
+        ax0.plot(xs, D_out, color='C0', linewidth=1.0, label=r'$D$')
+        ax0.plot(xs, D_out - Dstd_out, color='black', linestyle='dotted', linewidth=0.7, label=r'$\delta \overline{D}^\mathrm{predicted}$')
+        ax0.plot(xs, D_out + Dstd_out, color='black', linestyle='dotted', linewidth=0.7)
         ax0.fill_between(xs, D_out - Dempstd_out, D_out + Dempstd_out,
                          color='C0', alpha=0.5, edgecolor='none', linewidth=0,
                          label=r'$\delta \overline{D}^\mathrm{empirical}$')
