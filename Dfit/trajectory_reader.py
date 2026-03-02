@@ -37,13 +37,17 @@ class NumpyTextReader(TrajectoryReader):
         else:
             raise TypeError(f"Invalid input type for NumpyTextReader: {type(fz)}")
         
+        if len(self.files) == 0:
+            raise ValueError("No trajectory files provided. Pass at least one file path.")
+        
         self.n_trajs = len(self.files)
         
         # Read first file to determine properties
         if self.n_trajs > 0:
             first_traj = np.loadtxt(self.files[0])
-            # Handle 1D vs Multi-D
-            if len(first_traj.shape) == 1:
+            # Handle 0-d scalar, 1D, and multi-D arrays from loadtxt
+            first_traj = np.atleast_1d(first_traj)
+            if first_traj.ndim == 1:
                 self.n_frames = first_traj.shape[0]
                 self.ndim = 1
             else:

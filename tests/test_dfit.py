@@ -218,3 +218,62 @@ def test_multi_tmax_clamp(tmp_path):
         dcov = Dcov(fz=[str(file1), str(file2)], m=10, tmax=100.0, dt=1.0, fout=str(tmp_path / 'D_analysis_clamp'))
     # tmax should be clamped to nperseg // m
     assert dcov.tmax == dcov.nperseg // dcov.m
+
+
+# --- P1 / P2 validation tests ---
+
+def test_dt_auto_adopt(random_walk_file, tmp_path):
+    """When dt is not provided, it should adopt reader.dt (1.0 for text files)."""
+    dcov = Dcov(fz=random_walk_file, m=10, tmax=20.0, fout=str(tmp_path / 'D_analysis'))
+    assert dcov.dt == 1.0  # NumpyTextReader defaults to 1.0 ps
+
+
+def test_dt_explicit_mismatch_warns(random_walk_file, tmp_path):
+    """Explicit dt differing from reader.dt should warn."""
+    with pytest.warns(UserWarning, match="differs from"):
+        Dcov(fz=random_walk_file, dt=0.5, tmax=20.0, fout=str(tmp_path / 'D_analysis'))
+
+
+def test_m_too_small_error(tmp_path):
+    """m clamped below 2 should raise ValueError, not crash later."""
+    # Create a very short trajectory: 2 frames -> nperseg=1
+    traj = generate_random_walk(n_steps=1, dim=3)  # 2 frames
+    file_path = tmp_path / "tiny_traj.dat"
+    np.savetxt(file_path, traj)
+
+    with pytest.raises(ValueError, match="m must be >= 2"):
+        Dcov(fz=str(file_path), m=20, tmax=1.0, dt=1.0, nseg=1,
+             fout=str(tmp_path / 'D_analysis'))
+
+
+def test_analysis_before_run_error(random_walk_file, tmp_path):
+    """analysis() before run_Dfit() should raise RuntimeError."""
+    dcov = Dcov(fz=random_walk_file, m=10, tmax=20.0, fout=str(tmp_path / 'D_analysis'))
+    with pytest.raises(RuntimeError, match="run_Dfit"):
+        dcov.analysis(tc=10)
+
+
+def test_fsc_before_analysis_error(random_walk_file, tmp_path):
+    """finite_size_correction() before analysis() should raise RuntimeError."""
+    dcov = Dcov(fz=random_walk_file, m=10, tmax=20.0, fout=str(tmp_path / 'D_analysis'))
+    dcov.run_Dfit()
+    with pytest.raises(RuntimeError, match="analysis"):
+        dcov.finite_size_correction(T=300, eta=0.001, L=10.0, tc=10)
+
+
+def test_empty_files_error(tmp_path):
+    """Empty file list should raise ValueError early."""
+    with pytest.raises(ValueError, match="No trajectory files"):
+        Dcov(fz=[], fout=str(tmp_path / 'D_analysis'))
+
+
+def test_single_frame_error(tmp_path):
+    """Trajectory with only 1 frame should raise ValueError early."""
+    # np.loadtxt on a single-row 3D file reads shape (3,) which becomes 3 frames×1D.
+    # So write a single value to get exactly 1 frame in 1D.
+    file_path = tmp_path / "one_frame.dat"
+    file_path.write_text("0.0\n")
+
+    with pytest.raises(ValueError, match="too short"):
+        Dcov(fz=str(file_path), fout=str(tmp_path / 'D_analysis'))
+
