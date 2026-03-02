@@ -48,10 +48,16 @@ def test_run_dfit(random_walk_file, tmp_path):
     # Check if results are populated
     assert dcov.D is not None
     assert dcov.Dstd is not None
+    assert dcov.Dsem_pred is not None
+    assert dcov.Dsem_emp is not None
     assert dcov.q_m is not None
     
     # Check shapes
     assert len(dcov.D) == 20 # tmax - tmin + 1 (default tmin=1)
+    assert dcov.Dsem_pred.shape == dcov.Dstd.shape
+    assert dcov.Dsem_emp.shape == dcov.Dempstd.shape
+    assert np.allclose(dcov.Dsem_pred, dcov.Dstd / np.sqrt(dcov.nseg))
+    assert np.allclose(dcov.Dsem_emp, dcov.Dempstd / np.sqrt(dcov.nseg))
     
     # Basic sanity check: D should be positive
     assert np.all(dcov.D > 0)
@@ -108,7 +114,9 @@ def test_auto_tc(random_walk_file, tmp_path):
     dcov.analysis(tc='auto')
     
     # Check if output file exists
-    assert os.path.exists(tmp_path / 'D_analysis.dat')
+    tc_selected = dcov.tc_selected
+    expected_path = f"{tmp_path / 'D_analysis'}.tc_{tc_selected:.4g}.dat"
+    assert os.path.exists(expected_path)
     
     # We can't easily assert WHICH tc was chosen without parsing stdout or checking internals,
     # but we can check that it didn't crash and produced output.
@@ -192,25 +200,25 @@ def test_n_jobs(random_walk_file, tmp_path):
     dcov = Dcov(fz=random_walk_file, m=10, tmax=20.0, n_jobs=1, fout=str(tmp_path / 'D_analysis_1'))
     dcov.run_Dfit()
     dcov.analysis(tc=10)
-    assert os.path.exists(tmp_path / 'D_analysis_1.dat')
+    assert os.path.exists(f"{tmp_path / 'D_analysis_1'}.tc_{10.0:.4g}.dat")
     
     dcov = Dcov(fz=random_walk_file, m=10, tmax=20.0, n_jobs=2, fout=str(tmp_path / 'D_analysis_2'))
     dcov.run_Dfit()
     dcov.analysis(tc=10)
-    assert os.path.exists(tmp_path / 'D_analysis_2.dat')
+    assert os.path.exists(f"{tmp_path / 'D_analysis_2'}.tc_{10.0:.4g}.dat")
 
     # n_jobs=0 should be treated as serial (1 worker)
     dcov = Dcov(fz=random_walk_file, m=10, tmax=20.0, n_jobs=0, fout=str(tmp_path / 'D_analysis_0'))
     dcov.run_Dfit()
     dcov.analysis(tc=10)
-    assert os.path.exists(tmp_path / 'D_analysis_0.dat')
+    assert os.path.exists(f"{tmp_path / 'D_analysis_0'}.tc_{10.0:.4g}.dat")
 
 def test_time_unit_ns(random_walk_file, tmp_path):
     # Data have dt=1 ps; using time_unit=ns means inputs are in ns
     dcov = Dcov(fz=random_walk_file, dt=0.001, tmax=0.02, m=5, time_unit='ns', fout=str(tmp_path / 'D_analysis_ns'))
     dcov.run_Dfit()
     dcov.analysis(tc=0.01)
-    assert os.path.exists(tmp_path / 'D_analysis_ns.dat')
+    assert os.path.exists(f"{tmp_path / 'D_analysis_ns'}.tc_{0.01:.4g}.dat")
     # tmax=0.02 ns -> 20 ps -> 20 lag steps (tmin=1)
     assert len(dcov.D) == 20
 
