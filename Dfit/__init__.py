@@ -1,2 +1,9 @@
-from __future__ import absolute_import
-from .Dfit import *
+from .Dfit import Dcov, XI_CUBIC, BOLTZMANN_K
+from .trajectory_reader import TrajectoryReader, NumpyTextReader, get_reader
+
+try:
+    from .trajectory_reader import MDAnalysisReader
+except ImportError:
+    pass
+
+__all__ = ['Dcov', 'TrajectoryReader', 'NumpyTextReader', 'get_reader']

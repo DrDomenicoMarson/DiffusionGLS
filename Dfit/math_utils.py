@@ -51,15 +51,13 @@ def calc_cov(n,m,c,a2,s2):
 
 @nb.jit(nopython=True)
 def inv_mat(A):
-    # Regularization to prevent singularity
-    # We need to copy A to avoid modifying the input if it's used elsewhere
-    # But A is usually created in calc_cov.
-    # Let's add epsilon to diagonal.
-    n = A.shape[0]
+    # Regularization to prevent singularity.
+    # Copy to avoid mutating the caller's matrix.
+    B = A.copy()
+    n = B.shape[0]
     for i in range(n):
-        A[i,i] += 1e-6
-    cinv = np.linalg.inv(A)
-    return cinv
+        B[i,i] += 1e-6
+    return np.linalg.inv(B)
 
 @nb.jit(nopython=True)
 def calc_a2s2(m,v,cinv, a2, s2):
@@ -213,14 +211,19 @@ def compute_autocorrelation_via_fft(x):
 def compute_MSD_1D_via_correlation(x):
     """
     One-dimensional MSD calculated via FFT-based auto-correlation.
+    Uses vectorized cumulative sums instead of a Python loop.
     """
     corrx = compute_autocorrelation_via_fft(x)
-    nt     = len(x)
-    dsq    = x**2
-    sumsq  = 2*np.sum(dsq)
-    msd    = np.zeros((nt))
-    msd[0] = 0.
-    for m in range(1,nt):
-        sumsq  = sumsq - dsq[m-1]-dsq[nt-m]
-        msd[m] = sumsq/(nt-m) - 2*corrx[m]
+    nt = len(x)
+    dsq = x**2
+
+    # Vectorized cumulative subtraction from both ends
+    cumsum_front = np.cumsum(dsq)        # cumsum_front[m-1] = sum(dsq[0:m])
+    cumsum_back = np.cumsum(dsq[::-1])   # cumsum_back[m-1] = sum of last m elements
+
+    ms = np.arange(1, nt)
+    sumsq_arr = 2 * np.sum(dsq) - cumsum_front[ms - 1] - cumsum_back[ms - 1]
+
+    msd = np.zeros(nt)
+    msd[1:] = sumsq_arr / (nt - ms) - 2 * corrx[1:]
     return msd

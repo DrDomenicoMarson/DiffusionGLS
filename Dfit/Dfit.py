@@ -16,7 +16,6 @@ import os
 import pickle
 
 import matplotlib.pyplot as plt
-import seaborn as sns
 import numpy as np
 from tqdm import tqdm
 from scipy.special import gammainc
@@ -542,6 +541,7 @@ class Dcov():
         self.plot_results(tc_ps, out_base)
 
     def plot_results(self, tc, out_base):
+        import seaborn as sns
         sns.set_context("paper", font_scale=0.5)
         fig = plt.figure(figsize=(6,7.5))
         gs = fig.add_gridspec(3, 1, height_ratios=(3.0, 2.0, 2.0))
@@ -629,8 +629,12 @@ class Dcov():
         if eta is None:
             raise ValueError("Required parameter missing: eta, viscosity eta")
         if boxtype != 'cubic':
-            raise ValueError("Sorry, correction only implemented for cubic simulation boxes")
+            raise ValueError("Correction only implemented for cubic simulation boxes")
 
         kbT = T * BOLTZMANN_K # J
         self.Dcor = self.D + kbT * XI_CUBIC * 1e15 / (6. * np.pi * eta * L) # nm^2 / ps
-        print(f"Finite-size corrected diffusion coefficient D_t for timestep {tc} ps: {self.Dcor[itc]:.4g} nm^2/ps with standard dev. {self.Dstd[itc]:.4g} nm^2/ps")
+        Dcor_out = self.Dcor[itc] * self.diff_scale
+        Dstd_out = self.Dstd[itc] * self.diff_scale
+        tc_disp = (self.tmin + itc) * self.dt / self.time_scale
+        print(f"Finite-size corrected D at tc={tc_disp:.4g} {self.time_unit}: "
+              f"{Dcor_out:.4e} {self.diffusion_unit} ± {Dstd_out:.4e} {self.diffusion_unit}")

@@ -4,25 +4,8 @@ import numpy as np
 import os
 from Dfit.Dfit import Dcov, XI_CUBIC, BOLTZMANN_K
 from Dfit.trajectory_reader import NumpyTextReader
+from conftest import generate_random_walk
 
-# Mock data generation
-def generate_random_walk(n_steps, dim=3, diffusion_coeff=1.0, dt=1.0):
-    # MSD = 2 * dim * D * t
-    # variance of step = 2 * D * dt
-    step_std = np.sqrt(2 * diffusion_coeff * dt)
-    steps = np.random.normal(0, step_std, size=(n_steps, dim))
-    trajectory = np.cumsum(steps, axis=0)
-    # Add initial position 0
-    trajectory = np.vstack([np.zeros((1, dim)), trajectory])
-    return trajectory
-
-@pytest.fixture
-def random_walk_file(tmp_path):
-    # Create a temporary trajectory file
-    traj = generate_random_walk(n_steps=5000, dim=3, diffusion_coeff=0.1, dt=1.0)
-    file_path = tmp_path / "test_traj.dat"
-    np.savetxt(file_path, traj)
-    return str(file_path)
 
 def test_reader_text(random_walk_file):
     reader = NumpyTextReader(random_walk_file)

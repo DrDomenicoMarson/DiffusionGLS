@@ -7,58 +7,126 @@ simulations, Journal of Chemical Physics 153, 024116 (2020).
 
 The input trajectory is analyzed as a whole and split into segments. For each segment, a quality factor Q is computed, indicating how well the trajectory fits a model of random diffusion with noise. The analysis is done for different time steps $\Delta t_n$ of the trajectory. Given the quality factor analysis, the user decides on a time step/diffusion coefficient pair to use.
 
-# Basic Example
+## Installation
+
+```bash
+pip install -e .
 ```
+
+## Basic Example
+
+### From text files
+```python
 import Dfit
-res = Dfit.Dcov(m=20,fz='mytrajectory.dat',tmin=1.0,tmax=100.0,nseg=150)
+
+res = Dfit.Dcov(fz='mytrajectory.dat', m=20, tmin=1.0, tmax=100.0, nseg=150)
 res.run_Dfit()
 res.analysis(tc=10.0)
-res.finite_size_correction()
+res.finite_size_correction(T=300, eta=0.001, L=10.0, tc=10.0)
 ```
 
-# Input for Dfit.Dcov()
+### From MDAnalysis Universe
+```python
+import Dfit
+import MDAnalysis as mda
 
-Required:
-* fz (str): Filename of input trajectory. Format: Center-of-mass position x [y z ...] in nm. Each row corresponds to a timestep indicated in the optional argument `dt`. The number of columns determines the number of dimensions. Use no header. Separate columns by whitespace, no comma.
+u = mda.Universe('topology.tpr', 'trajectory.xtc')
+res = Dfit.Dcov(universe=u, selection='resname SOL', tmax=50, dt=0.5)
+res.run_Dfit()
+res.analysis(tc=10.0)
+```
 
-*(NOTE: Alternatively, you can provide a list of input trajectories. The code will then treat these lists as copies of the same molecule in the same simulation [e.g. several water molecules, or several copies of the same protein in a dense protein solution, or several DOPC lipids...]. The individual trajectories will then not be segmented; instead, each individual trajectory will be treated as one segment of a long simulation. The resulting diffusion coefficient is then the mean across all segments.)*
+### Multiple trajectory files (multi-molecule mode)
+```python
+res = Dfit.Dcov(fz=['traj1.dat', 'traj2.dat', 'traj3.dat'], tmax=50.0)
+res.run_Dfit()
+res.analysis(tc='auto')  # automatically select tc where Q ≈ 0.5
+```
 
-Optional:
-* dt (float): Timestep [in ps] (default: 1.0).
-* m (int): Number of MSD values to consider (default: 20).
-* tmin (float): Minimum lag time [in ps] (default: None, defaults to dt).
-* tmax (float): Maximum lag time [in ps] (default: 100.0).
-* d2max (float): Convergence criterion for GLS iteration (default: 1e-10).
-* nitmax (int): Maximum number of iterations in GLS procedure (default: 100).
-* nseg (int): Number of segments (default: N / (100*tmax)).
-* fout (str): Name for output files w/o extension (default 'D_analysis').
-* imgfmt (str): Output format for plot. Choose 'pdf' or 'png' (default: 'pdf').
-* n_jobs (int): Number of parallel jobs to run. -1 means using all processors (default: -1).
+## Input for Dfit.Dcov()
 
-Run res.run_Dfit() without additional arguments (everything is stored in `self`).
+### Trajectory input (one of):
+* **fz** (str | Path | list): Filename(s) of input trajectory. Format: Center-of-mass position x [y z ...] in nm. Each row corresponds to a timestep indicated in `dt`. The number of columns determines the number of dimensions. No header; whitespace-separated columns. If a list is provided, each trajectory is treated as one molecule/segment.
+* **universe** (MDAnalysis.Universe): MDAnalysis Universe with topology and trajectory loaded. Each residue in the selection is treated as a separate molecule.
+* **selection** (str): MDAnalysis selection string (only used with `universe`).
 
-# Output
+### Optional parameters:
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `dt` | float | 1.0 | Timestep in units of `time_unit` |
+| `m` | int | 20 | Number of MSD values used per lag step |
+| `tmin` | float | None | Minimum lag time in `time_unit` (defaults to `dt`) |
+| `tmax` | float | 100.0 | Maximum lag time in `time_unit` |
+| `d2max` | float | 1e-10 | Convergence criterion for GLS iteration |
+| `nitmax` | int | 100 | Maximum number of iterations in GLS procedure |
+| `nseg` | int | None | Number of segments (default: auto, `N / (100*tmax)`) |
+| `fout` | str | 'D_analysis' | Base name for output files (no extension) |
+| `imgfmt` | str | 'pdf' | Output format for plot: `'pdf'` or `'png'` |
+| `n_jobs` | int | -1 | Number of parallel workers. -1 = all CPUs |
+| `time_unit` | str | 'ps' | Time unit for inputs/outputs: `'ps'` or `'ns'` |
+| `diffusion_unit` | str | 'cm2/s' | Diffusion unit for outputs: `'cm2/s'` or `'nm2/ps'` |
+| `normalize_lengths` | bool | False | Truncate multi-file trajectories to shortest length |
+| `progress` | bool | True | Show progress bar during fitting |
 
-Files:
-* D_analysis.dat: Summary of output, including diffusion coefficient (in nm^2/ps and cm^2/s) and Q-factor analysis.
-* D_analysis.pdf: (or .png) Output plots. Use this to assess which diffusion coefficient to select. Refer to Figs. 2 and 4 in the paper.
+## Running the fit
 
-Stored values in the Dfit class instance:
-* res.D: Optimal diffusion coefficient estimates per timestep
-* res.Dstd: Estimated standard deviation of res.D per timestep
-* res.Dempstd: Empirical standard deviation of res.D per timestep (should be close to res.Dstd if the diffusive model is appropriate)
-* res.q_m: Mean quality factor per timestep
-* res.q_std: Standard deviation of quality factor per timestep
+```python
+res.run_Dfit(save_model=False)
+```
 
-# Additional input for method analysis():
+* **save_model** (bool): If `True`, saves the full object to `{fout}.pkl` via pickle, allowing later loading with `Dcov.load('file.pkl')`.
 
-* tc (float/str): 'Timestep chosen' [in ps] for the diffusion coefficient. Must be a multiple of dt. Can also be set to 'auto' to automatically select the time point where Q is closest to 0.5.
+## Analysis
 
-The analysis can be repeated with different values of tc. A red vertical line indicates the chosen timestep in the plot. Repeat until you are content with the chosen timestep
+```python
+res.analysis(tc=10.0, fout_prefix=None)
+```
 
-# Additional input for finite_size_correction():
-* tc (int/float): Use tc determined in the previous analysis step
-* eta (float): Viscosity in units of Pa*s
-* L (float): Edge length of cubic (!) simulation box in nm
-* T (float): Temperature in Kelvin
-* boxtype (str): Only 'cubic' currently allowed.
+* **tc** (float | `'auto'`): Lag time for the diffusion coefficient estimate. Must be a multiple of `dt`. Set to `'auto'` to automatically select the time point where Q is closest to 0.5.
+* **fout_prefix** (str | None): Custom base name for output files. Default: `{fout}.tc_{tc}`.
+
+The analysis can be repeated with different values of `tc`. A red vertical line indicates the chosen timestep in the plot.
+
+## Finite-size correction
+
+```python
+res.finite_size_correction(T=300, eta=0.001, L=10.0, tc=10.0)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `tc` | float | Lag time from the analysis step |
+| `T` | float | Temperature in Kelvin |
+| `eta` | float | Viscosity in Pa·s |
+| `L` | float | Edge length of cubic simulation box in nm |
+| `boxtype` | str | Only `'cubic'` currently supported |
+
+## Output
+
+### Files
+* `{fout}.tc_{tc}.dat`: Summary including diffusion coefficient and Q-factor analysis.
+* `{fout}.tc_{tc}.{imgfmt}`: Plots showing D(t), Q(t), and per-segment distribution.
+
+### Stored attributes
+| Attribute | Description |
+|-----------|-------------|
+| `res.D` | Optimal diffusion coefficient estimates per lag time |
+| `res.Dstd` | Predicted standard deviation of D per lag time |
+| `res.Dempstd` | Empirical standard deviation of D per lag time |
+| `res.Dsem_pred` | Predicted SEM (= Dstd / √nseg) |
+| `res.Dsem_emp` | Empirical SEM (= Dempstd / √nseg) |
+| `res.q_m` | Mean quality factor per lag time |
+| `res.q_std` | Std. dev. of quality factor per lag time |
+| `res.tc_selected` | Selected tc value (after calling `analysis`) |
+| `res.Dcor` | Finite-size corrected D (after calling `finite_size_correction`) |
+
+## Persistence
+
+```python
+# Save after fitting
+res.run_Dfit(save_model=True)
+
+# Load later
+res = Dfit.Dcov.load('D_analysis.pkl')
+res.analysis(tc=10.0)
+```
