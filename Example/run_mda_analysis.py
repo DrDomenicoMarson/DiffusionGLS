@@ -5,6 +5,36 @@ import os
 import matplotlib.pyplot as plt
 
 def analyze_system(name, tpr, xtc, selection, tmax=100, tc=10):
+    """Run end-to-end diffusion analysis for one MD system.
+
+    Parameters
+    ----------
+    name : str
+        Label used in console messages and output file names.
+    tpr : str
+        Path to topology file readable by MDAnalysis.
+    xtc : str
+        Path to trajectory file readable by MDAnalysis.
+    selection : str
+        Atom selection used to define molecules/residues for diffusion
+        analysis.
+    tmax : float, default=100
+        Maximum lag time passed to :class:`Dfit.Dcov`, in ps.
+    tc : float, default=10
+        Lag time used in :meth:`Dfit.Dcov.analysis`, in ps.
+
+    Returns
+    -------
+    None
+
+    Notes
+    -----
+    Side effects:
+
+    - Creates ``D_analysis_{name}.dat`` and ``D_analysis_{name}.pdf`` in the
+      ``Example`` directory.
+    - Prints progress and summary messages to stdout.
+    """
     print(f"--- Analyzing {name} ---")
     print(f"Topology: {tpr}")
     print(f"Trajectory: {xtc}")

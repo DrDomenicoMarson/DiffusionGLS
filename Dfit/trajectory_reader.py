@@ -11,20 +11,71 @@ except ImportError:
     HAS_MDA = False
 
 class TrajectoryReader:
-    """Base class/Interface for trajectory readers."""
+    """Abstract interface for trajectory backends used by :class:`Dfit.Dcov`.
+
+    Notes
+    -----
+    Concrete subclasses must expose ``n_frames``, ``ndim``, ``n_trajs``, and
+    ``dt`` attributes and implement ``__iter__`` yielding arrays of shape
+    ``(n_frames, ndim)`` in nm.
+    """
     def __init__(self):
+        """Initialize shared trajectory metadata defaults.
+
+        Returns
+        -------
+        None
+        """
         self.n_frames = 0
         self.ndim = 3
         self.n_trajs = 0
         self.dt = 1.0 # Default, can be overridden
 
     def __iter__(self) -> Iterator[np.ndarray]:
-        """Yields trajectory arrays of shape (n_frames, ndim)."""
+        """Yield trajectory arrays.
+
+        Returns
+        -------
+        Iterator[ndarray]
+            Iterator over arrays of shape ``(n_frames, ndim)``.
+
+        Raises
+        ------
+        NotImplementedError
+            Always raised in the abstract base class.
+        """
         raise NotImplementedError
 
 class NumpyTextReader(TrajectoryReader):
-    """Reads trajectories from text files (legacy format)."""
+    """Read one or more trajectories from whitespace-delimited text files.
+
+    Each file is expected to contain coordinate values in nm, one frame per
+    line and one spatial dimension per column.
+    """
     def __init__(self, fz: str | Path | Sequence[str | Path], normalize_lengths: bool = False):
+        """Load metadata from text trajectory files.
+
+        Parameters
+        ----------
+        fz : str or Path or sequence[str | Path]
+            Input file path(s). A single file maps to one trajectory, while a
+            sequence maps to multiple trajectories.
+        normalize_lengths : bool, default=False
+            If ``True`` and multiple files have different lengths, truncate all
+            trajectories to the shortest one.
+
+        Returns
+        -------
+        None
+
+        Raises
+        ------
+        TypeError
+            If ``fz`` is not a supported path type/sequence.
+        ValueError
+            If no files are provided, if dimensions mismatch across files, or
+            if lengths mismatch when ``normalize_lengths=False``.
+        """
         super().__init__()
         self.files = []
         self.lengths = []
@@ -76,6 +127,20 @@ class NumpyTextReader(TrajectoryReader):
                 self.n_frames = min_len
 
     def __iter__(self) -> Iterator[np.ndarray]:
+        """Yield trajectories loaded from text files.
+
+        Returns
+        -------
+        Iterator[ndarray]
+            Arrays with shape ``(n_frames, ndim)``. In 1D, files are reshaped
+            to ``(n_frames, 1)``. If normalization is enabled, yielded arrays
+            are truncated to the common shortest length.
+
+        Raises
+        ------
+        ValueError
+            If a file has a different number of dimensions than expected.
+        """
         for f in self.files:
             data = np.loadtxt(f)
             if len(data.shape) == 1:
@@ -91,8 +156,36 @@ class NumpyTextReader(TrajectoryReader):
                 yield data
 
 class MDAnalysisReader(TrajectoryReader):
-    """Reads trajectories using MDAnalysis."""
+    """Read trajectories from MDAnalysis objects as per-residue COM tracks.
+
+    Coordinates are converted from Angstrom (MDAnalysis default) to nm by
+    multiplying by 0.1.
+    """
     def __init__(self, universe_or_group, selection_str: str = None):
+        """Initialize a reader from an MDAnalysis Universe or AtomGroup.
+
+        Parameters
+        ----------
+        universe_or_group : MDAnalysis.Universe or MDAnalysis.AtomGroup
+            Input object defining topology and trajectory.
+        selection_str : str, optional
+            Selection expression used when ``universe_or_group`` is a Universe.
+
+        Returns
+        -------
+        None
+
+        Raises
+        ------
+        ImportError
+            If MDAnalysis is not installed.
+        TypeError
+            If ``universe_or_group`` is not a Universe or AtomGroup.
+
+        Notes
+        -----
+        Each residue in the final selection is treated as one trajectory.
+        """
         super().__init__()
         if not HAS_MDA:
             raise ImportError("MDAnalysis is not installed.")
@@ -126,6 +219,19 @@ class MDAnalysisReader(TrajectoryReader):
             warnings.warn("Selection contains 0 residues.")
 
     def __iter__(self) -> Iterator[np.ndarray]:
+        """Yield per-residue trajectories over all frames.
+
+        Returns
+        -------
+        Iterator[ndarray]
+            One ``(n_frames, 3)`` array per residue trajectory in nm.
+
+        Notes
+        -----
+        This implementation materializes an in-memory array with shape
+        ``(n_trajs, n_frames, 3)``, which can be memory intensive for large
+        systems.
+        """
         # Pre-calculate center of mass for each residue for the whole trajectory
         # This can be memory intensive for huge systems. 
         # Optimization: Iterate frames and build trajectories per residue.
@@ -179,7 +285,29 @@ class MDAnalysisReader(TrajectoryReader):
             yield trajs[i]
 
 def get_reader(fz=None, universe=None, selection=None, normalize_lengths: bool = False) -> TrajectoryReader:
-    """Factory function to get the appropriate reader."""
+    """Create a trajectory reader from text files or MDAnalysis input.
+
+    Parameters
+    ----------
+    fz : str or Path or sequence[str | Path], optional
+        Text trajectory input path(s).
+    universe : MDAnalysis.Universe or MDAnalysis.AtomGroup, optional
+        MDAnalysis input object.
+    selection : str, optional
+        MDAnalysis selection string. Ignored when ``fz`` is provided.
+    normalize_lengths : bool, default=False
+        Enable truncation to shortest length for multi-file text input.
+
+    Returns
+    -------
+    TrajectoryReader
+        Concrete reader instance matching the provided input mode.
+
+    Raises
+    ------
+    ValueError
+        If both input modes are provided, or if neither is provided.
+    """
     if fz is not None and universe is not None:
         raise ValueError("Cannot provide both 'fz' and 'universe'.")
     if fz is not None and selection is not None:

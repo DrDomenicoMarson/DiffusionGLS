@@ -29,8 +29,36 @@ XI_CUBIC = 2.837297
 BOLTZMANN_K = 1.380649e-23 # J/K
 
 def calc_q(n,m,a2_3D,s2_3D,msds_3D,a2full_3D,s2full_3D,ndim):
-    """ Q per segment (Eq. 22). Use best a2 and s2 estimates from 
-    full trajectory for cov and cinv. """
+    """Evaluate the segment quality factor ``Q`` from the GLS fit.
+
+    Parameters
+    ----------
+    n : int
+        Number of lag steps in the strided segment minus one.
+    m : int
+        Number of MSD values used in the GLS fit window.
+    a2_3D : float
+        Segment-level 3D offset estimate (sum across dimensions), in nm^2.
+    s2_3D : float
+        Segment-level 3D slope estimate (sum across dimensions), in nm^2.
+    msds_3D : ndarray of shape (m,)
+        Segment-level 3D MSD values used by the fit, in nm^2.
+    a2full_3D : float
+        Reference 3D offset used to construct the covariance matrix.
+    s2full_3D : float
+        Reference 3D slope used to construct the covariance matrix.
+    ndim : int
+        Number of spatial dimensions represented in the trajectory.
+
+    Returns
+    -------
+    float
+        Goodness-of-fit quality factor in the interval [0, 1].
+
+    Notes
+    -----
+    This follows Eq. 22 in Bullerjahn et al. (JCP 153, 024116, 2020).
+    """
 
     c = math_utils.setupc(m,n) # setups of cov matrix
     cov = math_utils.calc_cov(n,m,c,a2full_3D,s2full_3D)
@@ -45,6 +73,49 @@ def calc_q(n,m,a2_3D,s2_3D,msds_3D,a2full_3D,s2full_3D,ndim):
     return q
 
 def analyze_chunk_task(chunk_data, step, m, dt, nperseg, multi, ndim, d2max, nitmax, c2_pre, cm_pre, a2full_3D=0.0, s2full_3D=0.0):
+    """Process one worker chunk for a given lag step.
+
+    Parameters
+    ----------
+    chunk_data : list of ndarray
+        Segment trajectories assigned to this worker. Each array has shape
+        ``(n_frames_segment, ndim)`` in nm.
+    step : int
+        Lag stride in frame steps.
+    m : int
+        Number of MSD values used per lag step in the GLS fit.
+    dt : float
+        Timestep in ps used for user-facing diagnostics.
+    nperseg : int
+        Number of steps per segment before striding.
+    multi : bool
+        ``True`` for multi-trajectory mode where each input trajectory is one
+        segment/molecule, ``False`` for single-trajectory segmentation mode.
+    ndim : int
+        Number of spatial dimensions.
+    d2max : float
+        Convergence threshold for iterative GLS updates.
+    nitmax : int
+        Maximum number of GLS iterations.
+    c2_pre : ndarray or None
+        Optional precomputed covariance helper matrix for ``m=2``.
+    cm_pre : ndarray or None
+        Optional precomputed covariance helper matrix for ``m``.
+    a2full_3D : float, optional
+        Reference 3D offset used for ``Q`` evaluation in single-trajectory
+        mode.
+    s2full_3D : float, optional
+        Reference 3D slope used for ``Q`` evaluation in single-trajectory
+        mode.
+
+    Returns
+    -------
+    tuple[list[tuple[ndarray, ndarray, float, bool]] | None, Exception | None]
+        ``(results, error)`` where ``results`` contains one entry per segment:
+        ``(a2_per_dim, s2_per_dim, q_value, converged)``.  When a segment is
+        too short, ``results`` is ``None`` and ``error`` carries the
+        ``ValueError`` to propagate in the caller thread.
+    """
     results = []
     
     for s_idx, seg_z in enumerate(chunk_data):
@@ -98,13 +169,24 @@ def analyze_chunk_task(chunk_data, step, m, dt, nperseg, multi, ndim, d2max, nit
     return results, None
 
 class Dcov():
-    """
-    Diffusion coefficient estimator using GLS on mean-squared displacement.
-    
-    Parameters of interest:
-    - m (int): number of MSD points used per lag step (unitless). For a given lag step s,
-      the fit uses MSD values at times s*dt, 2*s*dt, ..., m*s*dt. Larger m widens the
-      lag-time window (m*s*dt) but requires longer segments and increases cost.
+    """Estimate diffusion coefficients from trajectories using GLS on MSD data.
+
+    The class supports two analysis modes:
+
+    1. Single-trajectory mode: one long trajectory is split into segments.
+    2. Multi-trajectory mode: each input trajectory/residue is a segment.
+
+    A typical workflow is:
+
+    1. Initialize :class:`Dcov` with trajectory input and fit configuration.
+    2. Call :meth:`run_Dfit` to perform GLS estimation across lag steps.
+    3. Call :meth:`analysis` to compute summary statistics and write outputs.
+    4. Optionally call :meth:`finite_size_correction` (3D, cubic box only).
+
+    Notes
+    -----
+    Internal diffusion units are nm^2/ps. Reported units are controlled through
+    ``diffusion_unit``.
     """
     def __init__(self, fz: TrajectoryInput = None, universe=None, selection=None,
                  m: int = 20, tmin: float | None = None, tmax: float = 100.0, dt: float | None = None,
@@ -112,6 +194,63 @@ class Dcov():
                  nseg: int | None = None, imgfmt: str = 'pdf', fout: str = 'D_analysis',
                  n_jobs: int = -1, normalize_lengths: bool = False, time_unit: str = 'ps',
                  diffusion_unit: str = 'cm2/s', progress: bool = True):
+        """Initialize the diffusion estimator and validate analysis settings.
+
+        Parameters
+        ----------
+        fz : str or Path or sequence[str | Path] or None, optional
+            One trajectory file or multiple trajectory files in text format.
+            Each row is a frame and columns are coordinate dimensions in nm.
+            Provide either ``fz`` or ``universe``.
+        universe : MDAnalysis.Universe or MDAnalysis.AtomGroup, optional
+            MDAnalysis object used to extract per-residue trajectories.
+            Provide either ``fz`` or ``universe``.
+        selection : str, optional
+            MDAnalysis selection string used only when ``universe`` is given as
+            a Universe.
+        m : int, default=20
+            Number of MSD values used in each lag-time GLS fit window.
+        tmin : float or None, optional
+            Minimum lag time in ``time_unit``. If ``None``, defaults to one
+            frame step.
+        tmax : float, default=100.0
+            Maximum lag time in ``time_unit``.
+        dt : float or None, optional
+            Frame timestep in ``time_unit``. If ``None``, adopts the reader
+            timestep (1.0 ps for text files, trajectory timestep for
+            MDAnalysis).
+        d2max : float, default=1e-10
+            Convergence criterion for iterative GLS updates.
+        nitmax : int, default=100
+            Maximum number of GLS iterations.
+        nseg : int or None, optional
+            Number of segments for single-trajectory mode. If ``None``, uses an
+            automatic heuristic.
+        imgfmt : {'pdf', 'png'}, default='pdf'
+            Plot output format.
+        fout : str, default='D_analysis'
+            Output file prefix.
+        n_jobs : int, default=-1
+            Number of parallel workers. ``-1`` uses executor default, ``0``
+            forces serial execution.
+        normalize_lengths : bool, default=False
+            When multiple text trajectories have different lengths, truncate to
+            shortest length if ``True``.
+        time_unit : {'ps', 'ns'}, default='ps'
+            Time unit for user input/output values.
+        diffusion_unit : {'cm2/s', 'nm2/ps'}, default='cm2/s'
+            Unit used for reported diffusion coefficients.
+        progress : bool, default=True
+            If ``True``, show a progress bar over lag steps.
+
+        Raises
+        ------
+        ValueError
+            If input trajectories are invalid, too short, or parameter
+            combinations are infeasible.
+        TypeError
+            If an unsupported image format is requested.
+        """
 
         # Initialize Reader
         self.reader: TrajectoryReader = get_reader(fz=fz, universe=universe, selection=selection, normalize_lengths=normalize_lengths)
@@ -280,11 +419,42 @@ class Dcov():
 
     @staticmethod
     def load(filename: str) -> 'Dcov':
-        """Load a saved Dcov state from a pickle file."""
+        """Load a serialized :class:`Dcov` instance from a pickle file.
+
+        Parameters
+        ----------
+        filename : str
+            Path to a ``.pkl`` file previously produced by
+            :meth:`run_Dfit(save_model=True)`.
+
+        Returns
+        -------
+        Dcov
+            Deserialized estimator object.
+        """
         with open(filename, 'rb') as f:
             return pickle.load(f)
 
     def _timestep_index(self, tc: float) -> int:
+        """Convert an analysis lag time to the internal lag-index position.
+
+        Parameters
+        ----------
+        tc : float
+            Lag time in ``time_unit``.
+
+        Returns
+        -------
+        int
+            Zero-based index into arrays stored on the lag-time grid
+            ``tmin..tmax``.
+
+        Raises
+        ------
+        ValueError
+            If ``tc`` is not a multiple of ``dt`` or lies outside the computed
+            lag-time range.
+        """
         steps = (tc * self.time_scale) / self.dt
         steps_int = round(steps)
         if not math.isclose(steps, steps_int, rel_tol=1e-9, abs_tol=1e-12):
@@ -295,7 +465,35 @@ class Dcov():
         return itc
 
     def run_Dfit(self, save_model: bool = False):
-        """ Main Function to calculate the stepsize sigma^2 and offset a^2. """
+        """Run GLS fitting over all configured lag steps and segments.
+
+        Parameters
+        ----------
+        save_model : bool, default=False
+            If ``True``, serialize the current estimator to ``{fout}.pkl``
+            after fitting.
+
+        Returns
+        -------
+        None
+            This method updates instance attributes in place.
+
+        Raises
+        ------
+        ValueError
+            If the trajectory is too short for the requested ``m`` and lag
+            range at runtime.
+
+        Notes
+        -----
+        Side effects include:
+
+        - Populating fit arrays (``a2``, ``s2``, ``q``, ``s2var``).
+        - Updating convergence diagnostics (``non_converged_count``,
+          ``percent_failed``).
+        - Setting lifecycle flag ``_fitted=True``.
+        - Optionally writing ``{fout}.pkl``.
+        """
         
         # Pre-load data if it fits in memory or iterate?
         # The original code loaded everything. 
@@ -459,6 +657,29 @@ class Dcov():
             multiple of dt.  Pass ``'auto'`` to select the lag where Q ≈ 0.5.
         fout_prefix : str, optional
             Custom base name for output files.  Default: ``{fout}.tc_{tc}``.
+
+        Returns
+        -------
+        None
+            This method updates analysis attributes in place.
+
+        Raises
+        ------
+        RuntimeError
+            If called before :meth:`run_Dfit`.
+        ValueError
+            If ``tc`` is invalid for the computed lag-time grid.
+
+        Notes
+        -----
+        Side effects include:
+
+        - Populating summary attributes (``D``, ``Dstd``, ``Dempstd``,
+          ``Dsem_pred``, ``Dsem_emp``, ``q_m``, ``q_std``).
+        - Recording selected lag time in ``tc_selected`` and
+          ``tc_selected_idx``.
+        - Writing ``.dat`` and plot output files.
+        - Setting lifecycle flag ``_analyzed=True``.
         """
         if not self._fitted:
             raise RuntimeError("Call run_Dfit() before analysis().")
@@ -580,7 +801,24 @@ class Dcov():
         self.plot_results(tc_ps, out_base)
 
     def plot_results(self, tc, out_base):
-        """Delegate to module-level plot function."""
+        """Create the analysis figure for the selected lag time.
+
+        Parameters
+        ----------
+        tc : float
+            Selected lag time in ps used to draw the vertical marker.
+        out_base : str
+            Output path prefix used by the plotting backend.
+
+        Returns
+        -------
+        None
+            Writes the image file to disk.
+
+        Notes
+        -----
+        This is a thin wrapper around :func:`plot_diffusion_results`.
+        """
         plot_diffusion_results(
             D=self.D, Dstd=self.Dstd, Dempstd=self.Dempstd,
             q_m=self.q_m, q_std=self.q_std, s2=self.s2,
@@ -608,6 +846,20 @@ class Dcov():
             Box geometry (only ``'cubic'`` supported).
         tc : float
             Lag time from the analysis step (in ``time_unit``).
+
+        Returns
+        -------
+        None
+            Stores the corrected diffusion series in ``self.Dcor`` and prints
+            the selected corrected value.
+
+        Raises
+        ------
+        RuntimeError
+            If called before :meth:`analysis`.
+        ValueError
+            If dimensionality/box type is unsupported or required parameters
+            are missing.
         """
         if not self._analyzed:
             raise RuntimeError("Call analysis() before finite_size_correction().")
@@ -636,7 +888,58 @@ def plot_diffusion_results(*, D, Dstd, Dempstd, q_m, q_std, s2,
                            tc, tc_selected_idx, out_base, imgfmt):
     """Create the three-panel diffusion analysis plot.
 
-    All parameters are plain numpy arrays / scalars — no dependency on Dcov.
+    Parameters
+    ----------
+    D : ndarray
+        Diffusion coefficient series in internal units (nm^2/ps).
+    Dstd : ndarray
+        Predicted standard deviation of ``D`` in internal units.
+    Dempstd : ndarray
+        Empirical standard deviation of ``D`` in internal units.
+    q_m : ndarray
+        Mean quality factor per lag time.
+    q_std : ndarray
+        Standard deviation of quality factor per lag time.
+    s2 : ndarray
+        Segment-wise slope values with shape ``(n_lag, nseg, ndim)``.
+    tmin : int
+        Minimum lag step index included in the analysis grid.
+    tmax : int
+        Maximum lag step index included in the analysis grid.
+    dt : float
+        Internal timestep in ps.
+    m : int
+        Number of MSD points used per lag step.
+    ndim : int
+        Number of spatial dimensions.
+    nseg : int
+        Number of segments/molecules analyzed.
+    time_scale : float
+        Conversion factor from ``time_unit`` to ps.
+    time_unit : str
+        Display unit label for time axes.
+    diff_scale : float
+        Scale factor from nm^2/ps to requested output diffusion unit.
+    diffusion_unit : str
+        Display unit label for diffusion axes.
+    tc : float
+        Selected lag time in ps.
+    tc_selected_idx : int or None
+        Selected lag index in the lag grid, if already known.
+    out_base : str
+        Output filename prefix.
+    imgfmt : str
+        Output image format extension (``pdf`` or ``png``).
+
+    Returns
+    -------
+    None
+        Saves the figure to ``{out_base}.{imgfmt}``.
+
+    Notes
+    -----
+    All inputs are plain arrays/scalars and the function does not depend on
+    :class:`Dcov` internals.
     """
     import seaborn as sns
     sns.set_context("paper", font_scale=0.5)
