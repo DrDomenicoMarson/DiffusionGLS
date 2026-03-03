@@ -39,3 +39,6 @@ addopts = "-ra -q"
 testpaths = [
     "tests",
 ]
+filterwarnings = [
+    "ignore:numpy.ndarray size changed, may indicate binary incompatibility.*:RuntimeWarning",
+]
