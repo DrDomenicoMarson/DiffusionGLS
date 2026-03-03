@@ -188,7 +188,7 @@ class Dcov():
     Internal diffusion units are nm^2/ps. Reported units are controlled through
     ``diffusion_unit``.
     """
-    def __init__(self, fz: TrajectoryInput = None, universe=None, selection=None,
+    def __init__(self, fz: TrajectoryInput = None, universe=None, universes=None, selection=None,
                  m: int = 20, tmin: float | None = None, tmax: float = 100.0, dt: float | None = None,
                  d2max: float = 1e-10, nitmax: int = 100,
                  nseg: int | None = None, imgfmt: str = 'pdf', fout: str = 'D_analysis',
@@ -201,13 +201,19 @@ class Dcov():
         fz : str or Path or sequence[str | Path] or None, optional
             One trajectory file or multiple trajectory files in text format.
             Each row is a frame and columns are coordinate dimensions in nm.
-            Provide either ``fz`` or ``universe``.
+            Provide exactly one trajectory source among ``fz``, ``universe``,
+            and ``universes``.
         universe : MDAnalysis.Universe or MDAnalysis.AtomGroup, optional
             MDAnalysis object used to extract per-residue trajectories.
-            Provide either ``fz`` or ``universe``.
+            Provide exactly one trajectory source among ``fz``, ``universe``,
+            and ``universes``.
+        universes : sequence[MDAnalysis.Universe | MDAnalysis.AtomGroup], optional
+            Multiple MDAnalysis objects to pool in one analysis. Inputs must
+            have matching frame count and timestep.
         selection : str, optional
             MDAnalysis selection string used only when ``universe`` is given as
-            a Universe.
+            a Universe. For ``universes``, the same selection is applied to
+            each Universe entry.
         m : int, default=20
             Number of MSD values used in each lag-time GLS fit window.
         tmin : float or None, optional
@@ -253,7 +259,13 @@ class Dcov():
         """
 
         # Initialize Reader
-        self.reader: TrajectoryReader = get_reader(fz=fz, universe=universe, selection=selection, normalize_lengths=normalize_lengths)
+        self.reader: TrajectoryReader = get_reader(
+            fz=fz,
+            universe=universe,
+            universes=universes,
+            selection=selection,
+            normalize_lengths=normalize_lengths,
+        )
         
         # Use reader properties
         self.ndim = self.reader.ndim

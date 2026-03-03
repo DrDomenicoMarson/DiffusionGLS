@@ -267,6 +267,26 @@ def test_empty_files_error(tmp_path):
         Dcov(fz=[], fout=str(tmp_path / 'D_analysis'))
 
 
+def test_input_mode_conflict_fz_and_universes(random_walk_file, tmp_path):
+    """Providing fz together with universes should raise ValueError."""
+    with pytest.raises(ValueError, match="exactly one input mode"):
+        Dcov(
+            fz=random_walk_file,
+            universes=[object()],
+            fout=str(tmp_path / 'D_analysis'),
+        )
+
+
+def test_input_mode_conflict_universe_and_universes(tmp_path):
+    """Providing universe together with universes should raise ValueError."""
+    with pytest.raises(ValueError, match="exactly one input mode"):
+        Dcov(
+            universe=object(),
+            universes=[object()],
+            fout=str(tmp_path / 'D_analysis'),
+        )
+
+
 def test_single_frame_error(tmp_path):
     """Trajectory with only 1 frame should raise ValueError early."""
     # np.loadtxt on a single-row 3D file reads shape (3,) which becomes 3 frames×1D.
@@ -276,4 +296,3 @@ def test_single_frame_error(tmp_path):
 
     with pytest.raises(ValueError, match="too short"):
         Dcov(fz=str(file_path), fout=str(tmp_path / 'D_analysis'))
-

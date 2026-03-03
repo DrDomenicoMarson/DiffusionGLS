@@ -39,7 +39,8 @@ Lifecycle constraints:
 
 - Single trajectory analysis via automatic or user-defined segmentation.
 - Multi-trajectory / multi-molecule analysis from a list of text trajectories.
-- MDAnalysis integration (`Universe` or `AtomGroup`) with per-residue handling.
+- MDAnalysis integration (`Universe`/`AtomGroup`, single or pooled) with
+  per-residue handling.
 - Automatic lag-time choice with `tc="auto"` (Q-factor target near 0.5).
 - Repeated analysis on the same fitted object with different `tc` values.
 - Finite-size correction for 3D cubic boxes.
@@ -51,8 +52,9 @@ Use exactly one trajectory source:
 
 - `fz`: text file path or list of paths.
 - `universe`: MDAnalysis `Universe` or `AtomGroup`.
+- `universes`: sequence of MDAnalysis `Universe`/`AtomGroup` objects to pool.
 
-`selection` is only used with `universe` when a `Universe` is supplied.
+`selection` is used with MDAnalysis inputs when a `Universe` is supplied.
 
 ## Units and Conversions
 
@@ -75,7 +77,8 @@ Use exactly one trajectory source:
 |---|---|---|---|
 | `fz` | `str \| Path \| Sequence[str \| Path] \| None` | `None` | Text trajectory input path(s). |
 | `universe` | MDAnalysis object or `None` | `None` | MDAnalysis trajectory source. |
-| `selection` | `str \| None` | `None` | MDAnalysis selection string for `Universe` input. |
+| `universes` | `Sequence[MDAnalysis object] \| None` | `None` | Multiple MDAnalysis trajectory sources pooled in one run. |
+| `selection` | `str \| None` | `None` | MDAnalysis selection string for `Universe` input(s). |
 | `m` | `int` | `20` | Number of MSD points per lag-time fit window. |
 | `tmin` | `float \| None` | `None` | Minimum lag time in `time_unit`; defaults to one lag step. |
 | `tmax` | `float` | `100.0` | Maximum lag time in `time_unit`. |
@@ -141,6 +144,8 @@ Parameters:
 - In multi-trajectory mode, all dimensions must match.
 - In multi-trajectory text mode, unequal lengths require
   `normalize_lengths=True`.
+- In pooled MDAnalysis mode (`universes`), all inputs must share the same
+  frame count and `dt`.
 - In multi mode, very large `tmax` may be clamped to a feasible value.
 - `tc` must lie on the computed lag grid and be a multiple of `dt`.
 
@@ -195,7 +200,21 @@ res.run_Dfit()
 res.analysis(tc=10.0)
 ```
 
-### 3) Multiple text trajectories (multi-molecule mode)
+### 3) Pooled MDAnalysis trajectories (replicas)
+
+```python
+import Dfit
+import MDAnalysis as mda
+
+u1 = mda.Universe("topol1.tpr", "traj_replica1.xtc")
+u2 = mda.Universe("topol2.tpr", "traj_replica2.xtc")
+
+res = Dfit.Dcov(universes=[u1, u2], selection="resname SOL", tmax=50)
+res.run_Dfit()
+res.analysis(tc="auto")
+```
+
+### 4) Multiple text trajectories (multi-molecule mode)
 
 ```python
 import Dfit
