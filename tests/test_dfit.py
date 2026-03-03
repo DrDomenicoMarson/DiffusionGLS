@@ -71,7 +71,8 @@ def test_finite_size_correction(random_walk_file, tmp_path):
     assert np.isclose(dcov.Dcor[itc], expected_Dcor)
 
 def test_timestep_index(random_walk_file, tmp_path):
-    dcov = Dcov(fz=random_walk_file, dt=0.5, tmin=1.0, tmax=10.0, fout=str(tmp_path / 'D_analysis'))
+    with pytest.warns(UserWarning, match="differs from"):
+        dcov = Dcov(fz=random_walk_file, dt=0.5, tmin=1.0, tmax=10.0, fout=str(tmp_path / 'D_analysis'))
     
     # Valid tc
     idx = dcov._timestep_index(2.0) # 2.0 / 0.5 = 4 steps. tmin is 2 steps (idx 0). So 4 steps is idx 2?
