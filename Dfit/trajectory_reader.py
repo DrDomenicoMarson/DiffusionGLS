@@ -329,16 +329,18 @@ class MDAnalysisMultiReader(TrajectoryReader):
     Each input Universe/AtomGroup contributes residue COM trajectories. All
     inputs must share the same frame count and timestep.
     """
-    def __init__(self, universes_or_groups: Sequence, selection_str: str = None):
+    def __init__(self, universes_or_groups: Sequence, selection_str: str | list[str] | None = None):
         """Initialize pooled MDAnalysis reader from multiple inputs.
 
         Parameters
         ----------
         universes_or_groups : sequence[MDAnalysis.Universe | MDAnalysis.AtomGroup]
-            Inputs to pool. A shared ``selection_str`` is applied to Universe
-            inputs; AtomGroup inputs are used as provided.
-        selection_str : str, optional
-            Selection expression applied when an entry is a Universe.
+            Inputs to pool.
+        selection_str : str or list[str] or None, optional
+            Selection expression(s). If a single string, the same selection is
+            applied to every Universe input. If a list, it must have the same
+            length as ``universes_or_groups`` and each entry is applied to the
+            corresponding input. AtomGroup inputs ignore the selection string.
 
         Returns
         -------
@@ -352,7 +354,8 @@ class MDAnalysisMultiReader(TrajectoryReader):
             If ``universes_or_groups`` is not a non-string sequence or contains
             unsupported entries.
         ValueError
-            If the sequence is empty, or if inputs have mismatched frame count
+            If the sequence is empty, if a selection list length does not match
+            ``universes_or_groups``, or if inputs have mismatched frame count
             or timestep.
         """
         super().__init__()
@@ -368,12 +371,24 @@ class MDAnalysisMultiReader(TrajectoryReader):
         if len(inputs) == 0:
             raise ValueError("No MDAnalysis universes provided. Pass at least one Universe/AtomGroup.")
 
+        # Resolve selection_str into a per-input list.
+        if isinstance(selection_str, list):
+            if len(selection_str) != len(inputs):
+                raise ValueError(
+                    f"When 'selection' is a list it must have the same length as 'universes'. "
+                    f"Got {len(selection_str)} selection(s) for {len(inputs)} universe(s)."
+                )
+            selections = selection_str
+        else:
+            # Single string (or None) – broadcast to all inputs.
+            selections = [selection_str] * len(inputs)
+
         self.sources: list[MDATrajectorySource] = []
         ref_n_frames = None
         ref_dt = None
 
         for i, item in enumerate(inputs):
-            universe, atomgroup = _resolve_mda_source(item, selection_str)
+            universe, atomgroup = _resolve_mda_source(item, selections[i])
             n_frames = universe.trajectory.n_frames
             dt = universe.trajectory.dt
 
@@ -446,9 +461,11 @@ def get_reader(
     universes : sequence[MDAnalysis.Universe | MDAnalysis.AtomGroup], optional
         Multiple MDAnalysis inputs to pool into one multi-molecule analysis.
         All inputs must have matching frame count and dt.
-    selection : str, optional
+    selection : str or list[str], optional
         MDAnalysis selection string. Ignored when ``fz`` is provided. For
-        ``universes``, the same selection is applied to each Universe entry.
+        ``universes``, pass a single string to apply the same selection to
+        every Universe, or a list of strings (one per Universe) to apply
+        different selections to each.
     normalize_lengths : bool, default=False
         Enable truncation to shortest length for multi-file text input.
 

@@ -76,3 +76,30 @@ def test_mda_multi_reader_mismatched_dt(monkeypatch):
     with pytest.raises(ValueError, match="same dt"):
         trajectory_reader.MDAnalysisMultiReader([u1, u2], selection_str="all")
 
+
+def test_mda_multi_reader_list_selections(monkeypatch):
+    """A list of selection strings (one per universe) should be accepted."""
+
+    _install_fake_mda(monkeypatch)
+    u1 = _FakeUniverse(n_frames=101, dt=2.0, n_residues=32)
+    u2 = _FakeUniverse(n_frames=101, dt=2.0, n_residues=20)
+
+    reader = trajectory_reader.MDAnalysisMultiReader(
+        [u1, u2], selection_str=["resname LIG", "resname SOL"]
+    )
+
+    assert reader.n_trajs == 52
+
+
+def test_mda_multi_reader_list_selections_wrong_length(monkeypatch):
+    """A selection list whose length differs from the universes list should raise ValueError."""
+
+    _install_fake_mda(monkeypatch)
+    u1 = _FakeUniverse(n_frames=101, dt=2.0, n_residues=32)
+    u2 = _FakeUniverse(n_frames=101, dt=2.0, n_residues=20)
+
+    with pytest.raises(ValueError, match="same length"):
+        trajectory_reader.MDAnalysisMultiReader(
+            [u1, u2], selection_str=["resname LIG"]
+        )
+
