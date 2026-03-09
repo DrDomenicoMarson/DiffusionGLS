@@ -445,7 +445,12 @@ class Dcov():
             Deserialized estimator object.
         """
         with open(filename, 'rb') as f:
-            return pickle.load(f)
+            obj = pickle.load(f)
+            
+        # A loaded model is assumed to have been fitted. This also ensures
+        # backward compatibility with older pickle files that lack this flag.
+        obj._fitted = True
+        return obj
 
     def _timestep_index(self, tc: float) -> int:
         """Convert an analysis lag time to the internal lag-index position.
