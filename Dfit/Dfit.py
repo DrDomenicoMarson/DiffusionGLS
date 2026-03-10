@@ -145,7 +145,7 @@ def analyze_chunk_task(chunk_data, step, m, dt, nperseg, multi, ndim, d2max, nit
 
         # Analyze per dimension
         for d in range(ndim):
-            z_dim = z_analyzed[:, d]
+            z_dim = np.ascontiguousarray(z_analyzed[:, d])
             msds[d] = math_utils.compute_MSD_1D_first_m(z_dim, m)
             
             # Check if pre-calculated matrices match current n
@@ -208,7 +208,7 @@ def analyze_full_traj_task(full_z, step, m, dt, ndim, d2max, nitmax):
     res_s2 = np.zeros(ndim)
     converged_all = True
     for d in range(ndim):
-        z_dim = full_z[:, d][::step]
+        z_dim = np.ascontiguousarray(full_z[:, d][::step])
         n = len(z_dim) - 1
         msd = math_utils.compute_MSD_1D_first_m(z_dim, m)
         res_a2[d], res_s2[d], converged = math_utils.calc_gls(n, m, msd, d2max, nitmax)
@@ -569,7 +569,14 @@ class Dcov():
         """
         all_trajs = list(self.reader)  # load once; shape (n_trajs, n_frames, ndim)
 
-        # Warm up numba-compiled kernels to avoid a slow first task
+        # Prevent BLAS/LAPACK from spawning internal threads that would
+        # oversubscribe cores when combined with our thread pool.
+        for env_var in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS'):
+            os.environ.setdefault(env_var, '1')
+
+        # Warm up numba-compiled kernels to avoid recompilation under the
+        # global compilation lock during threaded execution.  We compile
+        # for C-contiguous arrays (matching np.ascontiguousarray output).
         try:
             dummy = np.zeros(8)
             _ = math_utils.compute_MSD_1D_first_m(dummy, 3)
