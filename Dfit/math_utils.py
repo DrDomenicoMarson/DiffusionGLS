@@ -170,6 +170,7 @@ def calc_a2s2(m,v,cinv, a2, s2):
     d2=(s2n-s2)**2+(a2n-a2)**2
     return a2n, s2n, d2
 
+@nb.jit(nopython=True)
 def gls_closed(n,v, c=None):
     """Compute a closed-form initialization for GLS parameters.
 
@@ -203,6 +204,7 @@ def gls_closed(n,v, c=None):
 
     return a2, s2, s2var
 
+@nb.jit(nopython=True)
 def gls_iter(n,m,v,a2,s2,d2max,nitmax, c=None):
     """Iteratively refine GLS parameters for the MSD linear model.
 
@@ -249,6 +251,7 @@ def gls_iter(n,m,v,a2,s2,d2max,nitmax, c=None):
 
     return a2, s2, nit
 
+@nb.jit(nopython=True)
 def calc_gls(n,m,v,d2max,nitmax, c2=None, cm=None):
     """Estimate GLS parameters with iterative refinement and safe fallback.
 
@@ -360,6 +363,7 @@ def calc_var(n,m,a2,s2):
     s2var = A / denom
     return s2var
 
+@nb.jit(nopython=True)
 def eval_vars(n,m,a2m,s2m,ndim):
     """Aggregate slope variance estimates across dimensions.
 
@@ -455,4 +459,35 @@ def compute_MSD_1D_via_correlation(x):
 
     msd = np.zeros(nt)
     msd[1:] = sumsq_arr / (nt - ms) - 2 * corrx[1:]
+    return msd
+
+@nb.jit(nopython=True)
+def compute_MSD_1D_first_m(x, m):
+    """Compute MSD values for lags ``1..m`` using direct summation.
+
+    This is an O(n × m) computation that only calculates the first ``m``
+    lag values needed for GLS fitting.  Because it is fully Numba-compiled
+    in nopython mode, it releases the GIL and allows true multithreading.
+
+    Parameters
+    ----------
+    x : ndarray of shape (n,)
+        One-dimensional coordinate trajectory.
+    m : int
+        Number of MSD lag values to compute.
+
+    Returns
+    -------
+    ndarray of shape (m,)
+        MSD values at lags ``1..m``.
+    """
+    n = len(x)
+    msd = np.zeros(m)
+    for lag in range(1, m + 1):
+        total = 0.0
+        count = n - lag
+        for i in range(count):
+            diff = x[i + lag] - x[i]
+            total += diff * diff
+        msd[lag - 1] = total / count
     return msd

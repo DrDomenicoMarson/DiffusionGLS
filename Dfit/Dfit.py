@@ -146,7 +146,7 @@ def analyze_chunk_task(chunk_data, step, m, dt, nperseg, multi, ndim, d2max, nit
         # Analyze per dimension
         for d in range(ndim):
             z_dim = z_analyzed[:, d]
-            msds[d] = math_utils.compute_MSD_1D_via_correlation(z_dim)[1:(m+1)]
+            msds[d] = math_utils.compute_MSD_1D_first_m(z_dim, m)
             
             # Check if pre-calculated matrices match current n
             use_c2 = c2_pre
@@ -210,7 +210,7 @@ def analyze_full_traj_task(full_z, step, m, dt, ndim, d2max, nitmax):
     for d in range(ndim):
         z_dim = full_z[:, d][::step]
         n = len(z_dim) - 1
-        msd = math_utils.compute_MSD_1D_via_correlation(z_dim)[1:(m + 1)]
+        msd = math_utils.compute_MSD_1D_first_m(z_dim, m)
         res_a2[d], res_s2[d], converged = math_utils.calc_gls(n, m, msd, d2max, nitmax)
         if not converged:
             converged_all = False
@@ -572,7 +572,7 @@ class Dcov():
         # Warm up numba-compiled kernels to avoid a slow first task
         try:
             dummy = np.zeros(8)
-            _ = math_utils.compute_MSD_1D_via_correlation(dummy)
+            _ = math_utils.compute_MSD_1D_first_m(dummy, 3)
             _ = math_utils.calc_gls(5, 3, np.arange(3, dtype=np.float64), self.d2max, 2,
                                     c2=math_utils.setupc(2, 5), cm=math_utils.setupc(3, 5))
         except Exception:
