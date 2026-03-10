@@ -586,11 +586,6 @@ class Dcov():
         else:
             max_workers = self.n_jobs
 
-        n_workers_count = max_workers if max_workers else (os.cpu_count() or 1)
-        # One chunk per worker, sized to spread segments evenly.
-        # With many lag steps the pool is kept busy even with small chunk sizes.
-        chunk_size = max(1, math.ceil(self.nseg / n_workers_count))
-
         n_lag_steps = self.tmax - self.tmin + 1
         non_converged_count = 0
 
@@ -627,12 +622,13 @@ class Dcov():
                         non_converged_count += 1
 
             # ------------------------------------------------------------------
-            # Phase 2: Segment fits for every (lag_step, chunk) combination.
-            # All futures are submitted at once so the thread pool can schedule
-            # them freely and run at peak parallelism.
+            # Phase 2: Segment fits — one future per lag step.
+            # Each future processes ALL segments for that step, giving each
+            # task enough work to amortize Python/GIL overhead.  With
+            # n_lag_steps futures (typically 20-2000), the pool stays saturated.
             # ------------------------------------------------------------------
-            # future -> (t, step, s_start, s_end)
-            seg_futures: dict[concurrent.futures.Future, tuple[int, int, int, int]] = {}
+            # future -> (t, step)
+            seg_futures: dict[concurrent.futures.Future, tuple[int, int]] = {}
 
             for t, step in enumerate(range(self.tmin, self.tmax + 1)):
                 n_per_seg_step = int(self.nperseg / step)
@@ -643,25 +639,22 @@ class Dcov():
                 a2full_3D_val = float(np.sum(self.a2full[t])) if not self.multi else 0.0
                 s2full_3D_val = float(np.sum(self.s2full[t])) if not self.multi else 0.0
 
-                for s_start in range(0, self.nseg, chunk_size):
-                    s_end = min(s_start + chunk_size, self.nseg)
+                if self.multi:
+                    chunk_data = all_trajs
+                else:
+                    full_z = all_trajs[0]
+                    chunk_data = [
+                        full_z[s * (self.nperseg + 1):(s + 1) * (self.nperseg + 1)]
+                        for s in range(self.nseg)
+                    ]
 
-                    if self.multi:
-                        chunk_data = all_trajs[s_start:s_end]
-                    else:
-                        full_z = all_trajs[0]
-                        chunk_data = [
-                            full_z[s * (self.nperseg + 1):(s + 1) * (self.nperseg + 1)]
-                            for s in range(s_start, s_end)
-                        ]
-
-                    fut = executor.submit(
-                        analyze_chunk_task,
-                        chunk_data, step, self.m, self.dt, self.nperseg,
-                        self.multi, self.ndim, self.d2max, self.nitmax,
-                        c2_pre, cm_pre, a2full_3D_val, s2full_3D_val
-                    )
-                    seg_futures[fut] = (t, step, s_start, s_end)
+                fut = executor.submit(
+                    analyze_chunk_task,
+                    chunk_data, step, self.m, self.dt, self.nperseg,
+                    self.multi, self.ndim, self.d2max, self.nitmax,
+                    c2_pre, cm_pre, a2full_3D_val, s2full_3D_val
+                )
+                seg_futures[fut] = (t, step)
 
             seg_iter = concurrent.futures.as_completed(seg_futures)
             if self.progress:
@@ -669,12 +662,11 @@ class Dcov():
                 seg_iter = tqdm(seg_iter, total=len(seg_futures), desc=desc)
 
             for fut in seg_iter:
-                t, step, s_start, s_end = seg_futures[fut]
+                t, step = seg_futures[fut]
                 chunk_results, error = fut.result()
                 if error:
                     raise error
-                for i, (res_a2, res_s2, q_val, res_converged) in enumerate(chunk_results):
-                    s = s_start + i
+                for s, (res_a2, res_s2, q_val, res_converged) in enumerate(chunk_results):
                     self.a2[t, s] = res_a2
                     self.s2[t, s] = res_s2
                     self.q[t, s] = q_val
