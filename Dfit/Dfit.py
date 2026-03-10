@@ -168,6 +168,54 @@ def analyze_chunk_task(chunk_data, step, m, dt, nperseg, multi, ndim, d2max, nit
         
     return results, None
 
+
+def analyze_full_traj_task(full_z, step, m, dt, ndim, d2max, nitmax):
+    """Run the full-trajectory GLS fit for one lag step (single-trajectory mode).
+
+    Parameters
+    ----------
+    full_z : ndarray of shape (n_frames, ndim)
+        Complete trajectory array in nm.
+    step : int
+        Lag stride in frame steps.
+    m : int
+        Number of MSD values used in the GLS fit window.
+    dt : float
+        Timestep in ps (used only for error messages).
+    ndim : int
+        Number of spatial dimensions.
+    d2max : float
+        Convergence threshold for iterative GLS updates.
+    nitmax : int
+        Maximum number of GLS iterations.
+
+    Returns
+    -------
+    tuple[ndarray, ndarray, bool] | tuple[None, None, Exception]
+        ``(a2_per_dim, s2_per_dim, converged_all)`` on success, or
+        ``(None, None, exc)`` if the trajectory is too short.
+    """
+    z_strided_check = full_z[::step, 0]  # check length via first dim
+    if len(z_strided_check) <= m:
+        exc = ValueError(
+            f"Trajectory too short (length N={len(z_strided_check)}) to calculate "
+            f"m={m} MSD points at lag time step={step} (t={step * dt} ps). "
+            f"Please reduce tmax or m, or use a longer trajectory."
+        )
+        return None, None, exc
+
+    res_a2 = np.zeros(ndim)
+    res_s2 = np.zeros(ndim)
+    converged_all = True
+    for d in range(ndim):
+        z_dim = full_z[:, d][::step]
+        n = len(z_dim) - 1
+        msd = math_utils.compute_MSD_1D_via_correlation(z_dim)[1:(m + 1)]
+        res_a2[d], res_s2[d], converged = math_utils.calc_gls(n, m, msd, d2max, nitmax)
+        if not converged:
+            converged_all = False
+    return res_a2, res_s2, converged_all
+
 class Dcov():
     """Estimate diffusion coefficients from trajectories using GLS on MSD data.
 
@@ -510,34 +558,25 @@ class Dcov():
           ``percent_failed``).
         - Setting lifecycle flag ``_fitted=True``.
         - Optionally writing ``{fout}.pkl``.
-        """
-        
-        # Pre-load data if it fits in memory or iterate?
-        # The original code loaded everything. 
-        # Our reader yields full trajectories.
-        # To avoid re-reading for every 'step' in the outer loop, we should probably load it once
-        # IF we can afford it.
-        # The outer loop iterates over 'step' (lag time).
-        # We need the full trajectory for every lag time calculation?
-        # Actually, the original code sliced: z[::step].
-        
-        # Optimization: Read all data into a list of arrays once.
-        # If memory is an issue, we would need to re-read from disk/MDA every time, which is slow.
-        # Let's assume we load it.
-        
-        all_trajs = list(self.reader) # List of (N_frames, ndim) arrays
 
-        # Warm up numba-compiled kernels once to avoid a slow first step
+        The implementation submits all independent ``(lag_step, segment_chunk)``
+        combinations to the thread pool at once, so the pool can saturate all
+        available workers across the full lag-time range rather than being
+        limited to the number of segments per step.  In single-trajectory mode
+        a two-phase approach is used: full-trajectory fits (one per lag step)
+        are collected first because their results are needed as the Q-factor
+        reference for the segment fits.
+        """
+        all_trajs = list(self.reader)  # load once; shape (n_trajs, n_frames, ndim)
+
+        # Warm up numba-compiled kernels to avoid a slow first task
         try:
             dummy = np.zeros(8)
             _ = math_utils.compute_MSD_1D_via_correlation(dummy)
             _ = math_utils.calc_gls(5, 3, np.arange(3, dtype=np.float64), self.d2max, 2,
-                                   c2=math_utils.setupc(2, 5), cm=math_utils.setupc(3, 5))
+                                    c2=math_utils.setupc(2, 5), cm=math_utils.setupc(3, 5))
         except Exception:
-            # If warm-up fails for any reason, continue; main computation will trigger JIT anyway.
             pass
-        
-        non_converged_count = 0
 
         # Determine worker count (treat n_jobs=0 as serial)
         if self.n_jobs is None or self.n_jobs < 0:
@@ -547,114 +586,130 @@ class Dcov():
         else:
             max_workers = self.n_jobs
 
-        # Use threads to avoid pickling large trajectory chunks; numba kernels release the GIL
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            
-            step_iter = range(self.tmin, self.tmax+1)
-            if self.progress:
-                step_iter = tqdm(step_iter, total=self.tmax-self.tmin+1, desc="lag steps")
-            for t, step in enumerate(step_iter):
-                    
-                    # 1. Full Trajectory Analysis (Only for Single Trajectory mode)
-                    if not self.multi:
-                        # In single mode, all_trajs has 1 element
-                        full_z = all_trajs[0]
-                        converged_all_dims = True
-                        for d in range(self.ndim):
-                            z_dim = full_z[:, d]
-                            z_strided = z_dim[::step]
-                            if len(z_strided) <= self.m:
-                                 raise ValueError(f"Trajectory too short (length N={len(z_strided)}) to calculate m={self.m} MSD points at lag time step={step} (t={step*self.dt} ps). Please reduce tmax or m, or use a longer trajectory.")
-                            n = len(z_strided) - 1
-                            msd = math_utils.compute_MSD_1D_via_correlation(z_strided)[1:(self.m+1)]
-                            self.a2full[t,d], self.s2full[t,d], converged = math_utils.calc_gls(n, self.m, msd, self.d2max, self.nitmax)
-                            if not converged: converged_all_dims = False
-                        
-                        if not converged_all_dims: non_converged_count += 1
-                        
-                        a2full_3D = np.sum(self.a2full[t])
-                        s2full_3D = np.sum(self.s2full[t])
-                    
-                    # 2. Segment Analysis
-                    n_per_seg_step = int(self.nperseg / step)
-                    
-                    # Pre-calculate covariance matrices for this step
-                    c2_pre = None
-                    if n_per_seg_step >= 2:
-                        c2_pre = math_utils.setupc(2, n_per_seg_step)
-                    
-                    cm_pre = None
-                    if n_per_seg_step >= self.m:
-                        cm_pre = math_utils.setupc(self.m, n_per_seg_step)
-                    
-                    # Prepare chunks (coarser to reduce overhead)
-                    n_workers_count = max_workers if max_workers else (os.cpu_count() or 1)
-                    chunk_size = max(1, math.ceil(self.nseg / n_workers_count))
-                    
-                    # Prepare full trajectory values if single mode
-                    a2full_3D_val = 0.0
-                    s2full_3D_val = 0.0
-                    if not self.multi:
-                        a2full_3D_val = np.sum(self.a2full[t])
-                        s2full_3D_val = np.sum(self.s2full[t])
-                    
-                    future_to_range = {}
-                    for s_start in range(0, self.nseg, chunk_size):
-                        s_end = min(s_start + chunk_size, self.nseg)
-                        
-                        chunk_data = []
-                        if self.multi:
-                            chunk_data = all_trajs[s_start:s_end]
-                        else:
-                            # Slice the single trajectory
-                            full_z = all_trajs[0]
-                            for s in range(s_start, s_end):
-                                zstart = s * (self.nperseg + 1)
-                                zend = (s + 1) * (self.nperseg + 1)
-                                chunk_data.append(full_z[zstart:zend])
-                                
-                        fut = executor.submit(analyze_chunk_task, chunk_data, step, self.m, self.dt, self.nperseg, self.multi, self.ndim, self.d2max, self.nitmax, c2_pre, cm_pre, a2full_3D_val, s2full_3D_val)
-                        future_to_range[fut] = (s_start, s_end)
-                    
-                    for future in concurrent.futures.as_completed(future_to_range):
-                        s_start, s_end = future_to_range[future]
-                        try:
-                            chunk_results, error = future.result()
-                            if error:
-                                raise error
-                            
-                            for i, (res_a2, res_s2, q_val, res_converged) in enumerate(chunk_results):
-                                s = s_start + i
-                                self.a2[t,s] = res_a2
-                                self.s2[t,s] = res_s2
-                                self.q[t,s] = q_val
-                                if not res_converged: non_converged_count += 1
-                        except Exception as exc:
-                            raise exc
+        n_workers_count = max_workers if max_workers else (os.cpu_count() or 1)
+        # One chunk per worker, sized to spread segments evenly.
+        # With many lag steps the pool is kept busy even with small chunk sizes.
+        chunk_size = max(1, math.ceil(self.nseg / n_workers_count))
 
-                    # 3. Averaging
-                    a2m = np.mean(self.a2[t], axis=0)
-                    s2m = np.mean(self.s2[t], axis=0)
-                    
-                    self.s2var[t] = math_utils.eval_vars(n_per_seg_step, self.m, a2m, s2m, self.ndim)
-                    
-                    # Normalize by step
-                    self.a2[t] /= step
-                    self.s2[t] /= step
-                    self.s2var[t] /= step**2
-                    if not self.multi:
-                        self.a2full[t] /= step
-                        self.s2full[t] /= step
-                    
-                    # tqdm auto-updates via iteration; no manual update needed
-        
+        n_lag_steps = self.tmax - self.tmin + 1
+        non_converged_count = 0
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+
+            # ------------------------------------------------------------------
+            # Phase 1 (single-trajectory mode only):
+            # Run the full-trajectory GLS fits for every lag step in parallel.
+            # Results populate self.a2full / self.s2full and are later used as
+            # the Q-factor reference in the segment fits.
+            # ------------------------------------------------------------------
+            if not self.multi:
+                full_z = all_trajs[0]
+                full_futures: dict[concurrent.futures.Future, int] = {
+                    executor.submit(
+                        analyze_full_traj_task,
+                        full_z, step, self.m, self.dt, self.ndim, self.d2max, self.nitmax
+                    ): t
+                    for t, step in enumerate(range(self.tmin, self.tmax + 1))
+                }
+
+                full_iter = concurrent.futures.as_completed(full_futures)
+                if self.progress:
+                    full_iter = tqdm(full_iter, total=n_lag_steps, desc="full-traj fits")
+
+                for fut in full_iter:
+                    t = full_futures[fut]
+                    res_a2, res_s2, conv_or_exc = fut.result()
+                    if isinstance(conv_or_exc, Exception):
+                        raise conv_or_exc
+                    self.a2full[t] = res_a2
+                    self.s2full[t] = res_s2
+                    if not conv_or_exc:
+                        non_converged_count += 1
+
+            # ------------------------------------------------------------------
+            # Phase 2: Segment fits for every (lag_step, chunk) combination.
+            # All futures are submitted at once so the thread pool can schedule
+            # them freely and run at peak parallelism.
+            # ------------------------------------------------------------------
+            # future -> (t, step, s_start, s_end)
+            seg_futures: dict[concurrent.futures.Future, tuple[int, int, int, int]] = {}
+
+            for t, step in enumerate(range(self.tmin, self.tmax + 1)):
+                n_per_seg_step = int(self.nperseg / step)
+
+                c2_pre = math_utils.setupc(2, n_per_seg_step) if n_per_seg_step >= 2 else None
+                cm_pre = math_utils.setupc(self.m, n_per_seg_step) if n_per_seg_step >= self.m else None
+
+                a2full_3D_val = float(np.sum(self.a2full[t])) if not self.multi else 0.0
+                s2full_3D_val = float(np.sum(self.s2full[t])) if not self.multi else 0.0
+
+                for s_start in range(0, self.nseg, chunk_size):
+                    s_end = min(s_start + chunk_size, self.nseg)
+
+                    if self.multi:
+                        chunk_data = all_trajs[s_start:s_end]
+                    else:
+                        full_z = all_trajs[0]
+                        chunk_data = [
+                            full_z[s * (self.nperseg + 1):(s + 1) * (self.nperseg + 1)]
+                            for s in range(s_start, s_end)
+                        ]
+
+                    fut = executor.submit(
+                        analyze_chunk_task,
+                        chunk_data, step, self.m, self.dt, self.nperseg,
+                        self.multi, self.ndim, self.d2max, self.nitmax,
+                        c2_pre, cm_pre, a2full_3D_val, s2full_3D_val
+                    )
+                    seg_futures[fut] = (t, step, s_start, s_end)
+
+            seg_iter = concurrent.futures.as_completed(seg_futures)
+            if self.progress:
+                desc = "segment fits" if not self.multi else "lag steps"
+                seg_iter = tqdm(seg_iter, total=len(seg_futures), desc=desc)
+
+            for fut in seg_iter:
+                t, step, s_start, s_end = seg_futures[fut]
+                chunk_results, error = fut.result()
+                if error:
+                    raise error
+                for i, (res_a2, res_s2, q_val, res_converged) in enumerate(chunk_results):
+                    s = s_start + i
+                    self.a2[t, s] = res_a2
+                    self.s2[t, s] = res_s2
+                    self.q[t, s] = q_val
+                    if not res_converged:
+                        non_converged_count += 1
+
+        # ------------------------------------------------------------------
+        # Post-processing (serial): variance estimation and step normalisation.
+        # These depend on the full a2[t] / s2[t] arrays being populated, so
+        # they cannot be overlapped with the futures.
+        # ------------------------------------------------------------------
+        for t, step in enumerate(range(self.tmin, self.tmax + 1)):
+            n_per_seg_step = int(self.nperseg / step)
+            a2m = np.mean(self.a2[t], axis=0)
+            s2m = np.mean(self.s2[t], axis=0)
+            self.s2var[t] = math_utils.eval_vars(n_per_seg_step, self.m, a2m, s2m, self.ndim)
+
+            self.a2[t] /= step
+            self.s2[t] /= step
+            self.s2var[t] /= step ** 2
+            if not self.multi:
+                self.a2full[t] /= step
+                self.s2full[t] /= step
+
         self.non_converged_count = non_converged_count
-        self.total_cases = (self.tmax - self.tmin + 1) * (self.nseg + (1 if not self.multi else 0))
+        self.total_cases = n_lag_steps * (self.nseg + (1 if not self.multi else 0))
         self.percent_failed = 0.0
-        
+
         if non_converged_count > 0:
             self.percent_failed = (non_converged_count / self.total_cases) * 100
-            print(f"WARNING: Optimizer did not converge in {non_converged_count} cases ({self.percent_failed:.1f}% of Total {self.total_cases}). Falling back to M=2 for those cases.")
+            print(
+                f"WARNING: Optimizer did not converge in {non_converged_count} cases "
+                f"({self.percent_failed:.1f}% of Total {self.total_cases}). "
+                f"Falling back to M=2 for those cases."
+            )
 
         self._fitted = True
 

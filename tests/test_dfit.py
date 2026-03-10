@@ -297,3 +297,45 @@ def test_single_frame_error(tmp_path):
 
     with pytest.raises(ValueError, match="too short"):
         Dcov(fz=str(file_path), fout=str(tmp_path / 'D_analysis'))
+
+
+def test_parallel_consistent_single(random_walk_file, tmp_path):
+    """Serial and parallel runs must produce numerically identical results (single-traj mode)."""
+    kwargs = dict(fz=random_walk_file, m=10, tmax=20.0, nseg=5, progress=False)
+
+    dcov_serial = Dcov(**kwargs, n_jobs=0, fout=str(tmp_path / 'D_serial'))
+    dcov_serial.run_Dfit()
+    dcov_serial.analysis(tc=10)
+
+    dcov_par = Dcov(**kwargs, n_jobs=4, fout=str(tmp_path / 'D_par'))
+    dcov_par.run_Dfit()
+    dcov_par.analysis(tc=10)
+
+    assert np.allclose(dcov_serial.D, dcov_par.D), "D arrays differ between serial and parallel runs"
+    assert np.allclose(dcov_serial.a2, dcov_par.a2), "a2 arrays differ"
+    assert np.allclose(dcov_serial.s2, dcov_par.s2), "s2 arrays differ"
+    assert np.allclose(dcov_serial.q, dcov_par.q),   "q arrays differ"
+
+
+def test_parallel_consistent_multi(tmp_path):
+    """Serial and parallel runs must produce numerically identical results (multi-traj mode)."""
+    trajs = [generate_random_walk(n_steps=500, dim=3) for _ in range(8)]
+    files = []
+    for i, traj in enumerate(trajs):
+        p = tmp_path / f"traj{i}.dat"
+        np.savetxt(p, traj)
+        files.append(str(p))
+
+    kwargs = dict(fz=files, m=10, tmax=20.0, progress=False)
+
+    dcov_serial = Dcov(**kwargs, n_jobs=0, fout=str(tmp_path / 'D_serial'))
+    dcov_serial.run_Dfit()
+    dcov_serial.analysis(tc=10)
+
+    dcov_par = Dcov(**kwargs, n_jobs=4, fout=str(tmp_path / 'D_par'))
+    dcov_par.run_Dfit()
+    dcov_par.analysis(tc=10)
+
+    assert np.allclose(dcov_serial.D, dcov_par.D), "D arrays differ between serial and parallel runs"
+    assert np.allclose(dcov_serial.a2, dcov_par.a2), "a2 arrays differ"
+    assert np.allclose(dcov_serial.s2, dcov_par.s2), "s2 arrays differ"
