@@ -622,13 +622,17 @@ class Dcov():
                         non_converged_count += 1
 
             # ------------------------------------------------------------------
-            # Phase 2: Segment fits — one future per lag step.
-            # Each future processes ALL segments for that step, giving each
-            # task enough work to amortize Python/GIL overhead.  With
-            # n_lag_steps futures (typically 20-2000), the pool stays saturated.
+            # Phase 2: Segment fits — one future per (lag_step, chunk).
+            # Each lag step's segments are split across workers so the
+            # heaviest steps (step ≈ 1, largest per-segment work) are
+            # shared.  The Numba-JIT'd compute in each chunk releases the
+            # GIL, giving true thread-level parallelism.
             # ------------------------------------------------------------------
-            # future -> (t, step)
-            seg_futures: dict[concurrent.futures.Future, tuple[int, int]] = {}
+            n_workers_eff = max_workers if max_workers else (os.cpu_count() or 1)
+            chunk_size = max(1, math.ceil(self.nseg / n_workers_eff))
+
+            # future -> (t, step, s_start, s_end)
+            seg_futures: dict[concurrent.futures.Future, tuple[int, int, int, int]] = {}
 
             for t, step in enumerate(range(self.tmin, self.tmax + 1)):
                 n_per_seg_step = int(self.nperseg / step)
@@ -639,34 +643,37 @@ class Dcov():
                 a2full_3D_val = float(np.sum(self.a2full[t])) if not self.multi else 0.0
                 s2full_3D_val = float(np.sum(self.s2full[t])) if not self.multi else 0.0
 
-                if self.multi:
-                    chunk_data = all_trajs
-                else:
-                    full_z = all_trajs[0]
-                    chunk_data = [
-                        full_z[s * (self.nperseg + 1):(s + 1) * (self.nperseg + 1)]
-                        for s in range(self.nseg)
-                    ]
+                for s_start in range(0, self.nseg, chunk_size):
+                    s_end = min(s_start + chunk_size, self.nseg)
 
-                fut = executor.submit(
-                    analyze_chunk_task,
-                    chunk_data, step, self.m, self.dt, self.nperseg,
-                    self.multi, self.ndim, self.d2max, self.nitmax,
-                    c2_pre, cm_pre, a2full_3D_val, s2full_3D_val
-                )
-                seg_futures[fut] = (t, step)
+                    if self.multi:
+                        chunk_data = all_trajs[s_start:s_end]
+                    else:
+                        full_z = all_trajs[0]
+                        chunk_data = [
+                            full_z[s * (self.nperseg + 1):(s + 1) * (self.nperseg + 1)]
+                            for s in range(s_start, s_end)
+                        ]
+
+                    fut = executor.submit(
+                        analyze_chunk_task,
+                        chunk_data, step, self.m, self.dt, self.nperseg,
+                        self.multi, self.ndim, self.d2max, self.nitmax,
+                        c2_pre, cm_pre, a2full_3D_val, s2full_3D_val
+                    )
+                    seg_futures[fut] = (t, step, s_start, s_end)
 
             seg_iter = concurrent.futures.as_completed(seg_futures)
             if self.progress:
-                desc = "segment fits" if not self.multi else "lag steps"
-                seg_iter = tqdm(seg_iter, total=len(seg_futures), desc=desc)
+                seg_iter = tqdm(seg_iter, total=len(seg_futures), desc="segment fits")
 
             for fut in seg_iter:
-                t, step = seg_futures[fut]
+                t, step, s_start, s_end = seg_futures[fut]
                 chunk_results, error = fut.result()
                 if error:
                     raise error
-                for s, (res_a2, res_s2, q_val, res_converged) in enumerate(chunk_results):
+                for i, (res_a2, res_s2, q_val, res_converged) in enumerate(chunk_results):
+                    s = s_start + i
                     self.a2[t, s] = res_a2
                     self.s2[t, s] = res_s2
                     self.q[t, s] = q_val
