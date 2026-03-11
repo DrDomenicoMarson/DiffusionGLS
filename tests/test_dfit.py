@@ -7,6 +7,24 @@ from Dfit.trajectory_reader import NumpyTextReader
 from conftest import generate_random_walk
 
 
+def _set_q_profile(dcov: Dcov, q_profile: np.ndarray) -> None:
+    """Override segment Q values with a deterministic mean profile for tests.
+
+    Parameters
+    ----------
+    dcov : Dcov
+        Fitted diffusion estimator whose ``q`` array will be overwritten.
+    q_profile : ndarray
+        One-dimensional array of length ``tmax - tmin + 1`` containing the
+        desired mean ``Q`` value at each lag.
+    """
+    q_profile = np.asarray(q_profile, dtype=float)
+    expected_shape = (dcov.tmax - dcov.tmin + 1,)
+    if q_profile.shape != expected_shape:
+        raise ValueError(f"q_profile must have shape {expected_shape}, got {q_profile.shape}")
+    dcov.q[:] = q_profile[:, np.newaxis]
+
+
 def test_reader_text(random_walk_file):
     reader = NumpyTextReader(random_walk_file)
     assert reader.n_trajs == 1
@@ -101,11 +119,66 @@ def test_auto_tc(random_walk_file, tmp_path):
     tc_selected = dcov.tc_selected
     expected_path = f"{tmp_path / 'D_analysis'}.tc_{tc_selected:.4g}.dat"
     assert os.path.exists(expected_path)
+    assert dcov.tc_auto_unbounded == pytest.approx(tc_selected)
+    assert dcov.tc_auto_unbounded_idx == dcov.tc_selected_idx
+    assert dcov.auto_min_tc_used is None
     
     # We can't easily assert WHICH tc was chosen without parsing stdout or checking internals,
     # but we can check that it didn't crash and produced output.
     # Ideally we would check if the chosen Q is close to 0.5, but with random walk data it might vary.
     # Let's just ensure it runs.
+
+
+def test_auto_tc_with_lower_bound_rounds_up(random_walk_file, tmp_path):
+    with pytest.warns(UserWarning, match="differs from"):
+        dcov = Dcov(
+            fz=random_walk_file,
+            dt=0.5,
+            m=5,
+            tmax=5.0,
+            fout=str(tmp_path / 'D_analysis_bound'),
+        )
+    dcov.run_Dfit()
+
+    q_profile = np.full(dcov.tmax - dcov.tmin + 1, 0.9)
+    q_profile[1] = 0.49
+    q_profile[4] = 0.48
+    _set_q_profile(dcov, q_profile)
+
+    dcov.analysis(tc='auto', auto_min_tc=2.1)
+
+    assert dcov.tc_auto_unbounded == pytest.approx(1.0)
+    assert dcov.tc_auto_unbounded_idx == 1
+    assert dcov.tc_selected == pytest.approx(2.5)
+    assert dcov.tc_selected_idx == 4
+    assert dcov.auto_min_tc_used == pytest.approx(2.5)
+
+    expected_path = f"{tmp_path / 'D_analysis_bound'}.tc_{dcov.tc_selected:.4g}.dat"
+    assert os.path.exists(expected_path)
+
+    with open(expected_path, 'r', encoding='utf-8') as handle:
+        text = handle.read()
+
+    assert "AUTO TC SELECTION:" in text
+    assert "Requested auto_min_tc: 2.1 ps" in text
+    assert "Applied auto_min_tc on lag grid: 2.5 ps" in text
+    assert "Plain auto tc without lower bound: 1 ps" in text
+
+
+def test_auto_tc_with_excessive_lower_bound_raises(random_walk_file, tmp_path):
+    dcov = Dcov(fz=random_walk_file, m=5, tmax=10.0, fout=str(tmp_path / 'D_analysis'))
+    dcov.run_Dfit()
+
+    with pytest.raises(ValueError, match="auto_min_tc .* exceeds the computed lag-time range"):
+        dcov.analysis(tc='auto', auto_min_tc=100.0)
+
+
+def test_auto_min_tc_requires_auto_mode(random_walk_file, tmp_path):
+    dcov = Dcov(fz=random_walk_file, m=5, tmax=10.0, fout=str(tmp_path / 'D_analysis'))
+    dcov.run_Dfit()
+
+    with pytest.raises(ValueError, match="auto_min_tc can only be used when tc='auto'"):
+        dcov.analysis(tc=5.0, auto_min_tc=2.0)
 
 def test_mismatched_lengths_error(tmp_path):
     traj1 = generate_random_walk(n_steps=100, dim=3)

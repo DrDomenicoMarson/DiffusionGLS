@@ -9,6 +9,7 @@
 
 import math
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 import warnings
 import concurrent.futures
@@ -27,6 +28,42 @@ TrajectoryInput = str | Path | Sequence[str | Path] | None
 
 XI_CUBIC = 2.837297
 BOLTZMANN_K = 1.380649e-23 # J/K
+
+
+@dataclass(frozen=True)
+class AutoTcSelection:
+    """Resolved lag-time choice for ``analysis(tc="auto")``.
+
+    Parameters
+    ----------
+    selected_idx : int
+        Final zero-based lag-grid index used for the analysis output.
+    selected_step : int
+        Final lag step on the internal ``tmin..tmax`` grid.
+    selected_tc_ps : float
+        Final lag time in ps.
+    selected_tc_disp : float
+        Final lag time in the user's ``time_unit``.
+    unbounded_idx : int
+        Zero-based lag-grid index from the unconstrained auto selection.
+    unbounded_step : int
+        Unconstrained lag step on the internal ``tmin..tmax`` grid.
+    unbounded_tc_disp : float
+        Unconstrained lag time in the user's ``time_unit``.
+    auto_min_tc_used : float or None
+        First lag on the computed grid that satisfies the lower-bound search
+        threshold, in the user's ``time_unit``.
+    """
+
+    selected_idx: int
+    selected_step: int
+    selected_tc_ps: float
+    selected_tc_disp: float
+    unbounded_idx: int
+    unbounded_step: int
+    unbounded_tc_disp: float
+    auto_min_tc_used: float | None
+
 
 def calc_q(n,m,a2_3D,s2_3D,msds_3D,a2full_3D,s2full_3D,ndim):
     """Evaluate the segment quality factor ``Q`` from the GLS fit.
@@ -476,6 +513,9 @@ class Dcov():
         self.q_std = None
         self.tc_selected = None  # selected tc in chosen time unit
         self.tc_selected_idx = None  # index into lag arrays
+        self.tc_auto_unbounded = None  # unconstrained auto tc in chosen time unit
+        self.tc_auto_unbounded_idx = None  # index into lag arrays for unconstrained auto tc
+        self.auto_min_tc_used = None  # applied lower bound on the lag grid in chosen time unit
 
     @staticmethod
     def load(filename: str) -> 'Dcov':
@@ -498,6 +538,9 @@ class Dcov():
         # A loaded model is assumed to have been fitted. This also ensures
         # backward compatibility with older pickle files that lack this flag.
         obj._fitted = True
+        obj.tc_auto_unbounded = getattr(obj, 'tc_auto_unbounded', None)
+        obj.tc_auto_unbounded_idx = getattr(obj, 'tc_auto_unbounded_idx', None)
+        obj.auto_min_tc_used = getattr(obj, 'auto_min_tc_used', None)
         return obj
 
     def _timestep_index(self, tc: float) -> int:
@@ -528,6 +571,81 @@ class Dcov():
         if itc < 0 or itc >= (self.tmax - self.tmin + 1):
             raise ValueError(f'tc [{tc}] is outside the computed timestep range')
         return itc
+
+    def _ceil_timestep_index(self, tc: float) -> int:
+        """Map a lower-bound lag time to the first available grid index.
+
+        Parameters
+        ----------
+        tc : float
+            Lower-bound lag time in ``time_unit``.
+
+        Returns
+        -------
+        int
+            Zero-based index of the first computed lag that is greater than or
+            equal to ``tc``.
+
+        Raises
+        ------
+        ValueError
+            If the requested lower bound exceeds the computed lag grid.
+        """
+        steps = (tc * self.time_scale) / self.dt
+        steps_int = math.ceil(steps - 1e-12)
+        step = max(int(steps_int), self.tmin)
+        itc = step - self.tmin
+        if itc < 0 or itc >= (self.tmax - self.tmin + 1):
+            raise ValueError(
+                f"auto_min_tc [{tc}] exceeds the computed lag-time range up to "
+                f"{self.tmax * self.dt / self.time_scale:.4g} {self.time_unit}"
+            )
+        return itc
+
+    def _select_auto_tc(self, auto_min_tc: float | None = None) -> AutoTcSelection:
+        """Select the lag time for ``analysis(tc="auto")``.
+
+        Parameters
+        ----------
+        auto_min_tc : float or None, optional
+            Optional lower bound in ``time_unit``. When provided, the auto
+            search starts from the first lag on the computed grid that is
+            greater than or equal to this value.
+
+        Returns
+        -------
+        AutoTcSelection
+            Resolved auto-selection metadata, including the unconstrained
+            choice and the final bounded choice.
+        """
+        diff = np.abs(self.q_m - 0.5)
+        unbounded_idx = int(np.argmin(diff))
+        selected_idx = unbounded_idx
+        auto_min_tc_used = None
+
+        if auto_min_tc is not None:
+            min_idx = self._ceil_timestep_index(auto_min_tc)
+            selected_idx = min_idx + int(np.argmin(diff[min_idx:]))
+            min_step = self.tmin + min_idx
+            auto_min_tc_used = (min_step * self.dt) / self.time_scale
+
+        selected_step = self.tmin + selected_idx
+        selected_tc_ps = selected_step * self.dt
+        selected_tc_disp = selected_tc_ps / self.time_scale
+
+        unbounded_step = self.tmin + unbounded_idx
+        unbounded_tc_disp = (unbounded_step * self.dt) / self.time_scale
+
+        return AutoTcSelection(
+            selected_idx=selected_idx,
+            selected_step=selected_step,
+            selected_tc_ps=selected_tc_ps,
+            selected_tc_disp=selected_tc_disp,
+            unbounded_idx=unbounded_idx,
+            unbounded_step=unbounded_step,
+            unbounded_tc_disp=unbounded_tc_disp,
+            auto_min_tc_used=auto_min_tc_used,
+        )
 
     def run_Dfit(self, save_model: bool = False):
         """Run GLS fitting over all configured lag steps and segments.
@@ -725,7 +843,8 @@ class Dcov():
                 print(f"Model saved to {self.fout}.pkl")
 
     # Output and plotting
-    def analysis(self, tc: float | str = 10, fout_prefix: str | None = None):
+    def analysis(self, tc: float | str = 10, fout_prefix: str | None = None,
+                 auto_min_tc: float | None = None):
         """Compute diffusion coefficient statistics and write output files.
 
         Parameters
@@ -735,6 +854,10 @@ class Dcov():
             multiple of dt.  Pass ``'auto'`` to select the lag where Q ≈ 0.5.
         fout_prefix : str, optional
             Custom base name for output files.  Default: ``{fout}.tc_{tc}``.
+        auto_min_tc : float or None, optional
+            Lower bound for ``tc='auto'`` in ``time_unit``. The auto search is
+            restricted to the first lag on the computed grid that is greater
+            than or equal to this value and all larger lags.
 
         Returns
         -------
@@ -746,7 +869,9 @@ class Dcov():
         RuntimeError
             If called before :meth:`run_Dfit`.
         ValueError
-            If ``tc`` is invalid for the computed lag-time grid.
+            If ``tc`` is invalid for the computed lag-time grid, if
+            ``auto_min_tc`` exceeds the computed lag range, or if
+            ``auto_min_tc`` is provided together with a numeric ``tc``.
 
         Notes
         -----
@@ -799,24 +924,38 @@ class Dcov():
         Dsem_emp_out = self.Dsem_emp * self.diff_scale
         Dperdim_out = self.Dperdim * self.diff_scale
 
+        self.tc_auto_unbounded = None
+        self.tc_auto_unbounded_idx = None
+        self.auto_min_tc_used = None
+
         if tc == 'auto':
-            # Find index where q_m is closest to 0.5
-            # self.q_m is array of shape (tmax-tmin+1,)
-            # We want to minimize abs(q_m - 0.5)
-            # Note: q_m indices correspond to steps tmin...tmax
-            
-            diff = np.abs(self.q_m - 0.5)
-            idx_min = np.argmin(diff)
-            itc = idx_min
-            
-            # Calculate actual tc value for reporting
-            # itc is 0-indexed relative to self.tmin
-            step = self.tmin + itc
-            tc_ps = step * self.dt  # ps
-            tc_disp = tc_ps / self.time_scale  # user unit
-            
-            print(f"Automatically selected tc = {tc_disp:.4g} {self.time_unit} (Q = {self.q_m[itc]:.4f})")
+            auto_selection = self._select_auto_tc(auto_min_tc=auto_min_tc)
+            itc = auto_selection.selected_idx
+            step = auto_selection.selected_step
+            tc_ps = auto_selection.selected_tc_ps
+            tc_disp = auto_selection.selected_tc_disp
+
+            self.tc_auto_unbounded_idx = auto_selection.unbounded_idx
+            self.tc_auto_unbounded = auto_selection.unbounded_tc_disp
+            self.auto_min_tc_used = auto_selection.auto_min_tc_used
+
+            if (
+                auto_min_tc is not None
+                and auto_selection.selected_idx != auto_selection.unbounded_idx
+            ):
+                print(
+                    f"Plain auto tc = {auto_selection.unbounded_tc_disp:.4g} {self.time_unit} "
+                    f"(Q = {self.q_m[auto_selection.unbounded_idx]:.4f}); "
+                    f"bounded auto tc = {tc_disp:.4g} {self.time_unit} "
+                    f"for auto_min_tc >= {auto_min_tc:.4g} {self.time_unit} "
+                    f"(applied from {self.auto_min_tc_used:.4g} {self.time_unit}, "
+                    f"Q = {self.q_m[itc]:.4f})"
+                )
+            else:
+                print(f"Automatically selected tc = {tc_disp:.4g} {self.time_unit} (Q = {self.q_m[itc]:.4f})")
         else:
+            if auto_min_tc is not None:
+                raise ValueError("auto_min_tc can only be used when tc='auto'")
             itc = self._timestep_index(tc)
             step = self.tmin + itc
             tc_ps = step * self.dt  # ps
@@ -855,6 +994,18 @@ class Dcov():
             
             if hasattr(self, 'non_converged_count'):
                  g.write(f"Optimizer convergence failures: {self.non_converged_count} ({self.percent_failed:.1f}% of {self.total_cases})\n")
+
+            if tc == 'auto':
+                g.write("AUTO TC SELECTION:\n")
+                g.write(f"Selected auto tc: {tc_disp:.4g} {self.time_unit} (Q = {self.q_m[itc]:.4f})\n")
+                if auto_min_tc is not None:
+                    g.write(f"Requested auto_min_tc: {auto_min_tc:.4g} {self.time_unit}\n")
+                    g.write(f"Applied auto_min_tc on lag grid: {self.auto_min_tc_used:.4g} {self.time_unit}\n")
+                    if self.tc_auto_unbounded_idx != self.tc_selected_idx:
+                        g.write(
+                            f"Plain auto tc without lower bound: {self.tc_auto_unbounded:.4g} {self.time_unit} "
+                            f"(Q = {self.q_m[self.tc_auto_unbounded_idx]:.4f})\n"
+                        )
 
             # Summary at chosen tc
             g.write(f"Your chosen diffusion coefficient at {tc_disp} {self.time_unit}: {D_out[itc]:.4e} {self.diffusion_unit}\n")
@@ -897,6 +1048,10 @@ class Dcov():
         -----
         This is a thin wrapper around :func:`plot_diffusion_results`.
         """
+        tc_auto_unbounded_ps = None
+        if self.tc_auto_unbounded is not None:
+            tc_auto_unbounded_ps = self.tc_auto_unbounded * self.time_scale
+
         plot_diffusion_results(
             D=self.D, Dstd=self.Dstd, Dempstd=self.Dempstd,
             q_m=self.q_m, q_std=self.q_std, s2=self.s2,
@@ -904,7 +1059,7 @@ class Dcov():
             m=self.m, ndim=self.ndim, nseg=self.nseg,
             time_scale=self.time_scale, time_unit=self.time_unit,
             diff_scale=self.diff_scale, diffusion_unit=self.diffusion_unit,
-            tc=tc, tc_selected_idx=self.tc_selected_idx,
+            tc=tc, tc_auto_unbounded=tc_auto_unbounded_ps, tc_selected_idx=self.tc_selected_idx,
             out_base=out_base, imgfmt=self.imgfmt,
         )
 
@@ -963,7 +1118,7 @@ class Dcov():
 def plot_diffusion_results(*, D, Dstd, Dempstd, q_m, q_std, s2,
                            tmin, tmax, dt, m, ndim, nseg,
                            time_scale, time_unit, diff_scale, diffusion_unit,
-                           tc, tc_selected_idx, out_base, imgfmt):
+                           tc, tc_auto_unbounded, tc_selected_idx, out_base, imgfmt):
     """Create the three-panel diffusion analysis plot.
 
     Parameters
@@ -1002,6 +1157,9 @@ def plot_diffusion_results(*, D, Dstd, Dempstd, q_m, q_std, s2,
         Display unit label for diffusion axes.
     tc : float
         Selected lag time in ps.
+    tc_auto_unbounded : float or None
+        Unconstrained auto-selected lag time in ps. When it differs from
+        ``tc``, an additional comparison marker is drawn on the plot.
     tc_selected_idx : int or None
         Selected lag index in the lag grid, if already known.
     out_base : str
@@ -1030,6 +1188,10 @@ def plot_diffusion_results(*, D, Dstd, Dempstd, q_m, q_std, s2,
     D_out = D * diff_scale
     Dstd_out = Dstd * diff_scale
     Dempstd_out = Dempstd * diff_scale
+    show_auto_comparison = (
+        tc_auto_unbounded is not None
+        and not math.isclose(tc_auto_unbounded, tc, rel_tol=1e-9, abs_tol=1e-12)
+    )
 
     ax0.plot(xs, D_out, color='C0', linewidth=0.8, label=r'$D$')
     ax0.plot(xs, D_out - Dstd_out, color='black', linestyle='dotted', linewidth=0.7,
@@ -1039,6 +1201,8 @@ def plot_diffusion_results(*, D, Dstd, Dempstd, q_m, q_std, s2,
                      color='C0', alpha=0.5, edgecolor='none', linewidth=0,
                      label=r'$\delta \overline{D}^\mathrm{empirical}$')
     ax0.axvline(tc / time_scale, color='tab:red', linestyle='dashed')
+    if show_auto_comparison:
+        ax0.axvline(tc_auto_unbounded / time_scale, color='tab:orange', linestyle='dotted', linewidth=1.2)
     ax0.set(ylabel=fr'$D(t)$ [{diffusion_unit}]')
     ax0.set(xlim=(tmin * dt / time_scale, tmax * dt / time_scale))
     ax0.ticklabel_format(style='scientific', scilimits=(-3, 4))
@@ -1049,7 +1213,19 @@ def plot_diffusion_results(*, D, Dstd, Dempstd, q_m, q_std, s2,
     ax1.fill_between(xs, q_m - q_std, q_m + q_std,
                      color='C0', alpha=0.5, edgecolor='none', linewidth=0)
     ax1.axhline(0.5, linestyle='dashed', color='gray', linewidth=1.2)
-    ax1.axvline(tc / time_scale, color='tab:red', linestyle='dashed')
+    selected_tc_marker = ax1.axvline(tc / time_scale, color='tab:red', linestyle='dashed')
+    if show_auto_comparison:
+        plain_auto_marker = ax1.axvline(
+            tc_auto_unbounded / time_scale,
+            color='tab:orange',
+            linestyle='dotted',
+            linewidth=1.2,
+        )
+        ax1.legend(
+            handles=[selected_tc_marker, plain_auto_marker],
+            labels=['selected tc', 'plain auto tc'],
+            loc='best',
+        )
     ax1.set(ylabel=r'$Q(t)$')
     ax1.set(xlabel=fr'lag time $t$ [{time_unit}]')
     ax1.set(ylim=(0, 1))

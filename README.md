@@ -26,7 +26,7 @@ import Dfit
 
 res = Dfit.Dcov(...)
 res.run_Dfit()
-res.analysis(tc=10.0)  # or tc="auto"
+res.analysis(tc=10.0)  # or tc="auto", auto_min_tc=50.0
 res.finite_size_correction(T=300, eta=0.001, L=10.0, tc=10.0)  # optional
 ```
 
@@ -41,7 +41,8 @@ Lifecycle constraints:
 - Multi-trajectory / multi-molecule analysis from a list of text trajectories.
 - MDAnalysis integration (`Universe`/`AtomGroup`, single or pooled) with
   per-residue handling.
-- Automatic lag-time choice with `tc="auto"` (Q-factor target near 0.5).
+- Automatic lag-time choice with `tc="auto"` (Q-factor target near 0.5),
+  with optional lower-bound restriction via `auto_min_tc`.
 - Repeated analysis on the same fitted object with different `tc` values.
 - Finite-size correction for 3D cubic boxes.
 - Model persistence to and from pickle (`save_model=True`, `Dcov.load`).
@@ -107,11 +108,13 @@ res.run_Dfit(save_model=False)
 ## Analysis
 
 ```python
-res.analysis(tc=10.0, fout_prefix=None)
+res.analysis(tc=10.0, fout_prefix=None, auto_min_tc=None)
 ```
 
 - `tc`: lag time in `time_unit`, or `"auto"` to choose lag with Q nearest 0.5.
 - `fout_prefix`: optional custom output prefix. Default is `{fout}.tc_{tc}`.
+- `auto_min_tc`: optional lower bound for `tc="auto"` in `time_unit`; the
+  auto search starts from the first computed lag `>= auto_min_tc`.
 
 Analysis can be repeated with different `tc` values after a single fit run.
 
@@ -148,6 +151,8 @@ Parameters:
   frame count and `dt`.
 - In multi mode, very large `tmax` may be clamped to a feasible value.
 - `tc` must lie on the computed lag grid and be a multiple of `dt`.
+- `auto_min_tc` is only valid with `tc="auto"` and is rounded up to the first
+  lag on the computed grid that satisfies the requested lower bound.
 
 ## Outputs
 
@@ -166,7 +171,8 @@ Key attributes and availability:
 | `D`, `Dstd`, `Dempstd` | `analysis()` | Main diffusion estimate and uncertainties per lag. |
 | `Dsem_pred`, `Dsem_emp` | `analysis()` | Predicted and empirical SEM estimates. |
 | `q_m`, `q_std` | `analysis()` | Mean and std. deviation of Q-factor per lag. |
-| `tc_selected`, `tc_selected_idx` | `analysis()` | Selected lag-time value/index used for summary. |
+| `tc_selected`, `tc_selected_idx` | `analysis()` | Final lag-time value/index used for summary. |
+| `tc_auto_unbounded`, `tc_auto_unbounded_idx`, `auto_min_tc_used` | `analysis()` | Unconstrained auto lag and applied lower-bound metadata when `tc="auto"` is used. |
 | `Dcor` | `finite_size_correction()` | Finite-size corrected diffusion series. |
 
 ## Known Practical Limits
@@ -211,7 +217,7 @@ u2 = mda.Universe("topol2.tpr", "traj_replica2.xtc")
 
 res = Dfit.Dcov(universes=[u1, u2], selection="resname SOL", tmax=50)
 res.run_Dfit()
-res.analysis(tc="auto")
+res.analysis(tc="auto", auto_min_tc=50.0)
 ```
 
 ### 4) Multiple text trajectories (multi-molecule mode)
