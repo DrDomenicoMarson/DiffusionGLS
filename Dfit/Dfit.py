@@ -1031,7 +1031,7 @@ def plot_diffusion_results(*, D, Dstd, Dempstd, q_m, q_std, s2,
     Dstd_out = Dstd * diff_scale
     Dempstd_out = Dempstd * diff_scale
 
-    ax0.plot(xs, D_out, color='C0', linewidth=1.0, label=r'$D$')
+    ax0.plot(xs, D_out, color='C0', linewidth=0.8, label=r'$D$')
     ax0.plot(xs, D_out - Dstd_out, color='black', linestyle='dotted', linewidth=0.7,
              label=r'$\delta \overline{D}^\mathrm{predicted}$')
     ax0.plot(xs, D_out + Dstd_out, color='black', linestyle='dotted', linewidth=0.7)
@@ -1045,7 +1045,7 @@ def plot_diffusion_results(*, D, Dstd, Dempstd, q_m, q_std, s2,
     ax0.legend(ncol=2)
     ax0.set_title(f"MSD window per lag: t .. {m}\u00d7t [{time_unit}]")
 
-    ax1.plot(xs, q_m, color='C0')
+    ax1.plot(xs, q_m, color='C0', linewidth=0.8)
     ax1.fill_between(xs, q_m - q_std, q_m + q_std,
                      color='C0', alpha=0.5, edgecolor='none', linewidth=0)
     ax1.axhline(0.5, linestyle='dashed', color='gray', linewidth=1.2)
