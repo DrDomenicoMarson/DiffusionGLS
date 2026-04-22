@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Diffusion Properties Draft</title>
+  <style>
+    body {
+      font-family: "Times New Roman", serif;
+      font-size: 12pt;
+      line-height: 1.35;
+      margin: 1in;
+      color: #111111;
+    }
+    h1 {
+      font-size: 16pt;
+      margin-bottom: 0.25em;
+    }
+    h2 {
+      font-size: 13pt;
+      margin-top: 1.2em;
+      margin-bottom: 0.3em;
+    }
+    p {
+      margin-top: 0.45em;
+      margin-bottom: 0.45em;
+      text-align: justify;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      margin-top: 0.6em;
+      margin-bottom: 0.6em;
+      font-size: 10.5pt;
+    }
+    th, td {
+      border: 1px solid #666666;
+      padding: 6px 8px;
+      vertical-align: top;
+    }
+    th {
+      background: #f1f1f1;
+      text-align: left;
+    }
+    .note {
+      font-size: 10.5pt;
+    }
+    .figure-block {
+      margin-top: 0.9em;
+      margin-bottom: 0.9em;
+      page-break-inside: avoid;
+      text-align: center;
+    }
+    .figure-block img {
+      width: 100%;
+      max-width: 6.5in;
+      height: auto;
+      display: block;
+      margin-left: auto;
+      margin-right: auto;
+    }
+    .caption {
+      font-size: 10.5pt;
+      text-align: justify;
+      margin-top: 0.35em;
+      margin-bottom: 0.2em;
+    }
+    .si-figure {
+      page-break-before: always;
+    }
+  </style>
+</head>
+<body>
+  <h1>Diffusion Properties from All-Atom Simulations</h1>
+
+  <p>
+    Diffusion coefficients for water and oxygen were extracted from the 1 microsecond
+    production trajectories with the DiffusionGLS workflow. Unless otherwise noted,
+    the discussion below refers to the pooled analysis, in which the 32 penetrant
+    molecules from each of the three replicas were combined into a single data set
+    for each system and the uncertainty was taken as the empirical SEM returned by
+    the GLS analysis. The replica-averaged analysis, where the three independent
+    runs are first analyzed separately and then combined as mean plus or minus
+    standard deviation, leads to the same qualitative picture. For context, the
+    simulation results are compared below with typical room-temperature literature
+    values reported for amorphous PET and PEF [REF: room-temperature oxygen transport
+    in PET/PEF; REF: room-temperature water transport in PET/PEF].
+  </p>
+
+  <p>
+    The literature benchmark is fairly clear. Near room temperature, amorphous PET
+    typically shows oxygen diffusivities of about 3-6 x 10<sup>-9</sup> cm<sup>2</sup> s<sup>-1</sup>,
+    whereas amorphous PEF is usually reported around 0.3-1 x 10<sup>-9</sup> cm<sup>2</sup> s<sup>-1</sup>.
+    For water, the corresponding ranges are about 2-3 x 10<sup>-9</sup> cm<sup>2</sup> s<sup>-1</sup>
+    in PET and 0.5-1 x 10<sup>-9</sup> cm<sup>2</sup> s<sup>-1</sup> in PEF. Experimental and prior
+    modeling work therefore point to the same qualitative ordering for both penetrants,
+    namely slower diffusion in PEF than in PET, with a much stronger PET/PEF contrast
+    for oxygen than for water [REF: Burgess et al. for O2 transport/permeability in PET/PEF;
+    REF: water sorption and transport in PET/PEF; REF: Lightfoot et al. for PET/PEF
+    oxygen-diffusion modeling].
+  </p>
+
+  <p>
+    Within OPLS-AA, water is consistently more mobile than oxygen in both polymer
+    matrices. In PEF, <i>D</i><sub>WAT</sub> = 6.11 +/- 0.68 x 10<sup>-9</sup> cm<sup>2</sup> s<sup>-1</sup>,
+    whereas <i>D</i><sub>O2</sub> = 2.53 +/- 0.32 x 10<sup>-9</sup> cm<sup>2</sup> s<sup>-1</sup>,
+    corresponding to a water/oxygen ratio of 2.41. In PET, the same ordering is
+    preserved, with <i>D</i><sub>WAT</sub> = 5.53 +/- 0.53 x 10<sup>-9</sup> cm<sup>2</sup> s<sup>-1</sup>
+    and <i>D</i><sub>O2</sub> = 3.22 +/- 0.41 x 10<sup>-9</sup> cm<sup>2</sup> s<sup>-1</sup>,
+    giving a water/oxygen ratio of 1.71. Relative to the literature, OPLS-AA therefore
+    performs unevenly. For oxygen, it preserves the expected PET > PEF ordering and
+    places PET almost exactly in the reported experimental range, but it still predicts
+    PEF oxygen diffusion that is much too high and a PET/PEF contrast of only 1.27,
+    far below the 5-10x reduction generally reported for PEF. For water, the disagreement
+    is stronger: both polymers are too fast, and the model even predicts PEF water diffusion
+    to be slightly faster than PET, opposite to the literature trend [REF: oxygen
+    diffusion benchmark PET/PEF; REF: water diffusion benchmark PET/PEF].
+  </p>
+
+  <p>
+    The QMD-FF force field produces a markedly different transport pattern. Water
+    diffusivity decreases to 1.88 +/- 0.27 x 10<sup>-9</sup> cm<sup>2</sup> s<sup>-1</sup>
+    in PEF and 1.98 +/- 0.28 x 10<sup>-9</sup> cm<sup>2</sup> s<sup>-1</sup> in PET,
+    while oxygen becomes the faster penetrant, with <i>D</i><sub>O2</sub> =
+    7.92 +/- 0.86 x 10<sup>-9</sup> cm<sup>2</sup> s<sup>-1</sup> in PEF and
+    4.75 +/- 0.52 x 10<sup>-9</sup> cm<sup>2</sup> s<sup>-1</sup> in PET. Consequently,
+    the water/oxygen ratio drops below unity, to 0.24 in PEF and 0.42 in PET, meaning
+    that oxygen diffuses about 4.2 times faster than water in PEF and about 2.4 times
+    faster in PET. In terms of literature comparison, QMD-FF is somewhat better for the
+    absolute magnitude of water diffusion, especially in PET, but it still makes water
+    transport almost polymer-independent (PET/PEF = 1.05) instead of reproducing the
+    reported 3-5x slowdown in PEF. Its oxygen prediction is qualitatively inconsistent
+    with experiment and prior modeling, because it reverses the PET/PEF ordering and
+    makes oxygen diffuse about 40% faster in PEF than in PET [REF: oxygen
+    diffusion benchmark PET/PEF; REF: PET/PEF oxygen-diffusion modeling].
+  </p>
+
+  <p>
+    A direct comparison at fixed polymer highlights the magnitude of the force-field
+    effect. Relative to OPLS-AA, QMD-FF reduces water diffusivity by about 69% in PEF
+    and 64% in PET, while increasing oxygen diffusivity by a factor of 3.1 in PEF
+    and by about 47% in PET. Because the oxygen and water models were kept unchanged
+    and the cross interactions were generated with the same combination rules in both
+    sets of simulations, these differences can be attributed primarily to the different
+    polymer descriptions produced by the two force fields. Literature discussions of PET
+    and PEF attribute the lower diffusivity of PEF not simply to smaller static free volume,
+    but to reduced segmental mobility, higher torsional barriers for furan-based motions,
+    and poorer connectivity of transient free-volume channels. From that perspective,
+    OPLS-AA appears to retain part of the expected barrier character of PEF for oxygen,
+    but not strongly enough, whereas QMD-FF makes the PEF matrix too dynamically
+    permissive for oxygen hopping [REF: chain mobility / free-volume connectivity in PET
+    vs PEF; REF: furan-vs-phenyl torsional dynamics]. This point is especially important
+    when interpreting diffusion with QMD-FF. The QMD-FF nonbonded parameters are
+    deliberately tailored to reproduce polymer-specific descriptors, so using standard,
+    non-optimized Lennard-Jones cross terms for water/polymer and oxygen/polymer
+    interactions is a more delicate transferability test and, in that sense, a more
+    pronounced leap of faith than for a general-purpose force field [REF: QMD-FF
+    parameterization paper]. By contrast, OPLS-AA is intrinsically more transferable and
+    was developed in a much more favorable position for this type of mixed interaction,
+    so applying its established combination rules to penetrant/polymer cross terms is a
+    less severe extrapolation [REF: OPLS-AA transferability / combination-rule reference].
+    This likely matters more for diffusion than for pure-polymer observables, because
+    diffusional motion probes not only polymer packing but also the detailed balance of
+    weak penetrant-polymer contacts along the hopping pathway. The replica-averaged values
+    support the same trends;
+    the only combination showing substantial run-to-run variability is water in PEF with
+    QMD-FF, for which the replica average is 1.45 +/- 0.89 x 10<sup>-9</sup> cm<sup>2</sup> s<sup>-1</sup>.
+    Water should also be interpreted more cautiously than oxygen because PEF is known to
+    sorb more water than PET, so diffusivity alone does not map directly onto total barrier
+    performance, especially once humidity-driven plasticization becomes important [REF:
+    water sorption in PET vs PEF; REF: humidity-driven plasticization / non-Fickian
+    transport]. Overall,
+    neither force field reproduces the experimentally expected simultaneous suppression of
+    oxygen and water diffusion in PEF, although OPLS-AA is closer for the oxygen ordering
+    and QMD-FF gives water diffusivities that are closer to the PET literature magnitude.
+  </p>
+
+  <div class="figure-block">
+    <img src="diffusion_figures/diffusion_pooled_summary.png" alt="Pooled diffusion comparison for PET and PEF" />
+    <p class="caption">
+      <b>Figure X.</b> Pooled diffusion coefficients for water and oxygen in PET and PEF,
+      comparing QMD-FF and OPLS-AA. Bars report the pooled 96-trajectory DiffusionGLS
+      estimates and error bars show the empirical SEM. The gray shaded bands indicate
+      representative room-temperature literature ranges for the corresponding penetrant/polymer
+      combinations in amorphous PET and PEF.
+    </p>
+  </div>
+
+  <div class="figure-block">
+    <img src="diffusion_figures/diffusion_ratio_summary.png" alt="PET to PEF diffusion ratio comparison" />
+    <p class="caption">
+      <b>Figure Y.</b> PET/PEF diffusion ratios derived from the pooled DiffusionGLS estimates.
+      Ratios above unity indicate slower diffusion in PEF than in PET, whereas ratios below
+      unity indicate the opposite trend. Gray shaded bands indicate representative literature
+      ranges for the expected PET/PEF contrast, highlighting the substantially stronger
+      experimental suppression reported for oxygen than for water.
+    </p>
+  </div>
+
+  <h2>Suggested Summary Table</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Force field</th>
+        <th>Polymer</th>
+        <th>Penetrant</th>
+        <th>Pooled <i>D</i> +/- empirical SEM</th>
+        <th>Replica average <i>D</i> +/- std</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>OPLS-AA</td>
+        <td>PEF</td>
+        <td>Water</td>
+        <td>6.11 +/- 0.68</td>
+        <td>5.98 +/- 2.35</td>
+      </tr>
+      <tr>
+        <td>OPLS-AA</td>
+        <td>PEF</td>
+        <td>Oxygen</td>
+        <td>2.53 +/- 0.32</td>
+        <td>2.23 +/- 0.87</td>
+      </tr>
+      <tr>
+        <td>OPLS-AA</td>
+        <td>PET</td>
+        <td>Water</td>
+        <td>5.53 +/- 0.53</td>
+        <td>5.01 +/- 1.62</td>
+      </tr>
+      <tr>
+        <td>OPLS-AA</td>
+        <td>PET</td>
+        <td>Oxygen</td>
+        <td>3.22 +/- 0.41</td>
+        <td>3.42 +/- 0.61</td>
+      </tr>
+      <tr>
+        <td>QMD-FF</td>
+        <td>PEF</td>
+        <td>Water</td>
+        <td>1.88 +/- 0.27</td>
+        <td>1.45 +/- 0.89</td>
+      </tr>
+      <tr>
+        <td>QMD-FF</td>
+        <td>PEF</td>
+        <td>Oxygen</td>
+        <td>7.92 +/- 0.86</td>
+        <td>8.27 +/- 2.05</td>
+      </tr>
+      <tr>
+        <td>QMD-FF</td>
+        <td>PET</td>
+        <td>Water</td>
+        <td>1.98 +/- 0.28</td>
+        <td>2.07 +/- 0.23</td>
+      </tr>
+      <tr>
+        <td>QMD-FF</td>
+        <td>PET</td>
+        <td>Oxygen</td>
+        <td>4.75 +/- 0.52</td>
+        <td>4.35 +/- 0.51</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p class="note">
+    Table values are reported in units of x 10<sup>-9</sup> cm<sup>2</sup> s<sup>-1</sup>.
+    The pooled analysis uses all three replicas simultaneously, whereas the replica-average
+    column reports the mean and standard deviation over the three independent runs.
+  </p>
+
+  <div class="figure-block si-figure">
+    <img src="diffusion_figures/diffusion_replica_summary.png" alt="Replica-average diffusion comparison for PET and PEF" />
+    <p class="caption">
+      <b>Figure S1.</b> Replica-average diffusion coefficients for water and oxygen in PET and
+      PEF, comparing QMD-FF and OPLS-AA. Bars report the mean over the three independent
+      replicas and error bars show the standard deviation across replicas. Open markers denote
+      the individual replica values used to assess the run-to-run variability.
+    </p>
+  </div>
+</body>
+</html>
