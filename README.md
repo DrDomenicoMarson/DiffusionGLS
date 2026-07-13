@@ -9,7 +9,8 @@ coefficients from molecular dynamics simulations*, J. Chem. Phys. 153, 024116
 (2020).
 
 The package evaluates diffusion as a function of lag time, quantifies
-goodness-of-fit with a Q-factor, and reports uncertainty estimates.
+goodness-of-fit with a Q-factor, and reports both trajectory-level conditional
+precision and reproducibility across independently prepared simulation boxes.
 
 ## Installation
 
@@ -41,8 +42,10 @@ Lifecycle constraints:
 - Multi-trajectory / multi-molecule analysis from a list of text trajectories.
 - MDAnalysis integration (`Universe`/`AtomGroup`, single or pooled) with
   per-residue handling.
-- Automatic lag-time choice with `tc="auto"` (Q-factor target near 0.5),
-  with optional lower-bound restriction via `auto_min_tc`.
+- Cluster-aware analysis for trajectories nested within independently prepared
+  boxes or replicas.
+- Diagnostic automatic lag-time suggestion with equal cluster weighting and an
+  optional lower bound via `auto_min_tc`.
 - Repeated analysis on the same fitted object with different `tc` values.
 - Finite-size correction for 3D cubic boxes.
 - Model persistence to and from pickle (`save_model=True`, `Dcov.load`).
@@ -57,6 +60,17 @@ Use exactly one trajectory source:
 
 `selection` is used with MDAnalysis inputs when a `Universe` is supplied.
 
+One `Dcov` object should represent one physical condition (for example, one
+polymer/force-field/penetrant combination). Use `cluster_ids` to identify
+independently prepared boxes within that condition:
+
+- Every entry in `universes` is a separate cluster by default.
+- Text files in `fz` belong to one cluster by default because independence
+  cannot be inferred from filenames.
+- Explicit `cluster_ids` align with Universes or text files. Repeated IDs group
+  multiple sources into one cluster.
+- Segments from one long trajectory remain in one cluster.
+
 ## Units and Conversions
 
 - Internal time unit is ps.
@@ -66,11 +80,10 @@ Use exactly one trajectory source:
 
 `dt` behavior:
 
-- `dt=None` (default): adopt timestep from the reader.
-- Text files (`fz`): reader default is `1.0 ps`.
-- MDAnalysis inputs: reader timestep comes from trajectory metadata.
-- If explicit `dt` is provided and differs from reader timestep, a warning is
-  emitted and the user-provided value is used.
+- Text files contain no time metadata, so `dt` is required.
+- MDAnalysis inputs adopt the trajectory timestep when `dt=None`.
+- If explicit `dt` differs from MDAnalysis metadata, a warning is emitted and
+  the user-provided value is used.
 
 ## Constructor Parameters (`Dfit.Dcov`)
 
@@ -80,10 +93,11 @@ Use exactly one trajectory source:
 | `universe` | MDAnalysis object or `None` | `None` | MDAnalysis trajectory source. |
 | `universes` | `Sequence[MDAnalysis object] \| None` | `None` | Multiple MDAnalysis trajectory sources pooled in one run. |
 | `selection` | `str \| None` | `None` | MDAnalysis selection string for `Universe` input(s). |
+| `cluster_ids` | `Sequence[object] \| None` | `None` | Cluster IDs aligned with input sources; repeated IDs group sources. |
 | `m` | `int` | `20` | Number of MSD points per lag-time fit window. |
 | `tmin` | `float \| None` | `None` | Minimum lag time in `time_unit`; defaults to one lag step. |
 | `tmax` | `float` | `100.0` | Maximum lag time in `time_unit`. |
-| `dt` | `float \| None` | `None` | Timestep in `time_unit`; `None` uses reader timestep. |
+| `dt` | `float \| None` | `None` | Timestep in `time_unit`; required for text input and optional for MDAnalysis. |
 | `d2max` | `float` | `1e-10` | Iterative GLS convergence threshold. |
 | `nitmax` | `int` | `100` | Maximum GLS iterations. |
 | `nseg` | `int \| None` | `None` | Number of segments (single-trajectory mode). |
@@ -108,15 +122,36 @@ res.run_Dfit(save_model=False)
 ## Analysis
 
 ```python
-res.analysis(tc=10.0, fout_prefix=None, auto_min_tc=None)
+result = res.analysis(tc=10.0, fout_prefix=None, auto_min_tc=None)
 ```
 
-- `tc`: lag time in `time_unit`, or `"auto"` to choose lag with Q nearest 0.5.
+- `tc`: one common lag time in `time_unit` for all clusters. A reviewed numeric
+  cutoff is recommended for publication.
+- `tc="auto"`: diagnostic suggestion minimizing the equal-cluster mean of
+  `abs(Q_cluster - 0.5)`. This is not an automatic diffusion-plateau test.
 - `fout_prefix`: optional custom output prefix. Default is `{fout}.tc_{tc}`.
 - `auto_min_tc`: optional lower bound for `tc="auto"` in `time_unit`; the
   auto search starts from the first computed lag `>= auto_min_tc`.
 
 Analysis can be repeated with different `tc` values after a single fit run.
+It returns an `AnalysisResult` dataclass containing pooled, per-cluster, and
+across-cluster statistics.
+
+### Interpreting uncertainty
+
+- Pooled and per-cluster predicted/empirical SEMs quantify conditional
+  precision among the trajectories in the sampled boxes. They do not make
+  penetrants sharing one polymer matrix independent box realizations.
+- The across-cluster estimate is the equal-weight mean of cluster estimates.
+  Its sample SD describes observed box-to-box variability, and every cluster
+  estimate is reported.
+- The propagated within-cluster conditional SEM uses each cluster's error but
+  is kept separate from the between-cluster sample SD. They are not added in
+  quadrature because the observed cluster spread already contains estimation
+  noise.
+- Bootstrap, inverse-variance weighting, and random-effects meta-analysis are
+  intentionally not applied by default, especially when only three boxes are
+  available.
 
 ## Finite-Size Correction
 
@@ -142,14 +177,22 @@ Parameters:
 
 ## Validation and Constraints
 
-- `m` must be at least 2 after internal clamping.
+- `m` must be at least 2. With `m=2`, Q is unavailable and `tc="auto"` is
+  rejected.
 - Input trajectories must provide at least 2 frames.
+- Text trajectories require a positive finite `dt`.
 - In multi-trajectory mode, all dimensions must match.
 - In multi-trajectory text mode, unequal lengths require
   `normalize_lengths=True`.
 - In pooled MDAnalysis mode (`universes`), all inputs must share the same
   frame count and `dt`.
-- In multi mode, very large `tmax` may be clamped to a feasible value.
+- Infeasible explicit `m`, `tmax`, and `nseg` combinations raise instead of
+  being silently changed.
+- Explicit feasible `nseg` is honored. If fewer than 100 strided coordinate
+  samples remain at `tmax`, a sampling-adequacy warning reports the actual
+  count and automatic recommendation.
+- Single-trajectory segmentation uses every frame; segment lengths may differ
+  by one frame.
 - `tc` must lie on the computed lag grid and be a multiple of `dt`.
 - `auto_min_tc` is only valid with `tc="auto"` and is rounded up to the first
   lag on the computed grid that satisfies the requested lower bound.
@@ -158,9 +201,12 @@ Parameters:
 
 Generated files:
 
-- `{fout}.tc_{tc}.dat`: text summary (statistics + lag scan table).
+- `{fout}.tc_{tc}.dat`: concise selected-cutoff report with pooled, cluster,
+  and across-cluster statistics.
+- `{fout}.tc_{tc}.csv`: complete lag-dependent pooled, cluster, and
+  across-cluster data.
 - `{fout}.tc_{tc}.{imgfmt}`: plot with D(t), Q(t), and per-segment
-  distribution.
+  distribution augmented by cluster curves and means.
 - `{fout}.pkl`: optional serialized object if `save_model=True`.
 
 Key attributes and availability:
@@ -168,9 +214,13 @@ Key attributes and availability:
 | Attribute | Available After | Description |
 |---|---|---|
 | `a2`, `s2`, `s2var`, `q` | `run_Dfit()` | Raw fit outputs over lag and segment dimensions. |
-| `D`, `Dstd`, `Dempstd` | `analysis()` | Main diffusion estimate and uncertainties per lag. |
-| `Dsem_pred`, `Dsem_emp` | `analysis()` | Predicted and empirical SEM estimates. |
+| `D`, `Dstd`, `Dempstd` | `analysis()` | Pooled diffusion estimate and predicted/empirical member SD per lag. |
+| `Dsem_pred`, `Dsem_emp` | `analysis()` | Pooled predicted and empirical conditional SEM. |
 | `q_m`, `q_std` | `analysis()` | Mean and std. deviation of Q-factor per lag. |
+| `cluster_D`, `cluster_Dstd`, `cluster_Dempstd` | `analysis()` | Per-cluster estimate and member-level uncertainty series. |
+| `cluster_Dsem_pred`, `cluster_Dsem_emp` | `analysis()` | Per-cluster conditional SEM series. |
+| `D_cluster_mean`, `D_cluster_sd` | `analysis()` | Equal-weight cluster mean and between-cluster sample SD. |
+| `D_cluster_sem_pred`, `D_cluster_sem_emp` | `analysis()` | Propagated within-cluster conditional SEM series. |
 | `tc_selected`, `tc_selected_idx` | `analysis()` | Final lag-time value/index used for summary. |
 | `tc_auto_unbounded`, `tc_auto_unbounded_idx`, `auto_min_tc_used` | `analysis()` | Unconstrained auto lag and applied lower-bound metadata when `tc="auto"` is used. |
 | `Dcor` | `finite_size_correction()` | Finite-size corrected diffusion series. |
@@ -188,7 +238,14 @@ Key attributes and availability:
 ```python
 import Dfit
 
-res = Dfit.Dcov(fz="mytrajectory.dat", m=20, tmin=1.0, tmax=100.0, nseg=150)
+res = Dfit.Dcov(
+    fz="mytrajectory.dat",
+    dt=1.0,
+    m=20,
+    tmin=1.0,
+    tmax=100.0,
+    nseg=150,
+)
 res.run_Dfit()
 res.analysis(tc=10.0)
 res.finite_size_correction(T=300, eta=0.001, L=10.0, tc=10.0)
@@ -212,12 +269,19 @@ res.analysis(tc=10.0)
 import Dfit
 import MDAnalysis as mda
 
-u1 = mda.Universe("topol1.tpr", "traj_replica1.xtc")
-u2 = mda.Universe("topol2.tpr", "traj_replica2.xtc")
+u1 = mda.Universe("topol1.tpr", "traj_box1.xtc")
+u2 = mda.Universe("topol2.tpr", "traj_box2.xtc")
+u3 = mda.Universe("topol3.tpr", "traj_box3.xtc")
 
-res = Dfit.Dcov(universes=[u1, u2], selection="resname SOL", tmax=50)
+res = Dfit.Dcov(
+    universes=[u1, u2, u3],
+    cluster_ids=["box_1", "box_2", "box_3"],  # optional; inferred by source
+    selection="resname SOL",
+    tmax=50,
+)
 res.run_Dfit()
-res.analysis(tc="auto", auto_min_tc=50.0)
+result = res.analysis(tc=10.0)
+print(result.across_clusters)
 ```
 
 ### 4) Multiple text trajectories (multi-molecule mode)
@@ -225,9 +289,14 @@ res.analysis(tc="auto", auto_min_tc=50.0)
 ```python
 import Dfit
 
-res = Dfit.Dcov(fz=["traj1.dat", "traj2.dat", "traj3.dat"], tmax=50.0)
+res = Dfit.Dcov(
+    fz=["box1_mol1.dat", "box1_mol2.dat", "box2_mol1.dat"],
+    cluster_ids=["box_1", "box_1", "box_2"],
+    dt=1.0,
+    tmax=50.0,
+)
 res.run_Dfit()
-res.analysis(tc="auto")
+res.analysis(tc=10.0)
 ```
 
 ## Persistence

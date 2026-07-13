@@ -8,6 +8,7 @@
 # J. Bullerjahn, S. v. Buelow, G. Hummer: Optimal estimates of diffusion coefficients from molecular dynamics simulations, Journal of Chemical Physics 153, 024116 (2020).
 
 import math
+import csv
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,7 +17,6 @@ import concurrent.futures
 import os
 import pickle
 
-import matplotlib.pyplot as plt
 import numpy as np
 from tqdm import tqdm
 from scipy.special import gammainc
@@ -28,6 +28,118 @@ TrajectoryInput = str | Path | Sequence[str | Path] | None
 
 XI_CUBIC = 2.837297
 BOLTZMANN_K = 1.380649e-23 # J/K
+MIN_SAMPLES_AT_TMAX = 100
+
+
+class SamplingAdequacyWarning(UserWarning):
+    """Warn that an explicit segmentation is feasible but statistically weak."""
+
+
+@dataclass(frozen=True)
+class DiffusionStatistics:
+    """Diffusion estimate and conditional trajectory-level uncertainty.
+
+    Parameters
+    ----------
+    diffusion : float
+        Diffusion coefficient in ``diffusion_unit``.
+    predicted_sd : float
+        RMS model-predicted standard deviation of member estimates.
+    empirical_sd : float or None
+        Sample standard deviation of member estimates, or ``None`` when fewer
+        than two members are available.
+    predicted_sem : float
+        Model-predicted conditional standard error of the mean.
+    empirical_sem : float or None
+        Empirical conditional standard error of the mean, or ``None`` when
+        unavailable.
+    q_mean : float or None
+        Mean Q-factor, or ``None`` for ``m=2``.
+    q_sd : float or None
+        Sample standard deviation of Q, or ``None`` when unavailable.
+    """
+
+    diffusion: float
+    predicted_sd: float
+    empirical_sd: float | None
+    predicted_sem: float
+    empirical_sem: float | None
+    q_mean: float | None
+    q_sd: float | None
+
+
+@dataclass(frozen=True)
+class ClusterStatistics:
+    """Selected-cutoff statistics for one independent cluster.
+
+    Parameters
+    ----------
+    cluster_id : str
+        User-facing cluster identifier.
+    n_trajectories : int
+        Number of member trajectories assigned to the cluster.
+    statistics : DiffusionStatistics
+        Cluster-level estimate and conditional uncertainty.
+    """
+
+    cluster_id: str
+    n_trajectories: int
+    statistics: DiffusionStatistics
+
+
+@dataclass(frozen=True)
+class AcrossClusterStatistics:
+    """Equal-weight aggregation across independently prepared clusters.
+
+    Parameters
+    ----------
+    n_clusters : int
+        Number of independent clusters.
+    mean : float
+        Equal-weight mean of cluster diffusion estimates.
+    sample_sd : float or None
+        Sample standard deviation across cluster estimates.
+    propagated_predicted_sem : float
+        Conditional predicted SEM propagated from cluster-level errors without
+        changing the equal-weight point estimate.
+    propagated_empirical_sem : float or None
+        Propagated empirical conditional SEM, or ``None`` when any contributing
+        cluster has fewer than two trajectories.
+    """
+
+    n_clusters: int
+    mean: float
+    sample_sd: float | None
+    propagated_predicted_sem: float
+    propagated_empirical_sem: float | None
+
+
+@dataclass(frozen=True)
+class AnalysisResult:
+    """Selected-cutoff pooled and cluster-aware diffusion result.
+
+    Parameters
+    ----------
+    tc : float
+        Common selected cutoff in ``time_unit``.
+    time_unit : str
+        Time unit used for ``tc``.
+    diffusion_unit : str
+        Unit used by every diffusion statistic.
+    pooled : DiffusionStatistics
+        Trajectory-weighted pooled result conditional on the sampled clusters.
+    clusters : tuple[ClusterStatistics, ...]
+        Per-cluster results in first-appearance order.
+    across_clusters : AcrossClusterStatistics
+        Equal-weight aggregation and separated uncertainty components.
+    """
+
+    tc: float
+    time_unit: str
+    diffusion_unit: str
+    pooled: DiffusionStatistics
+    clusters: tuple[ClusterStatistics, ...]
+    across_clusters: AcrossClusterStatistics
 
 
 @dataclass(frozen=True)
@@ -53,6 +165,10 @@ class AutoTcSelection:
     auto_min_tc_used : float or None
         First lag on the computed grid that satisfies the lower-bound search
         threshold, in the user's ``time_unit``.
+    selected_score : float
+        Equal-cluster mean absolute deviation of Q from 0.5 at the selected lag.
+    selected_max_deviation : float
+        Largest absolute cluster Q deviation from 0.5 at the selected lag.
     """
 
     selected_idx: int
@@ -63,6 +179,8 @@ class AutoTcSelection:
     unbounded_step: int
     unbounded_tc_disp: float
     auto_min_tc_used: float | None
+    selected_score: float
+    selected_max_deviation: float
 
 
 def calc_q(n,m,a2_3D,s2_3D,msds_3D,a2full_3D,s2full_3D,ndim):
@@ -97,6 +215,9 @@ def calc_q(n,m,a2_3D,s2_3D,msds_3D,a2full_3D,s2full_3D,ndim):
     This follows Eq. 22 in Bullerjahn et al. (JCP 153, 024116, 2020).
     """
 
+    if m <= 2:
+        return np.nan
+
     c = math_utils.setupc(m,n) # setups of cov matrix
     cov = math_utils.calc_cov(n,m,c,a2full_3D,s2full_3D)
     cinv = math_utils.inv_mat(cov)
@@ -109,7 +230,19 @@ def calc_q(n,m,a2_3D,s2_3D,msds_3D,a2full_3D,s2full_3D,ndim):
         q = 1-gammainc( (m-2)/2.,chi2/2.) # goodness-of-fit Q
     return q
 
-def analyze_chunk_task(chunk_data, step, m, dt, nperseg, multi, ndim, d2max, nitmax, c2_pre, cm_pre, a2full_3D=0.0, s2full_3D=0.0):
+def analyze_chunk_task(
+    chunk_data,
+    step,
+    m,
+    dt,
+    multi,
+    ndim,
+    d2max,
+    nitmax,
+    covariance_helpers,
+    a2full_3D=0.0,
+    s2full_3D=0.0,
+):
     """Process one worker chunk for a given lag step.
 
     Parameters
@@ -123,8 +256,6 @@ def analyze_chunk_task(chunk_data, step, m, dt, nperseg, multi, ndim, d2max, nit
         Number of MSD values used per lag step in the GLS fit.
     dt : float
         Timestep in ps used for user-facing diagnostics.
-    nperseg : int
-        Number of steps per segment before striding.
     multi : bool
         ``True`` for multi-trajectory mode where each input trajectory is one
         segment/molecule, ``False`` for single-trajectory segmentation mode.
@@ -134,10 +265,9 @@ def analyze_chunk_task(chunk_data, step, m, dt, nperseg, multi, ndim, d2max, nit
         Convergence threshold for iterative GLS updates.
     nitmax : int
         Maximum number of GLS iterations.
-    c2_pre : ndarray or None
-        Optional precomputed covariance helper matrix for ``m=2``.
-    cm_pre : ndarray or None
-        Optional precomputed covariance helper matrix for ``m``.
+    covariance_helpers : dict[int, tuple[ndarray, ndarray]]
+        Read-only cache mapping the actual strided segment length in steps to
+        the ``m=2`` and ``m`` covariance helper matrices.
     a2full_3D : float, optional
         Reference 3D offset used for ``Q`` evaluation in single-trajectory
         mode.
@@ -162,7 +292,8 @@ def analyze_chunk_task(chunk_data, step, m, dt, nperseg, multi, ndim, d2max, nit
         if len(z_analyzed) <= m:
             # Calculate suggestions
             max_m_possible = len(z_analyzed) - 1
-            max_lag_steps = max(1, nperseg // m)
+            segment_steps = len(seg_z) - 1
+            max_lag_steps = max(1, segment_steps // m)
             max_tmax_possible = max_lag_steps * dt
             
             # We can't raise here easily without crashing the worker.
@@ -185,12 +316,11 @@ def analyze_chunk_task(chunk_data, step, m, dt, nperseg, multi, ndim, d2max, nit
             z_dim = np.ascontiguousarray(z_analyzed[:, d])
             msds[d] = math_utils.compute_MSD_1D_first_m(z_dim, m)
             
-            # Check if pre-calculated matrices match current n
-            use_c2 = c2_pre
-            use_cm = cm_pre
+            use_c2, use_cm = covariance_helpers[n_per_seg_step]
             
             res_a2[d], res_s2[d], conv = math_utils.calc_gls(n_per_seg_step, m, msds[d], d2max, nitmax, c2=use_c2, cm=use_cm)
-            if not conv: res_converged = False
+            if not conv:
+                res_converged = False
         
         msds_3D = np.sum(msds, axis=0)
         a2_3D_val = np.sum(res_a2)
@@ -274,6 +404,7 @@ class Dcov():
     ``diffusion_unit``.
     """
     def __init__(self, fz: TrajectoryInput = None, universe=None, universes=None, selection=None,
+                 cluster_ids=None,
                  m: int = 20, tmin: float | None = None, tmax: float = 100.0, dt: float | None = None,
                  d2max: float = 1e-10, nitmax: int = 100,
                  nseg: int | None = None, imgfmt: str = 'pdf', fout: str = 'D_analysis',
@@ -299,6 +430,10 @@ class Dcov():
             MDAnalysis selection string used only when ``universe`` is given as
             a Universe. For ``universes``, the same selection is applied to
             each Universe entry.
+        cluster_ids : sequence[object] or None, optional
+            Cluster identifiers aligned with text files, a single MDAnalysis
+            input, or entries in ``universes``. Multiple Universes default to
+            separate clusters; multiple text files default to one cluster.
         m : int, default=20
             Number of MSD values used in each lag-time GLS fit window.
         tmin : float or None, optional
@@ -307,9 +442,9 @@ class Dcov():
         tmax : float, default=100.0
             Maximum lag time in ``time_unit``.
         dt : float or None, optional
-            Frame timestep in ``time_unit``. If ``None``, adopts the reader
-            timestep (1.0 ps for text files, trajectory timestep for
-            MDAnalysis).
+            Frame timestep in ``time_unit``. Metadata-free text input requires
+            this value. MDAnalysis input adopts trajectory metadata when it is
+            omitted.
         d2max : float, default=1e-10
             Convergence criterion for iterative GLS updates.
         nitmax : int, default=100
@@ -350,6 +485,7 @@ class Dcov():
             universes=universes,
             selection=selection,
             normalize_lengths=normalize_lengths,
+            cluster_ids=cluster_ids,
         )
         
         # Use reader properties
@@ -382,19 +518,41 @@ class Dcov():
         self.diffusion_unit = diffusion_unit
         self.diff_scale = diff_map[diffusion_unit]  # scale from nm^2/ps to desired unit
         self.progress = progress
-        
+
+        if not isinstance(m, (int, np.integer)) or isinstance(m, bool) or m < 2:
+            raise ValueError("m must be an integer greater than or equal to 2.")
+
         if dt is None:
-            self.dt = self.reader.dt  # adopt reader's dt (already in ps)
+            if self.reader.dt is None:
+                raise ValueError(
+                    "dt is required for metadata-free text trajectories; "
+                    "provide dt in the selected time_unit."
+                )
+            self.dt = float(self.reader.dt)  # reader metadata are already in ps
         else:
+            if not isinstance(dt, (int, float, np.integer, np.floating)):
+                raise TypeError("dt must be a positive finite number.")
             self.dt = dt * self.time_scale  # convert user-provided dt to ps
-            if not math.isclose(self.dt, self.reader.dt, rel_tol=1e-5):
+            if not math.isfinite(self.dt) or self.dt <= 0:
+                raise ValueError("dt must be a positive finite number.")
+            if self.reader.dt is not None and not math.isclose(self.dt, self.reader.dt, rel_tol=1e-5):
                 warnings.warn(
                     f"User provided dt ({dt} {self.time_unit} = {self.dt} ps) differs from "
                     f"reader's dt ({self.reader.dt} ps). Using provided dt.",
                     UserWarning,
                 )
 
-        self.m = m
+        if not math.isfinite(self.dt) or self.dt <= 0:
+            raise ValueError("dt must be a positive finite number.")
+
+        self.m = int(m)
+
+        for name, value in (("tmin", tmin), ("tmax", tmax)):
+            if value is not None:
+                if not isinstance(value, (int, float, np.integer, np.floating)):
+                    raise TypeError(f"{name} must be a positive finite number or None.")
+                if not math.isfinite(float(value)) or float(value) <= 0:
+                    raise ValueError(f"{name} must be a positive finite number.")
         
         # Convert tmin/tmax from ps to steps
         if tmin is None:
@@ -408,6 +566,13 @@ class Dcov():
             self.tmax = int(round((100.0 * self.time_scale) / self.dt)) # Default 100 in chosen unit
         else:
             self.tmax = int(round((tmax * self.time_scale) / self.dt))
+
+        if self.tmax < 1:
+            raise ValueError("tmax resolves to fewer than one frame step; increase tmax or reduce dt.")
+        if self.tmin > self.tmax:
+            raise ValueError(
+                f"tmin resolves to step {self.tmin}, which exceeds tmax step {self.tmax}."
+            )
             
         self.d2max = d2max
         self.nitmax = nitmax
@@ -433,6 +598,8 @@ class Dcov():
             self.multi = True # Keep flag for internal logic if needed, or refactor it away
             self.nseg = self.n_molecules
             self.nperseg = self.n
+            self.segment_lengths = np.full(self.nseg, self.n + 1, dtype=int)
+            self.segment_cluster_ids = tuple(self.reader.trajectory_cluster_ids)
         else:
             print('Analyzing single trajectory.')
             self.multi = False
@@ -450,42 +617,51 @@ class Dcov():
                 else:
                     self.nseg = auto_nseg
             else:
+                if not isinstance(nseg, (int, np.integer)) or isinstance(nseg, bool):
+                    raise TypeError("nseg must be an integer or None.")
                 if nseg < 1:
                     raise ValueError('nseg must be at least 1')
-                if auto_nseg > 0 and nseg > auto_nseg:
-                    print(f"Warning, too many segments chosen, falling back to nseg = {auto_nseg}")
-                    self.nseg = auto_nseg
-                else:
-                    self.nseg = nseg
-            
-            self.nperseg = int(total_points / self.nseg) - 1
+                self.nseg = int(nseg)
+
+            base_length, remainder = divmod(total_points, self.nseg)
+            self.segment_lengths = np.array(
+                [base_length + (1 if i < remainder else 0) for i in range(self.nseg)],
+                dtype=int,
+            )
+            self.nperseg = int(np.min(self.segment_lengths)) - 1
             if self.nperseg < 1:
                 raise ValueError(f'nseg={self.nseg} yields segment length < 2 points; reduce nseg or use a longer trajectory')
+            source_cluster_id = self.reader.trajectory_cluster_ids[0]
+            self.segment_cluster_ids = (source_cluster_id,) * self.nseg
 
-        if self.m > self.nperseg:
-            self.m = self.nperseg
-
-        if self.m < 2:
+        strided_points_at_tmax = np.array(
+            [((length - 1) // self.tmax) + 1 for length in self.segment_lengths],
+            dtype=int,
+        )
+        min_strided_points = int(np.min(strided_points_at_tmax))
+        if min_strided_points <= self.m:
             raise ValueError(
-                f"m={self.m} after clamping to segment length ({self.nperseg}); "
-                f"m must be >= 2. Use a longer trajectory or reduce nseg/tmax."
+                "Segment too short at the requested tmax: the shortest segment has "
+                f"{min_strided_points} strided coordinate samples, but m={self.m} "
+                f"requires at least {self.m + 1}. Reduce nseg, tmax, or m."
             )
 
-        # In multi-traj mode, ensure tmax is feasible given segment length and m
-        if self.multi:
-            max_tmax_steps = max(1, self.nperseg // self.m)
-            if self.tmax > max_tmax_steps:
-                warnings.warn(
-                    f"tmax ({self.tmax * self.dt / self.time_scale:.4g} {self.time_unit}) is too long for segment length; "
-                    f"reducing to {max_tmax_steps * self.dt / self.time_scale:.4g} {self.time_unit}.",
-                    UserWarning
-                )
-                self.tmax = max_tmax_steps
-            if self.tmin > self.tmax:
-                raise ValueError(
-                    f"tmin ({self.tmin * self.dt / self.time_scale:.4g} {self.time_unit}) exceeds max feasible tmax "
-                    f"({self.tmax * self.dt / self.time_scale:.4g} {self.time_unit}) for m={self.m} and trajectory length {self.nperseg+1}."
-                )
+        if not self.multi and nseg is not None and min_strided_points < MIN_SAMPLES_AT_TMAX:
+            recommended_nseg = max(1, auto_nseg)
+            warnings.warn(
+                f"Explicit nseg={self.nseg} is feasible but leaves only "
+                f"{min_strided_points} strided coordinate samples in the shortest "
+                f"segment at tmax; the conservative guideline is {MIN_SAMPLES_AT_TMAX}. "
+                f"The automatic heuristic would use nseg={recommended_nseg}. "
+                "The explicit value is being honored.",
+                SamplingAdequacyWarning,
+            )
+
+        self.cluster_ids = tuple(dict.fromkeys(self.segment_cluster_ids))
+        self.cluster_indices = tuple(
+            np.flatnonzero(np.asarray(self.segment_cluster_ids, dtype=object) == cluster_id)
+            for cluster_id in self.cluster_ids
+        )
 
         # Arrays
         self.a2full = np.zeros((self.tmax-self.tmin+1, self.ndim))
@@ -495,6 +671,7 @@ class Dcov():
         self.s2 = np.zeros((self.tmax-self.tmin+1, self.nseg, self.ndim))
 
         self.s2var = np.zeros((self.tmax-self.tmin+1))
+        self.s2var_members = np.zeros((self.tmax-self.tmin+1, self.nseg))
         self.q = np.zeros((self.tmax-self.tmin+1, self.nseg))
 
         # Lifecycle flags
@@ -516,6 +693,21 @@ class Dcov():
         self.tc_auto_unbounded = None  # unconstrained auto tc in chosen time unit
         self.tc_auto_unbounded_idx = None  # index into lag arrays for unconstrained auto tc
         self.auto_min_tc_used = None  # applied lower bound on the lag grid in chosen time unit
+        self.analysis_result = None
+        self.cluster_D = None
+        self.cluster_Dstd = None
+        self.cluster_Dempstd = None
+        self.cluster_Dsem_pred = None
+        self.cluster_Dsem_emp = None
+        self.cluster_Dperdim = None
+        self.cluster_q_m = None
+        self.cluster_q_std = None
+        self.D_cluster_mean = None
+        self.D_cluster_sd = None
+        self.D_cluster_sem_pred = None
+        self.D_cluster_sem_emp = None
+        self.q_cluster_score = None
+        self.q_cluster_max_deviation = None
 
     @staticmethod
     def load(filename: str) -> 'Dcov':
@@ -534,13 +726,63 @@ class Dcov():
         """
         with open(filename, 'rb') as f:
             obj = pickle.load(f)
-            
+
         # A loaded model is assumed to have been fitted. This also ensures
         # backward compatibility with older pickle files that lack this flag.
         obj._fitted = True
         obj.tc_auto_unbounded = getattr(obj, 'tc_auto_unbounded', None)
         obj.tc_auto_unbounded_idx = getattr(obj, 'tc_auto_unbounded_idx', None)
         obj.auto_min_tc_used = getattr(obj, 'auto_min_tc_used', None)
+        obj.analysis_result = getattr(obj, 'analysis_result', None)
+
+        if not hasattr(obj, "segment_lengths"):
+            obj.segment_lengths = np.full(obj.nseg, obj.nperseg + 1, dtype=int)
+        if not hasattr(obj, "s2var_members"):
+            obj.s2var_members = np.repeat(obj.s2var[:, np.newaxis], obj.nseg, axis=1)
+
+        if not hasattr(obj, "segment_cluster_ids"):
+            inferred_ids = None
+            reader = getattr(obj, "reader", None)
+            sources = getattr(reader, "sources", None)
+            if sources and sum(getattr(source, "n_residues", 0) for source in sources) == obj.nseg:
+                inferred_ids = tuple(
+                    f"cluster_{source_index}"
+                    for source_index, source in enumerate(sources)
+                    for _ in range(source.n_residues)
+                )
+            if inferred_ids is None:
+                inferred_ids = ("cluster_0",) * obj.nseg
+            obj.segment_cluster_ids = inferred_ids
+            warnings.warn(
+                "Loaded a legacy model without cluster metadata. Cluster IDs were "
+                "inferred where possible; otherwise all estimates were assigned to "
+                "one cluster.",
+                UserWarning,
+            )
+
+        obj.cluster_ids = tuple(dict.fromkeys(obj.segment_cluster_ids))
+        obj.cluster_indices = tuple(
+            np.flatnonzero(np.asarray(obj.segment_cluster_ids, dtype=object) == cluster_id)
+            for cluster_id in obj.cluster_ids
+        )
+        for attribute in (
+            "cluster_D",
+            "cluster_Dstd",
+            "cluster_Dempstd",
+            "cluster_Dsem_pred",
+            "cluster_Dsem_emp",
+            "cluster_Dperdim",
+            "cluster_q_m",
+            "cluster_q_std",
+            "D_cluster_mean",
+            "D_cluster_sd",
+            "D_cluster_sem_pred",
+            "D_cluster_sem_emp",
+            "q_cluster_score",
+            "q_cluster_max_deviation",
+        ):
+            if not hasattr(obj, attribute):
+                setattr(obj, attribute, None)
         return obj
 
     def _timestep_index(self, tc: float) -> int:
@@ -563,6 +805,8 @@ class Dcov():
             If ``tc`` is not a multiple of ``dt`` or lies outside the computed
             lag-time range.
         """
+        if not math.isfinite(tc) or tc <= 0:
+            raise ValueError("tc must be a positive finite lag time.")
         steps = (tc * self.time_scale) / self.dt
         steps_int = round(steps)
         if not math.isclose(steps, steps_int, rel_tol=1e-9, abs_tol=1e-12):
@@ -591,6 +835,8 @@ class Dcov():
         ValueError
             If the requested lower bound exceeds the computed lag grid.
         """
+        if not math.isfinite(tc) or tc <= 0:
+            raise ValueError("auto_min_tc must be a positive finite lag time.")
         steps = (tc * self.time_scale) / self.dt
         steps_int = math.ceil(steps - 1e-12)
         step = max(int(steps_int), self.tmin)
@@ -618,14 +864,21 @@ class Dcov():
             Resolved auto-selection metadata, including the unconstrained
             choice and the final bounded choice.
         """
-        diff = np.abs(self.q_m - 0.5)
-        unbounded_idx = int(np.argmin(diff))
+        if self.m <= 2:
+            raise ValueError("tc='auto' requires m >= 3 because Q is undefined for m=2.")
+        if self.q_cluster_score is None or not np.any(np.isfinite(self.q_cluster_score)):
+            raise ValueError("Automatic cutoff selection requires finite cluster Q statistics.")
+
+        diff = self.q_cluster_score
+        unbounded_idx = int(np.nanargmin(diff))
         selected_idx = unbounded_idx
         auto_min_tc_used = None
 
         if auto_min_tc is not None:
             min_idx = self._ceil_timestep_index(auto_min_tc)
-            selected_idx = min_idx + int(np.argmin(diff[min_idx:]))
+            if not np.any(np.isfinite(diff[min_idx:])):
+                raise ValueError("No finite cluster Q statistics are available above auto_min_tc.")
+            selected_idx = min_idx + int(np.nanargmin(diff[min_idx:]))
             min_step = self.tmin + min_idx
             auto_min_tc_used = (min_step * self.dt) / self.time_scale
 
@@ -645,6 +898,8 @@ class Dcov():
             unbounded_step=unbounded_step,
             unbounded_tc_disp=unbounded_tc_disp,
             auto_min_tc_used=auto_min_tc_used,
+            selected_score=float(self.q_cluster_score[selected_idx]),
+            selected_max_deviation=float(self.q_cluster_max_deviation[selected_idx]),
         )
 
     def run_Dfit(self, save_model: bool = False):
@@ -686,6 +941,16 @@ class Dcov():
         reference for the segment fits.
         """
         all_trajs = list(self.reader)  # load once; shape (n_trajs, n_frames, ndim)
+        if self.multi:
+            segment_data = all_trajs
+        else:
+            segment_data = list(np.array_split(all_trajs[0], self.nseg, axis=0))
+
+        actual_lengths = np.asarray([len(segment) for segment in segment_data], dtype=int)
+        if not np.array_equal(actual_lengths, self.segment_lengths):
+            raise RuntimeError(
+                "Internal segmentation lengths differ from the validated partition."
+            )
 
         # Prevent BLAS/LAPACK from spawning internal threads that would
         # oversubscribe cores when combined with our thread pool.
@@ -760,10 +1025,14 @@ class Dcov():
             seg_futures: dict[concurrent.futures.Future, tuple[int, int, int, int]] = {}
 
             for t, step in enumerate(range(self.tmin, self.tmax + 1)):
-                n_per_seg_step = int(self.nperseg / step)
-
-                c2_pre = math_utils.setupc(2, n_per_seg_step) if n_per_seg_step >= 2 else None
-                cm_pre = math_utils.setupc(self.m, n_per_seg_step) if n_per_seg_step >= self.m else None
+                n_values = sorted({int((length - 1) // step) for length in self.segment_lengths})
+                covariance_helpers = {
+                    n_value: (
+                        math_utils.setupc(2, n_value),
+                        math_utils.setupc(self.m, n_value),
+                    )
+                    for n_value in n_values
+                }
 
                 a2full_3D_val = float(np.sum(self.a2full[t])) if not self.multi else 0.0
                 s2full_3D_val = float(np.sum(self.s2full[t])) if not self.multi else 0.0
@@ -771,20 +1040,13 @@ class Dcov():
                 for s_start in range(0, self.nseg, chunk_size):
                     s_end = min(s_start + chunk_size, self.nseg)
 
-                    if self.multi:
-                        chunk_data = all_trajs[s_start:s_end]
-                    else:
-                        full_z = all_trajs[0]
-                        chunk_data = [
-                            full_z[s * (self.nperseg + 1):(s + 1) * (self.nperseg + 1)]
-                            for s in range(s_start, s_end)
-                        ]
+                    chunk_data = segment_data[s_start:s_end]
 
                     fut = executor.submit(
                         analyze_chunk_task,
-                        chunk_data, step, self.m, self.dt, self.nperseg,
+                        chunk_data, step, self.m, self.dt,
                         self.multi, self.ndim, self.d2max, self.nitmax,
-                        c2_pre, cm_pre, a2full_3D_val, s2full_3D_val
+                        covariance_helpers, a2full_3D_val, s2full_3D_val
                     )
                     seg_futures[fut] = (t, step, s_start, s_end)
 
@@ -811,14 +1073,20 @@ class Dcov():
         # they cannot be overlapped with the futures.
         # ------------------------------------------------------------------
         for t, step in enumerate(range(self.tmin, self.tmax + 1)):
-            n_per_seg_step = int(self.nperseg / step)
-            a2m = np.mean(self.a2[t], axis=0)
-            s2m = np.mean(self.s2[t], axis=0)
-            self.s2var[t] = math_utils.eval_vars(n_per_seg_step, self.m, a2m, s2m, self.ndim)
+            for s, segment_length in enumerate(self.segment_lengths):
+                n_per_seg_step = int((segment_length - 1) // step)
+                self.s2var_members[t, s] = math_utils.eval_vars(
+                    n_per_seg_step,
+                    self.m,
+                    self.a2[t, s],
+                    self.s2[t, s],
+                    self.ndim,
+                ) / (step ** 2)
+
+            self.s2var[t] = float(np.mean(self.s2var_members[t]))
 
             self.a2[t] /= step
             self.s2[t] /= step
-            self.s2var[t] /= step ** 2
             if not self.multi:
                 self.a2full[t] /= step
                 self.s2full[t] /= step
@@ -844,89 +1112,142 @@ class Dcov():
 
     # Output and plotting
     def analysis(self, tc: float | str = 10, fout_prefix: str | None = None,
-                 auto_min_tc: float | None = None):
-        """Compute diffusion coefficient statistics and write output files.
+                 auto_min_tc: float | None = None) -> AnalysisResult:
+        """Compute pooled and cluster-aware statistics and write outputs.
 
         Parameters
         ----------
-        tc : float or 'auto'
-            Lag time for the diffusion estimate (in ``time_unit``). Must be a
-            multiple of dt.  Pass ``'auto'`` to select the lag where Q ≈ 0.5.
-        fout_prefix : str, optional
-            Custom base name for output files.  Default: ``{fout}.tc_{tc}``.
+        tc : float or {'auto'}, default=10
+            Common lag time for every cluster in ``time_unit``. A numeric value
+            is recommended for publication. ``'auto'`` provides a diagnostic
+            cluster-balanced Q suggestion and requires ``m >= 3``.
+        fout_prefix : str or None, optional
+            Custom output base. By default, use ``{fout}.tc_{tc}``.
         auto_min_tc : float or None, optional
-            Lower bound for ``tc='auto'`` in ``time_unit``. The auto search is
-            restricted to the first lag on the computed grid that is greater
-            than or equal to this value and all larger lags.
+            Lower bound for automatic cutoff selection in ``time_unit``.
 
         Returns
         -------
-        None
-            This method updates analysis attributes in place.
+        AnalysisResult
+            Selected-cutoff pooled, per-cluster, and across-cluster results.
 
         Raises
         ------
         RuntimeError
             If called before :meth:`run_Dfit`.
         ValueError
-            If ``tc`` is invalid for the computed lag-time grid, if
-            ``auto_min_tc`` exceeds the computed lag range, or if
-            ``auto_min_tc`` is provided together with a numeric ``tc``.
-
-        Notes
-        -----
-        Side effects include:
-
-        - Populating summary attributes (``D``, ``Dstd``, ``Dempstd``,
-          ``Dsem_pred``, ``Dsem_emp``, ``q_m``, ``q_std``).
-        - Recording selected lag time in ``tc_selected`` and
-          ``tc_selected_idx``.
-        - Writing ``.dat`` and plot output files.
-        - Setting lifecycle flag ``_analyzed=True``.
+            If the cutoff is invalid or automatic selection is requested with
+            ``m=2``.
         """
         if not self._fitted:
             raise RuntimeError("Call run_Dfit() before analysis().")
 
-        # Calculate statistics
-        Dseg = self.s2.sum(axis=2) # across dims
-        self.Dseg = np.mean(Dseg, axis=1) / (2.*self.ndim*self.dt) # mean across segs, nm^2 / (dt * ps)
+        denominator = 2.0 * self.ndim * self.dt
+        member_D = self.s2.sum(axis=2) / denominator
+        member_var_D = np.maximum(self.s2var_members, 0.0) / (denominator ** 2)
+        if np.any(self.s2var_members < 0):
+            warnings.warn("Negative predicted variance encountered; clamping to zero.", RuntimeWarning)
 
-        if np.any(self.s2var < 0):
-            warnings.warn("Negative variance encountered; clamping to zero.", RuntimeWarning)
-        s2var_clamped = np.maximum(self.s2var, 0.0)
-        self.Dstd = np.sqrt(s2var_clamped/ (2.*self.ndim*self.dt)**2) # nm^2 / (dt * ps)
+        self.Dseg = np.mean(member_D, axis=1)
+        self.Dstd = np.sqrt(np.mean(member_var_D, axis=1))
+        self.Dsem_pred = np.sqrt(np.sum(member_var_D, axis=1)) / self.nseg
+        if self.nseg > 1:
+            self.Dempstd = np.std(member_D, axis=1, ddof=1)
+            self.Dsem_emp = self.Dempstd / math.sqrt(self.nseg)
+        else:
+            self.Dempstd = np.full(member_D.shape[0], np.nan)
+            self.Dsem_emp = np.full(member_D.shape[0], np.nan)
 
-        if self.multi: # no 'full' run available
-            self.D = self.Dseg # nm^2 / (dt * ps)
-            self.Dperdim = np.mean(self.s2,axis=1) / (2.*self.dt) # mean across segs
-        else: # use full run
-            self.D = self.s2full.sum(axis=1)/(2.*self.ndim*self.dt) # nm^2 / (dt * ps)
-            self.Dperdim = self.s2full / (2.*self.dt)
+        if self.multi:
+            self.D = self.Dseg
+            self.Dperdim = np.mean(self.s2, axis=1) / (2.0 * self.dt)
+        else:
+            self.D = self.s2full.sum(axis=1) / denominator
+            self.Dperdim = self.s2full / (2.0 * self.dt)
 
-        Dempstd = np.var(self.s2, axis=1) # across segments per dim
-        Dempstd = np.sum(Dempstd, axis=1) # across dims
-        if np.any(Dempstd < 0):
-            warnings.warn("Negative empirical variance encountered; clamping to zero.", RuntimeWarning)
-        Dempstd_clamped = np.maximum(Dempstd, 0.0)
-        self.Dempstd = np.sqrt(Dempstd_clamped) / (2.*self.ndim*self.dt)
-        self.q_m = np.mean(self.q, axis=1)
-        self.q_std = np.std(self.q, axis=1)
+        if self.m > 2:
+            self.q_m = np.mean(self.q, axis=1)
+            if self.nseg > 1:
+                self.q_std = np.std(self.q, axis=1, ddof=1)
+            else:
+                self.q_std = np.full(self.q.shape[0], np.nan)
+        else:
+            self.q_m = np.full(self.q.shape[0], np.nan)
+            self.q_std = np.full(self.q.shape[0], np.nan)
 
-        sem_denom = math.sqrt(max(int(self.nseg), 1))
-        self.Dsem_pred = self.Dstd / sem_denom
-        self.Dsem_emp = self.Dempstd / sem_denom
+        n_lags = member_D.shape[0]
+        n_clusters = len(self.cluster_ids)
+        self.cluster_D = np.zeros((n_lags, n_clusters))
+        self.cluster_Dstd = np.zeros((n_lags, n_clusters))
+        self.cluster_Dempstd = np.full((n_lags, n_clusters), np.nan)
+        self.cluster_Dsem_pred = np.zeros((n_lags, n_clusters))
+        self.cluster_Dsem_emp = np.full((n_lags, n_clusters), np.nan)
+        self.cluster_Dperdim = np.zeros((n_lags, n_clusters, self.ndim))
+        self.cluster_q_m = np.full((n_lags, n_clusters), np.nan)
+        self.cluster_q_std = np.full((n_lags, n_clusters), np.nan)
 
-        # Scaled values for reporting
-        D_out = self.D * self.diff_scale
-        Dstd_out = self.Dstd * self.diff_scale
-        Dempstd_out = self.Dempstd * self.diff_scale
-        Dsem_pred_out = self.Dsem_pred * self.diff_scale
-        Dsem_emp_out = self.Dsem_emp * self.diff_scale
-        Dperdim_out = self.Dperdim * self.diff_scale
+        for cluster_index, member_indices in enumerate(self.cluster_indices):
+            count = len(member_indices)
+            cluster_member_D = member_D[:, member_indices]
+            cluster_member_var = member_var_D[:, member_indices]
+            self.cluster_D[:, cluster_index] = np.mean(cluster_member_D, axis=1)
+            self.cluster_Dstd[:, cluster_index] = np.sqrt(np.mean(cluster_member_var, axis=1))
+            self.cluster_Dsem_pred[:, cluster_index] = (
+                np.sqrt(np.sum(cluster_member_var, axis=1)) / count
+            )
+            self.cluster_Dperdim[:, cluster_index] = (
+                np.mean(self.s2[:, member_indices, :], axis=1) / (2.0 * self.dt)
+            )
+            if count > 1:
+                self.cluster_Dempstd[:, cluster_index] = np.std(
+                    cluster_member_D, axis=1, ddof=1
+                )
+                self.cluster_Dsem_emp[:, cluster_index] = (
+                    self.cluster_Dempstd[:, cluster_index] / math.sqrt(count)
+                )
+            if self.m > 2:
+                self.cluster_q_m[:, cluster_index] = np.mean(
+                    self.q[:, member_indices], axis=1
+                )
+                if count > 1:
+                    self.cluster_q_std[:, cluster_index] = np.std(
+                        self.q[:, member_indices], axis=1, ddof=1
+                    )
+
+        if not self.multi:
+            self.cluster_D[:, 0] = self.D
+            self.cluster_Dperdim[:, 0] = self.Dperdim
+
+        self.D_cluster_mean = np.mean(self.cluster_D, axis=1)
+        self.D_cluster_sd = (
+            np.std(self.cluster_D, axis=1, ddof=1)
+            if n_clusters > 1
+            else np.full(n_lags, np.nan)
+        )
+        self.D_cluster_sem_pred = (
+            np.sqrt(np.sum(self.cluster_Dsem_pred ** 2, axis=1)) / n_clusters
+        )
+        if np.all(np.isfinite(self.cluster_Dsem_emp), axis=1).any():
+            self.D_cluster_sem_emp = np.where(
+                np.all(np.isfinite(self.cluster_Dsem_emp), axis=1),
+                np.sqrt(np.nansum(self.cluster_Dsem_emp ** 2, axis=1)) / n_clusters,
+                np.nan,
+            )
+        else:
+            self.D_cluster_sem_emp = np.full(n_lags, np.nan)
+
+        if self.m > 2:
+            cluster_deviation = np.abs(self.cluster_q_m - 0.5)
+            self.q_cluster_score = np.mean(cluster_deviation, axis=1)
+            self.q_cluster_max_deviation = np.max(cluster_deviation, axis=1)
+        else:
+            self.q_cluster_score = np.full(n_lags, np.nan)
+            self.q_cluster_max_deviation = np.full(n_lags, np.nan)
 
         self.tc_auto_unbounded = None
         self.tc_auto_unbounded_idx = None
         self.auto_min_tc_used = None
+        auto_selection = None
 
         if tc == 'auto':
             auto_selection = self._select_auto_tc(auto_min_tc=auto_min_tc)
@@ -934,100 +1255,447 @@ class Dcov():
             step = auto_selection.selected_step
             tc_ps = auto_selection.selected_tc_ps
             tc_disp = auto_selection.selected_tc_disp
-
             self.tc_auto_unbounded_idx = auto_selection.unbounded_idx
             self.tc_auto_unbounded = auto_selection.unbounded_tc_disp
             self.auto_min_tc_used = auto_selection.auto_min_tc_used
-
-            if (
-                auto_min_tc is not None
-                and auto_selection.selected_idx != auto_selection.unbounded_idx
-            ):
-                print(
-                    f"Plain auto tc = {auto_selection.unbounded_tc_disp:.4g} {self.time_unit} "
-                    f"(Q = {self.q_m[auto_selection.unbounded_idx]:.4f}); "
-                    f"bounded auto tc = {tc_disp:.4g} {self.time_unit} "
-                    f"for auto_min_tc >= {auto_min_tc:.4g} {self.time_unit} "
-                    f"(applied from {self.auto_min_tc_used:.4g} {self.time_unit}, "
-                    f"Q = {self.q_m[itc]:.4f})"
-                )
-            else:
-                print(f"Automatically selected tc = {tc_disp:.4g} {self.time_unit} (Q = {self.q_m[itc]:.4f})")
+            print(
+                f"Diagnostic auto tc = {tc_disp:.4g} {self.time_unit}; "
+                f"mean |Q_cluster-0.5| = {auto_selection.selected_score:.4f}, "
+                f"max deviation = {auto_selection.selected_max_deviation:.4f}."
+            )
         else:
             if auto_min_tc is not None:
                 raise ValueError("auto_min_tc can only be used when tc='auto'")
-            itc = self._timestep_index(tc)
+            if not isinstance(tc, (int, float, np.integer, np.floating)):
+                raise ValueError("tc must be a numeric lag time or 'auto'.")
+            itc = self._timestep_index(float(tc))
             step = self.tmin + itc
-            tc_ps = step * self.dt  # ps
-            tc_disp = tc_ps / self.time_scale  # user unit
+            tc_ps = step * self.dt
+            tc_disp = tc_ps / self.time_scale
 
-        # store selected tc for later access
         self.tc_selected_idx = itc
         self.tc_selected = tc_disp
-        
-        # Determine output filename base
-        if fout_prefix is not None:
-            out_base = fout_prefix
-        else:
-            # Format tc for filename to avoid slashes or dots if possible or just standard format
-            # Using fixed precision or string format if it was a string (though it's converted to float)
-            # tc_disp is float.
-            out_base = f"{self.fout}.tc_{tc_disp:.4g}"
+        out_base = fout_prefix if fout_prefix is not None else f"{self.fout}.tc_{tc_disp:.4g}"
 
-        with open(f'{out_base}.dat','w') as g:
-            g.write("DIFFUSION COEFFICIENT ESTIMATE\n")
-            g.write("INPUT:\n")
-            # g.write("Trajectory: {}\n".format(self.fz)) # fz might be None now
-            g.write(f"Number of dimensions : {self.ndim}\n")
-            g.write(f"Min/max lag time [steps]: {self.tmin}/{self.tmax}\n")
-            g.write(f"Min/max lag time [{self.time_unit}]: {self.tmin*self.dt/self.time_scale}/{self.tmax*self.dt/self.time_scale}\n")
-            g.write(f"Parameter m (MSD points per lag step): {self.m}\n")
-            g.write(f"MSD window per lag step t: [{self.time_unit}] t to {self.m}*t (e.g., at t={self.tmin*self.dt/self.time_scale:.4g} {self.time_unit}, window spans up to {(self.m*self.tmin*self.dt)/self.time_scale:.4g} {self.time_unit})\n")
-            
-            if self.multi:
-                g.write(f"Number of molecules: {self.nseg}\n")
-            else:
-                g.write(f"Number of segments: {self.nseg}\n")
-                
-            g.write(f"Total number of trajectory data points per dim.: {self.n+1}\n")
-            g.write(f"Data points per segment and dim.: {self.nperseg+1}\n")
-            
-            if hasattr(self, 'non_converged_count'):
-                 g.write(f"Optimizer convergence failures: {self.non_converged_count} ({self.percent_failed:.1f}% of {self.total_cases})\n")
+        pooled_statistics = self._statistics_at(
+            self.D,
+            self.Dstd,
+            self.Dempstd,
+            self.Dsem_pred,
+            self.Dsem_emp,
+            self.q_m,
+            self.q_std,
+            itc,
+        )
+        cluster_statistics = tuple(
+            ClusterStatistics(
+                cluster_id=cluster_id,
+                n_trajectories=len(self.cluster_indices[index]),
+                statistics=self._statistics_at(
+                    self.cluster_D[:, index],
+                    self.cluster_Dstd[:, index],
+                    self.cluster_Dempstd[:, index],
+                    self.cluster_Dsem_pred[:, index],
+                    self.cluster_Dsem_emp[:, index],
+                    self.cluster_q_m[:, index],
+                    self.cluster_q_std[:, index],
+                    itc,
+                ),
+            )
+            for index, cluster_id in enumerate(self.cluster_ids)
+        )
+        across_statistics = AcrossClusterStatistics(
+            n_clusters=n_clusters,
+            mean=float(self.D_cluster_mean[itc] * self.diff_scale),
+            sample_sd=self._scaled_optional(self.D_cluster_sd[itc]),
+            propagated_predicted_sem=float(self.D_cluster_sem_pred[itc] * self.diff_scale),
+            propagated_empirical_sem=self._scaled_optional(self.D_cluster_sem_emp[itc]),
+        )
+        self.analysis_result = AnalysisResult(
+            tc=float(tc_disp),
+            time_unit=self.time_unit,
+            diffusion_unit=self.diffusion_unit,
+            pooled=pooled_statistics,
+            clusters=cluster_statistics,
+            across_clusters=across_statistics,
+        )
 
-            if tc == 'auto':
-                g.write("AUTO TC SELECTION:\n")
-                g.write(f"Selected auto tc: {tc_disp:.4g} {self.time_unit} (Q = {self.q_m[itc]:.4f})\n")
-                if auto_min_tc is not None:
-                    g.write(f"Requested auto_min_tc: {auto_min_tc:.4g} {self.time_unit}\n")
-                    g.write(f"Applied auto_min_tc on lag grid: {self.auto_min_tc_used:.4g} {self.time_unit}\n")
-                    if self.tc_auto_unbounded_idx != self.tc_selected_idx:
-                        g.write(
-                            f"Plain auto tc without lower bound: {self.tc_auto_unbounded:.4g} {self.time_unit} "
-                            f"(Q = {self.q_m[self.tc_auto_unbounded_idx]:.4f})\n"
-                        )
-
-            # Summary at chosen tc
-            g.write(f"Your chosen diffusion coefficient at {tc_disp} {self.time_unit}: {D_out[itc]:.4e} {self.diffusion_unit}\n")
-            g.write(f"Standard deviation at {tc_disp} {self.time_unit}: {Dstd_out[itc]:.4e} {self.diffusion_unit}\n")
-            g.write(f"Empirical std at {tc_disp} {self.time_unit}: {Dempstd_out[itc]:.4e} {self.diffusion_unit}\n")
-            g.write(f"SEM (predicted) at {tc_disp} {self.time_unit} [n={self.nseg}]: {Dsem_pred_out[itc]:.4e} {self.diffusion_unit}\n")
-            g.write(f"SEM (empirical) at {tc_disp} {self.time_unit} [n={self.nseg}]: {Dsem_emp_out[itc]:.4e} {self.diffusion_unit}\n")
-            g.write(f"Q-factor at {tc_disp} {self.time_unit}: {self.q_m[itc]:.4f}\n")
-            if self.diffusion_unit != 'cm2/s':
-                g.write(f"Your chosen diffusion coefficient at {tc_disp} {self.time_unit}: {self.D[itc]*0.01:.4e} cm^2/s\n")
-            g.write("DIFFUSION COEFFICIENT OUTPUT SUMMARY:\n")
-            g.write(f"t[{self.time_unit}] D[{self.diffusion_unit}] varD[{self.diffusion_unit}^2] Q\n")
-            for t,step in enumerate(range(self.tmin, self.tmax+1)):
-                g.write(f"{(step*self.dt)/self.time_scale:.4g} {D_out[t]:.5g} {(Dstd_out[t]**2):.5g} {self.q_m[t]:.5f}\n")
-            if self.ndim > 1:
-                g.write("\nDIFFUSION COEFFICIENT PER DIMENSION:\n")
-                g.write(f"t[{self.time_unit}] Dx[{self.diffusion_unit}] Dy[{self.diffusion_unit}] ...\n")
-                for step, Dt in zip(range(self.tmin, self.tmax+1), self.Dperdim):
-                    g.write(f"{(step*self.dt)/self.time_scale:.4f} {Dperdim_out[step-self.tmin]}\n")
-        
+        self._write_analysis_report(
+            out_base,
+            self.analysis_result,
+            auto_selection=auto_selection,
+            requested_auto_min_tc=auto_min_tc,
+        )
+        self._write_analysis_csv(out_base)
         self._analyzed = True
         self.plot_results(tc_ps, out_base)
+        return self.analysis_result
+
+    def _scaled_optional(self, value: float) -> float | None:
+        """Scale a finite internal diffusion value or return ``None``.
+
+        Parameters
+        ----------
+        value : float
+            Value in internal diffusion units.
+
+        Returns
+        -------
+        float or None
+            Scaled value, or ``None`` when ``value`` is not finite.
+        """
+        return float(value * self.diff_scale) if np.isfinite(value) else None
+
+    def _statistics_at(
+        self,
+        diffusion,
+        predicted_sd,
+        empirical_sd,
+        predicted_sem,
+        empirical_sem,
+        q_mean,
+        q_sd,
+        index: int,
+    ) -> DiffusionStatistics:
+        """Create a selected-lag statistics dataclass from result arrays.
+
+        Parameters
+        ----------
+        diffusion, predicted_sd, empirical_sd, predicted_sem, empirical_sem : ndarray
+            Lag-dependent diffusion and uncertainty arrays in internal units.
+        q_mean, q_sd : ndarray
+            Lag-dependent Q summary arrays.
+        index : int
+            Selected lag-grid index.
+
+        Returns
+        -------
+        DiffusionStatistics
+            Scaled selected-lag statistics.
+        """
+        return DiffusionStatistics(
+            diffusion=float(diffusion[index] * self.diff_scale),
+            predicted_sd=float(predicted_sd[index] * self.diff_scale),
+            empirical_sd=self._scaled_optional(empirical_sd[index]),
+            predicted_sem=float(predicted_sem[index] * self.diff_scale),
+            empirical_sem=self._scaled_optional(empirical_sem[index]),
+            q_mean=float(q_mean[index]) if np.isfinite(q_mean[index]) else None,
+            q_sd=float(q_sd[index]) if np.isfinite(q_sd[index]) else None,
+        )
+
+    @staticmethod
+    def _format_optional(value: float | None, format_spec: str = ".4e") -> str:
+        """Format an optional numeric report value.
+
+        Parameters
+        ----------
+        value : float or None
+            Value to format.
+        format_spec : str, default='.4e'
+            Standard Python floating-point format specification.
+
+        Returns
+        -------
+        str
+            Formatted value or ``'N/A'``.
+        """
+        return "N/A" if value is None else format(value, format_spec)
+
+    def _write_analysis_report(
+        self,
+        out_base: str,
+        result: AnalysisResult,
+        *,
+        auto_selection: AutoTcSelection | None,
+        requested_auto_min_tc: float | None,
+    ) -> None:
+        """Write the concise selected-cutoff text report.
+
+        Parameters
+        ----------
+        out_base : str
+            Output path without extension.
+        result : AnalysisResult
+            Selected-cutoff analysis result.
+        auto_selection : AutoTcSelection or None
+            Automatic cutoff metadata when diagnostic auto mode was used.
+        requested_auto_min_tc : float or None
+            User-requested lower cutoff bound.
+
+        Returns
+        -------
+        None
+            Writes ``{out_base}.dat``.
+        """
+        with open(f"{out_base}.dat", "w", encoding="utf-8") as handle:
+            handle.write("DIFFUSION COEFFICIENT ESTIMATE\n")
+            handle.write("INPUT:\n")
+            handle.write(f"Number of dimensions: {self.ndim}\n")
+            handle.write(f"Number of trajectory-level estimates: {self.nseg}\n")
+            handle.write(f"Number of independent clusters: {len(self.cluster_ids)}\n")
+            handle.write(f"Cluster IDs: {', '.join(self.cluster_ids)}\n")
+            handle.write(f"Min/max lag time [steps]: {self.tmin}/{self.tmax}\n")
+            handle.write(
+                f"Min/max lag time [{self.time_unit}]: "
+                f"{self.tmin * self.dt / self.time_scale:.6g}/"
+                f"{self.tmax * self.dt / self.time_scale:.6g}\n"
+            )
+            handle.write(f"Parameter m (MSD points per lag step): {self.m}\n")
+            handle.write(f"Total trajectory data points per dimension: {self.n + 1}\n")
+            handle.write(
+                "Data points per segment and dimension [min/max]: "
+                f"{int(np.min(self.segment_lengths))}/{int(np.max(self.segment_lengths))}\n"
+            )
+            if hasattr(self, "non_converged_count"):
+                handle.write(
+                    f"Optimizer convergence failures: {self.non_converged_count} "
+                    f"({self.percent_failed:.1f}% of {self.total_cases})\n"
+                )
+
+            if auto_selection is not None:
+                handle.write("AUTO TC SELECTION:\n")
+                handle.write(
+                    f"Selected auto tc: {result.tc:.4g} {self.time_unit}\n"
+                    f"Cluster-mean absolute Q deviation: {auto_selection.selected_score:.6g}\n"
+                    f"Maximum cluster Q deviation: {auto_selection.selected_max_deviation:.6g}\n"
+                )
+                if requested_auto_min_tc is not None:
+                    handle.write(
+                        f"Requested auto_min_tc: {requested_auto_min_tc:.4g} {self.time_unit}\n"
+                        f"Applied auto_min_tc on lag grid: "
+                        f"{self.auto_min_tc_used:.4g} {self.time_unit}\n"
+                    )
+                    if self.tc_auto_unbounded_idx != self.tc_selected_idx:
+                        handle.write(
+                            f"Plain auto tc without lower bound: "
+                            f"{self.tc_auto_unbounded:.4g} {self.time_unit}\n"
+                        )
+
+            pooled = result.pooled
+            handle.write("POOLED TRAJECTORY-LEVEL RESULT (CONDITIONAL ON SAMPLED CLUSTERS):\n")
+            handle.write(
+                f"D: {pooled.diffusion:.6e} {self.diffusion_unit}\n"
+                f"Predicted member SD: {pooled.predicted_sd:.6e} {self.diffusion_unit}\n"
+                f"Empirical member SD: {self._format_optional(pooled.empirical_sd, '.6e')} "
+                f"{self.diffusion_unit}\n"
+                f"Predicted conditional SEM: {pooled.predicted_sem:.6e} {self.diffusion_unit}\n"
+                f"Empirical conditional SEM: {self._format_optional(pooled.empirical_sem, '.6e')} "
+                f"{self.diffusion_unit}\n"
+                f"Q mean: {self._format_optional(pooled.q_mean, '.6f')}\n"
+                f"Q sample SD: {self._format_optional(pooled.q_sd, '.6f')}\n"
+            )
+
+            across = result.across_clusters
+            handle.write("ACROSS INDEPENDENT CLUSTERS (EQUAL WEIGHT):\n")
+            handle.write(
+                f"Cluster mean D: {across.mean:.6e} {self.diffusion_unit}\n"
+                f"Between-cluster sample SD: {self._format_optional(across.sample_sd, '.6e')} "
+                f"{self.diffusion_unit}\n"
+                f"Propagated predicted within-cluster conditional SEM: "
+                f"{across.propagated_predicted_sem:.6e} {self.diffusion_unit}\n"
+                f"Propagated empirical within-cluster conditional SEM: "
+                f"{self._format_optional(across.propagated_empirical_sem, '.6e')} "
+                f"{self.diffusion_unit}\n"
+            )
+            handle.write(
+                "The propagated conditional SEM and observed between-cluster SD are "
+                "reported separately and are not added in quadrature.\n"
+            )
+
+            handle.write("INDIVIDUAL CLUSTERS:\n")
+            for cluster in result.clusters:
+                stats = cluster.statistics
+                handle.write(
+                    f"{cluster.cluster_id} [n={cluster.n_trajectories}]: "
+                    f"D={stats.diffusion:.6e} {self.diffusion_unit}, "
+                    f"predicted_member_SD={stats.predicted_sd:.6e} {self.diffusion_unit}, "
+                    f"empirical_member_SD={self._format_optional(stats.empirical_sd, '.6e')} "
+                    f"{self.diffusion_unit}, predicted_conditional_SEM="
+                    f"{stats.predicted_sem:.6e} {self.diffusion_unit}, "
+                    f"empirical_conditional_SEM="
+                    f"{self._format_optional(stats.empirical_sem, '.6e')} "
+                    f"{self.diffusion_unit}, Q={self._format_optional(stats.q_mean, '.6f')}\n"
+                )
+            handle.write(f"Complete lag-dependent data: {out_base}.csv\n")
+
+    def _write_analysis_csv(self, out_base: str) -> None:
+        """Write complete pooled, cluster, and across-cluster lag data.
+
+        Parameters
+        ----------
+        out_base : str
+            Output path without extension.
+
+        Returns
+        -------
+        None
+            Writes ``{out_base}.csv``.
+        """
+        dimension_columns = [f"D_dim_{dimension}" for dimension in range(self.ndim)]
+        fieldnames = [
+            "scope",
+            "cluster_id",
+            "n_trajectories",
+            "n_clusters",
+            "lag",
+            "lag_unit",
+            "diffusion",
+            "diffusion_unit",
+            "predicted_variance",
+            "predicted_sd",
+            "empirical_sd",
+            "conditional_sem_predicted",
+            "conditional_sem_empirical",
+            "q_mean",
+            "q_sd",
+            "between_cluster_sample_sd",
+            "propagated_within_cluster_sem_predicted",
+            "propagated_within_cluster_sem_empirical",
+            "q_cluster_mean_abs_deviation",
+            "q_cluster_max_abs_deviation",
+            *dimension_columns,
+        ]
+
+        def csv_number(value):
+            """Return a finite float or CSV NaN.
+
+            Parameters
+            ----------
+            value : float
+                Numeric value to normalize for CSV output.
+
+            Returns
+            -------
+            float
+                Finite input value or ``NaN``.
+            """
+            return float(value) if np.isfinite(value) else np.nan
+
+        with open(f"{out_base}.csv", "w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for lag_index, step in enumerate(range(self.tmin, self.tmax + 1)):
+                lag = step * self.dt / self.time_scale
+                pooled_row = {
+                    "scope": "pooled",
+                    "cluster_id": "",
+                    "n_trajectories": self.nseg,
+                    "n_clusters": len(self.cluster_ids),
+                    "lag": lag,
+                    "lag_unit": self.time_unit,
+                    "diffusion": self.D[lag_index] * self.diff_scale,
+                    "diffusion_unit": self.diffusion_unit,
+                    "predicted_variance": (self.Dstd[lag_index] * self.diff_scale) ** 2,
+                    "predicted_sd": self.Dstd[lag_index] * self.diff_scale,
+                    "empirical_sd": csv_number(self.Dempstd[lag_index] * self.diff_scale),
+                    "conditional_sem_predicted": self.Dsem_pred[lag_index] * self.diff_scale,
+                    "conditional_sem_empirical": csv_number(
+                        self.Dsem_emp[lag_index] * self.diff_scale
+                    ),
+                    "q_mean": csv_number(self.q_m[lag_index]),
+                    "q_sd": csv_number(self.q_std[lag_index]),
+                    "between_cluster_sample_sd": np.nan,
+                    "propagated_within_cluster_sem_predicted": np.nan,
+                    "propagated_within_cluster_sem_empirical": np.nan,
+                    "q_cluster_mean_abs_deviation": csv_number(
+                        self.q_cluster_score[lag_index]
+                    ),
+                    "q_cluster_max_abs_deviation": csv_number(
+                        self.q_cluster_max_deviation[lag_index]
+                    ),
+                }
+                pooled_row.update(
+                    {
+                        column: self.Dperdim[lag_index, dimension] * self.diff_scale
+                        for dimension, column in enumerate(dimension_columns)
+                    }
+                )
+                writer.writerow(pooled_row)
+
+                for cluster_index, cluster_id in enumerate(self.cluster_ids):
+                    cluster_row = {
+                        "scope": "cluster",
+                        "cluster_id": cluster_id,
+                        "n_trajectories": len(self.cluster_indices[cluster_index]),
+                        "n_clusters": 1,
+                        "lag": lag,
+                        "lag_unit": self.time_unit,
+                        "diffusion": self.cluster_D[lag_index, cluster_index] * self.diff_scale,
+                        "diffusion_unit": self.diffusion_unit,
+                        "predicted_variance": (
+                            self.cluster_Dstd[lag_index, cluster_index] * self.diff_scale
+                        ) ** 2,
+                        "predicted_sd": (
+                            self.cluster_Dstd[lag_index, cluster_index] * self.diff_scale
+                        ),
+                        "empirical_sd": csv_number(
+                            self.cluster_Dempstd[lag_index, cluster_index] * self.diff_scale
+                        ),
+                        "conditional_sem_predicted": (
+                            self.cluster_Dsem_pred[lag_index, cluster_index] * self.diff_scale
+                        ),
+                        "conditional_sem_empirical": csv_number(
+                            self.cluster_Dsem_emp[lag_index, cluster_index] * self.diff_scale
+                        ),
+                        "q_mean": csv_number(self.cluster_q_m[lag_index, cluster_index]),
+                        "q_sd": csv_number(self.cluster_q_std[lag_index, cluster_index]),
+                        "between_cluster_sample_sd": np.nan,
+                        "propagated_within_cluster_sem_predicted": np.nan,
+                        "propagated_within_cluster_sem_empirical": np.nan,
+                        "q_cluster_mean_abs_deviation": np.nan,
+                        "q_cluster_max_abs_deviation": np.nan,
+                    }
+                    cluster_row.update(
+                        {
+                            column: (
+                                self.cluster_Dperdim[lag_index, cluster_index, dimension]
+                                * self.diff_scale
+                            )
+                            for dimension, column in enumerate(dimension_columns)
+                        }
+                    )
+                    writer.writerow(cluster_row)
+
+                across_per_dimension = np.mean(self.cluster_Dperdim[lag_index], axis=0)
+                across_row = {
+                    "scope": "across_clusters",
+                    "cluster_id": "",
+                    "n_trajectories": self.nseg,
+                    "n_clusters": len(self.cluster_ids),
+                    "lag": lag,
+                    "lag_unit": self.time_unit,
+                    "diffusion": self.D_cluster_mean[lag_index] * self.diff_scale,
+                    "diffusion_unit": self.diffusion_unit,
+                    "predicted_variance": np.nan,
+                    "predicted_sd": np.nan,
+                    "empirical_sd": np.nan,
+                    "conditional_sem_predicted": np.nan,
+                    "conditional_sem_empirical": np.nan,
+                    "q_mean": np.nan,
+                    "q_sd": np.nan,
+                    "between_cluster_sample_sd": csv_number(
+                        self.D_cluster_sd[lag_index] * self.diff_scale
+                    ),
+                    "propagated_within_cluster_sem_predicted": (
+                        self.D_cluster_sem_pred[lag_index] * self.diff_scale
+                    ),
+                    "propagated_within_cluster_sem_empirical": csv_number(
+                        self.D_cluster_sem_emp[lag_index] * self.diff_scale
+                    ),
+                    "q_cluster_mean_abs_deviation": csv_number(
+                        self.q_cluster_score[lag_index]
+                    ),
+                    "q_cluster_max_abs_deviation": csv_number(
+                        self.q_cluster_max_deviation[lag_index]
+                    ),
+                }
+                across_row.update(
+                    {
+                        column: across_per_dimension[dimension] * self.diff_scale
+                        for dimension, column in enumerate(dimension_columns)
+                    }
+                )
+                writer.writerow(across_row)
 
     def plot_results(self, tc, out_base):
         """Create the analysis figure for the selected lag time.
@@ -1055,6 +1723,9 @@ class Dcov():
         plot_diffusion_results(
             D=self.D, Dstd=self.Dstd, Dempstd=self.Dempstd,
             q_m=self.q_m, q_std=self.q_std, s2=self.s2,
+            cluster_ids=self.cluster_ids, cluster_indices=self.cluster_indices,
+            cluster_D=self.cluster_D, cluster_q_m=self.cluster_q_m,
+            D_cluster_mean=self.D_cluster_mean, D_cluster_sd=self.D_cluster_sd,
             tmin=self.tmin, tmax=self.tmax, dt=self.dt,
             m=self.m, ndim=self.ndim, nseg=self.nseg,
             time_scale=self.time_scale, time_unit=self.time_unit,
@@ -1111,11 +1782,16 @@ class Dcov():
         Dcor_out = self.Dcor[itc] * self.diff_scale
         Dstd_out = self.Dstd[itc] * self.diff_scale
         tc_disp = (self.tmin + itc) * self.dt / self.time_scale
-        print(f"Finite-size corrected D at tc={tc_disp:.4g} {self.time_unit}: "
-              f"{Dcor_out:.4e} {self.diffusion_unit} ± {Dstd_out:.4e} {self.diffusion_unit}")
+        print(
+            f"Finite-size corrected pooled D at tc={tc_disp:.4g} {self.time_unit}: "
+            f"{Dcor_out:.4e} {self.diffusion_unit}; predicted member SD "
+            f"{Dstd_out:.4e} {self.diffusion_unit}"
+        )
 
 
 def plot_diffusion_results(*, D, Dstd, Dempstd, q_m, q_std, s2,
+                           cluster_ids, cluster_indices, cluster_D, cluster_q_m,
+                           D_cluster_mean, D_cluster_sd,
                            tmin, tmax, dt, m, ndim, nseg,
                            time_scale, time_unit, diff_scale, diffusion_unit,
                            tc, tc_auto_unbounded, tc_selected_idx, out_base, imgfmt):
@@ -1135,6 +1811,18 @@ def plot_diffusion_results(*, D, Dstd, Dempstd, q_m, q_std, s2,
         Standard deviation of quality factor per lag time.
     s2 : ndarray
         Segment-wise slope values with shape ``(n_lag, nseg, ndim)``.
+    cluster_ids : tuple[str, ...]
+        Cluster identifiers in plotting order.
+    cluster_indices : tuple[ndarray, ...]
+        Segment indices belonging to each cluster.
+    cluster_D : ndarray
+        Per-cluster diffusion estimates with shape ``(n_lag, n_cluster)``.
+    cluster_q_m : ndarray
+        Per-cluster Q means with shape ``(n_lag, n_cluster)``.
+    D_cluster_mean : ndarray
+        Equal-weight cluster mean diffusion series.
+    D_cluster_sd : ndarray
+        Sample standard deviation across clusters per lag.
     tmin : int
         Minimum lag step index included in the analysis grid.
     tmax : int
@@ -1177,6 +1865,7 @@ def plot_diffusion_results(*, D, Dstd, Dempstd, q_m, q_std, s2,
     All inputs are plain arrays/scalars and the function does not depend on
     :class:`Dcov` internals.
     """
+    import matplotlib.pyplot as plt
     import seaborn as sns
     sns.set_context("paper", font_scale=0.5)
     fig = plt.figure(figsize=(6, 7.5))
@@ -1195,11 +1884,41 @@ def plot_diffusion_results(*, D, Dstd, Dempstd, q_m, q_std, s2,
 
     ax0.plot(xs, D_out, color='C0', linewidth=0.8, label=r'$D$')
     ax0.plot(xs, D_out - Dstd_out, color='black', linestyle='dotted', linewidth=0.7,
-             label=r'$\delta \overline{D}^\mathrm{predicted}$')
+             label='predicted member SD')
     ax0.plot(xs, D_out + Dstd_out, color='black', linestyle='dotted', linewidth=0.7)
     ax0.fill_between(xs, D_out - Dempstd_out, D_out + Dempstd_out,
                      color='C0', alpha=0.5, edgecolor='none', linewidth=0,
-                     label=r'$\delta \overline{D}^\mathrm{empirical}$')
+                     label='empirical member SD')
+    cluster_colors = sns.color_palette("colorblind", n_colors=max(len(cluster_ids), 1))
+    for cluster_index, cluster_id in enumerate(cluster_ids):
+        ax0.plot(
+            xs,
+            cluster_D[:, cluster_index] * diff_scale,
+            color=cluster_colors[cluster_index],
+            linewidth=0.65,
+            alpha=0.75,
+            label=f"cluster {cluster_id}",
+        )
+    if len(cluster_ids) > 1:
+        cluster_mean_out = D_cluster_mean * diff_scale
+        cluster_sd_out = D_cluster_sd * diff_scale
+        ax0.plot(
+            xs,
+            cluster_mean_out,
+            color="tab:purple",
+            linestyle="--",
+            linewidth=1.1,
+            label="equal-weight cluster mean",
+        )
+        ax0.fill_between(
+            xs,
+            cluster_mean_out - cluster_sd_out,
+            cluster_mean_out + cluster_sd_out,
+            color="tab:purple",
+            alpha=0.1,
+            edgecolor="none",
+            label="between-cluster sample SD",
+        )
     ax0.axvline(tc / time_scale, color='tab:red', linestyle='dashed')
     if show_auto_comparison:
         ax0.axvline(tc_auto_unbounded / time_scale, color='tab:orange', linestyle='dotted', linewidth=1.2)
@@ -1209,26 +1928,39 @@ def plot_diffusion_results(*, D, Dstd, Dempstd, q_m, q_std, s2,
     ax0.legend(ncol=2)
     ax0.set_title(f"MSD window per lag: t .. {m}\u00d7t [{time_unit}]")
 
-    ax1.plot(xs, q_m, color='C0', linewidth=0.8)
+    ax1.plot(xs, q_m, color='C0', linewidth=0.8, label='pooled Q mean')
     ax1.fill_between(xs, q_m - q_std, q_m + q_std,
                      color='C0', alpha=0.5, edgecolor='none', linewidth=0)
+    if m > 2:
+        for cluster_index, cluster_id in enumerate(cluster_ids):
+            ax1.plot(
+                xs,
+                cluster_q_m[:, cluster_index],
+                color=cluster_colors[cluster_index],
+                linewidth=0.65,
+                alpha=0.8,
+                label=f"cluster {cluster_id}",
+            )
     ax1.axhline(0.5, linestyle='dashed', color='gray', linewidth=1.2)
-    selected_tc_marker = ax1.axvline(tc / time_scale, color='tab:red', linestyle='dashed')
+    ax1.axvline(
+        tc / time_scale,
+        color='tab:red',
+        linestyle='dashed',
+        label='selected tc',
+    )
     if show_auto_comparison:
-        plain_auto_marker = ax1.axvline(
+        ax1.axvline(
             tc_auto_unbounded / time_scale,
             color='tab:orange',
             linestyle='dotted',
             linewidth=1.2,
-        )
-        ax1.legend(
-            handles=[selected_tc_marker, plain_auto_marker],
-            labels=['selected tc', 'plain auto tc'],
-            loc='best',
+            label='plain auto tc',
         )
     ax1.set(ylabel=r'$Q(t)$')
     ax1.set(xlabel=fr'lag time $t$ [{time_unit}]')
     ax1.set(ylim=(0, 1))
+    if m > 2:
+        ax1.legend(loc='best', ncol=2)
 
     # Distribution of per-segment/molecule estimates at the selected tc
     itc = tc_selected_idx
@@ -1259,7 +1991,25 @@ def plot_diffusion_results(*, D, Dstd, Dempstd, q_m, q_std, s2,
                     label=r'mean($D_i$)')
         ax2.axvline(d_median, color='C0', linestyle='solid', linewidth=1.2,
                     label=r'median($D_i$)')
-        ax2.plot(D_seg_tc, np.zeros_like(D_seg_tc), '|', color='C0', alpha=0.3, markersize=10)
+        for cluster_index, (cluster_id, indices) in enumerate(zip(cluster_ids, cluster_indices)):
+            cluster_values = D_seg_tc[indices]
+            y_offset = np.full_like(cluster_values, 0.06 * (cluster_index - (len(cluster_ids) - 1) / 2))
+            ax2.plot(
+                cluster_values,
+                y_offset,
+                '|',
+                color=cluster_colors[cluster_index],
+                alpha=0.55,
+                markersize=10,
+            )
+            ax2.plot(
+                [cluster_D[itc, cluster_index] * diff_scale],
+                [y_offset[0] if len(y_offset) else 0.0],
+                marker='o',
+                color=cluster_colors[cluster_index],
+                markersize=3.5,
+                label=f"{cluster_id} mean",
+            )
         ax2.axvspan(q25, q75, color='C0', alpha=0.12, label='25\u201375%')
         ax2.axvspan(q05, q95, color='C0', alpha=0.05, label='5\u201395%')
 

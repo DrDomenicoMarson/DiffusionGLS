@@ -3,7 +3,6 @@ import numpy as np
 import os
 import pickle
 from Dfit.Dfit import Dcov
-from conftest import generate_random_walk
 
 
 def _set_q_profile(dcov: Dcov, q_profile: np.ndarray) -> None:
@@ -26,7 +25,7 @@ def _set_q_profile(dcov: Dcov, q_profile: np.ndarray) -> None:
 
 def test_save_load_cycle(random_walk_file, tmp_path):
     fout = str(tmp_path / 'D_analysis_save_load')
-    dcov = Dcov(fz=random_walk_file, m=5, tmax=10.0, fout=fout)
+    dcov = Dcov(fz=random_walk_file, dt=1.0, m=5, tmax=10.0, fout=fout)
     dcov.run_Dfit(save_model=True)
     
     # Check if pickle file exists
@@ -48,7 +47,7 @@ def test_save_load_cycle(random_walk_file, tmp_path):
 
 def test_flexible_analysis_output(random_walk_file, tmp_path):
     fout = str(tmp_path / 'D_analysis_flex')
-    dcov = Dcov(fz=random_walk_file, m=5, tmax=10.0, fout=fout)
+    dcov = Dcov(fz=random_walk_file, dt=1.0, m=5, tmax=10.0, fout=fout)
     dcov.run_Dfit()
     
     # 1. Test custom prefix
@@ -56,6 +55,7 @@ def test_flexible_analysis_output(random_walk_file, tmp_path):
     dcov.analysis(tc=5.0, fout_prefix=custom_prefix)
     
     assert os.path.exists(f"{custom_prefix}.dat")
+    assert os.path.exists(f"{custom_prefix}.csv")
     assert os.path.exists(f"{custom_prefix}.pdf")
     
     # 2. Test default naming (append tc)
@@ -77,7 +77,7 @@ def test_flexible_analysis_output(random_walk_file, tmp_path):
 
 def test_auto_tc_naming(random_walk_file, tmp_path):
     fout = str(tmp_path / 'D_analysis_auto')
-    dcov = Dcov(fz=random_walk_file, m=5, tmax=10.0, fout=fout)
+    dcov = Dcov(fz=random_walk_file, dt=1.0, m=5, tmax=10.0, fout=fout)
     dcov.run_Dfit()
     
     dcov.analysis(tc='auto')
@@ -92,8 +92,7 @@ def test_auto_tc_naming(random_walk_file, tmp_path):
 
 def test_auto_tc_metadata_persists(random_walk_file, tmp_path):
     fout = str(tmp_path / 'D_analysis_auto_bound')
-    with pytest.warns(UserWarning, match="differs from"):
-        dcov = Dcov(fz=random_walk_file, dt=0.5, m=5, tmax=5.0, fout=fout)
+    dcov = Dcov(fz=random_walk_file, dt=0.5, m=5, tmax=5.0, fout=fout)
     dcov.run_Dfit()
 
     q_profile = np.full(dcov.tmax - dcov.tmin + 1, 0.9)
@@ -113,3 +112,29 @@ def test_auto_tc_metadata_persists(random_walk_file, tmp_path):
     assert dcov_loaded.tc_auto_unbounded == pytest.approx(dcov.tc_auto_unbounded)
     assert dcov_loaded.tc_auto_unbounded_idx == dcov.tc_auto_unbounded_idx
     assert dcov_loaded.auto_min_tc_used == pytest.approx(dcov.auto_min_tc_used)
+
+
+def test_legacy_pickle_without_cluster_metadata_is_conservative(random_walk_file, tmp_path):
+    """Legacy fitted models fall back to one cluster rather than pseudoreplicas."""
+    dcov = Dcov(
+        fz=random_walk_file,
+        dt=1.0,
+        m=5,
+        tmax=5.0,
+        fout=str(tmp_path / "legacy"),
+        progress=False,
+    )
+    dcov.run_Dfit()
+    for attribute in ("segment_cluster_ids", "segment_lengths", "s2var_members"):
+        delattr(dcov, attribute)
+
+    path = tmp_path / "legacy.pkl"
+    with open(path, "wb") as handle:
+        pickle.dump(dcov, handle)
+
+    with pytest.warns(UserWarning, match="legacy model without cluster metadata"):
+        loaded = Dcov.load(str(path))
+
+    assert loaded.cluster_ids == ("cluster_0",)
+    assert loaded.segment_cluster_ids == ("cluster_0",) * loaded.nseg
+    assert loaded.s2var_members.shape == (len(loaded.s2var), loaded.nseg)

@@ -2,6 +2,8 @@
 import numpy as np
 import numba as nb
 
+COVARIANCE_RCOND = 1e-12
+
 @nb.jit(nopython=True)
 def setupc(m,n):
     """Build the MSD covariance prefactor matrix from Eq. 8b.
@@ -100,7 +102,7 @@ def calc_cov(n,m,c,a2,s2):
 
 @nb.jit(nopython=True)
 def inv_mat(A):
-    """Invert a covariance matrix with diagonal regularization.
+    """Compute a scale-relative pseudoinverse of a covariance matrix.
 
     Parameters
     ----------
@@ -110,20 +112,17 @@ def inv_mat(A):
     Returns
     -------
     ndarray of shape (m, m)
-        Inverse of a regularized copy of ``A``.
+        Symmetric Moore-Penrose pseudoinverse of ``A``.
 
     Notes
     -----
-    A small diagonal value (``1e-6``) is added to improve numerical
-    robustness for near-singular matrices.
+    The covariance is symmetrized before inversion. Singular values smaller
+    than ``1e-12`` times the largest singular value are discarded, avoiding an
+    absolute regularizer that changes meaning when coordinate units or the
+    diffusion scale change.
     """
-    # Regularization to prevent singularity.
-    # Copy to avoid mutating the caller's matrix.
-    B = A.copy()
-    n = B.shape[0]
-    for i in range(n):
-        B[i,i] += 1e-6
-    return np.linalg.inv(B)
+    symmetric = 0.5 * (A + A.T)
+    return np.linalg.pinv(symmetric, rcond=COVARIANCE_RCOND)
 
 @nb.jit(nopython=True)
 def calc_a2s2(m,v,cinv, a2, s2):
@@ -163,6 +162,14 @@ def calc_a2s2(m,v,cinv, a2, s2):
             E += (i+1) * v[j] * cinv[i,j]
 
     denom = A * C - B**2
+
+    denom_scale = abs(A * C) + B**2
+    if (
+        not np.isfinite(denom)
+        or denom_scale == 0.0
+        or abs(denom) <= np.finfo(np.float64).eps * denom_scale
+    ):
+        return a2, s2, 0.0
 
     a2n = (C*D-B*E) / denom
     s2n = (A*E-B*D) / denom
@@ -359,6 +366,13 @@ def calc_var(n,m,a2,s2):
             B += (i+1) * cinv[i,j]
             C += (i+1) * (j+1) * cinv[i,j]
     denom = A * C - B**2
+    denom_scale = abs(A * C) + B**2
+    if (
+        not np.isfinite(denom)
+        or denom_scale == 0.0
+        or abs(denom) <= np.finfo(np.float64).eps * denom_scale
+    ):
+        return 0.0
     # a2var = C / denom
     s2var = A / denom
     return s2var
@@ -405,10 +419,10 @@ def compute_autocorrelation_via_fft(x):
         at each lag.
     """
     # x is assumed to be a numpy array (float64)
-    l = len(x)
+    length = len(x)
     
     # FFT
-    xft = np.fft.fft(x, 2*l)
+    xft = np.fft.fft(x, 2*length)
     
     # Autocorrelation: ifft( |xft|^2 )
     # np.abs(xft)**2 is real, but ifft expects complex? 
@@ -420,12 +434,12 @@ def compute_autocorrelation_via_fft(x):
     corr = np.real(np.fft.ifft(spec))
     
     # Normalization
-    norm = l - np.arange(l)
+    norm = length - np.arange(length)
     # Avoid division by zero if l=0 (unlikely)
     # Numba handles array division
     
     # Slice to length l
-    corr = corr[:l]/norm
+    corr = corr[:length]/norm
     return corr
 
 def compute_MSD_1D_via_correlation(x):

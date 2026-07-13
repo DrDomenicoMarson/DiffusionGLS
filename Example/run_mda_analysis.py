@@ -47,8 +47,8 @@ def analyze_system(name, tpr, xtc, selection, tmax=100, tc=10):
     -----
     Side effects:
 
-    - Creates ``D_analysis_{name}.dat`` and ``D_analysis_{name}.pdf`` in the
-      ``Example`` directory.
+    - Creates ``D_analysis_{name}.dat``, ``D_analysis_{name}.csv``, and the
+      configured plot in the ``Example`` directory.
     - Prints progress and summary messages to stdout.
     """
     print(f"--- Analyzing {name} ---")
@@ -73,7 +73,7 @@ def analyze_system(name, tpr, xtc, selection, tmax=100, tc=10):
     
     # Analyze and plot
     res.analysis(tc=tc)
-    print(f"Analysis complete. Output saved to D_analysis_{name}.dat and .pdf\n")
+    print(f"Analysis complete. Output saved to D_analysis_{name}.dat, .csv, and .pdf\n")
 
 
 def analyze_pooled_system(
@@ -83,15 +83,16 @@ def analyze_pooled_system(
     tmax: float = 100,
     tc: float | str = "auto",
 ):
-    """Run diffusion analysis by pooling residue trajectories from replicas.
+    """Run cluster-aware diffusion analysis across independent replicas.
 
     Parameters
     ----------
     name : str
         Label used in console messages and output file names.
     systems : sequence[MDAInputSpec]
-        Topology/trajectory inputs used to build Universes for pooled analysis.
-        All trajectories must have matching frame count and timestep.
+        Topology/trajectory inputs used to build Universes. Each Universe is an
+        independent cluster by default. All trajectories must have matching
+        frame count and timestep.
     selection : str
         Shared atom selection applied to each Universe.
     tmax : float, default=100
@@ -124,7 +125,10 @@ def analyze_pooled_system(
     res = Dfit.Dcov(universes=universes, selection=selection, tmax=tmax, fout=output_path)
     res.run_Dfit()
     res.analysis(tc=tc)
-    print(f"Pooled analysis complete. Output saved to D_analysis_{name}.dat and .pdf\n")
+    print(
+        f"Cluster-aware analysis complete. Output saved to "
+        f"D_analysis_{name}.dat, .csv, and .pdf\n"
+    )
 
 
 if __name__ == "__main__":

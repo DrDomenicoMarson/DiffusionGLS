@@ -8,3 +8,7 @@ build/
 # Generated analysis artifacts
 D_analysis.*
 Example/D_analysis*
+*.tc_*.dat
+*.tc_*.csv
+*.tc_*.pdf
+*.tc_*.png

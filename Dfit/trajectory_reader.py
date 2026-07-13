@@ -25,10 +25,63 @@ class MDATrajectorySource:
         Atom selection used to define residue trajectories.
     n_residues : int
         Number of residues contributing trajectories from this source.
+    cluster_id : str
+        Cluster identifier inherited by every residue trajectory from this
+        source.
     """
     universe: object
     atomgroup: object
     n_residues: int
+    cluster_id: str
+
+
+def _normalize_cluster_ids(
+    cluster_ids,
+    expected_length: int,
+    *,
+    default_ids: Sequence[str],
+) -> tuple[str, ...]:
+    """Validate and normalize user-provided cluster identifiers.
+
+    Parameters
+    ----------
+    cluster_ids : sequence[object] or None
+        Optional identifiers aligned with input trajectory sources. Repeated
+        values intentionally combine sources into one cluster.
+    expected_length : int
+        Required number of identifiers.
+    default_ids : sequence[str]
+        Identifiers to use when ``cluster_ids`` is ``None``.
+
+    Returns
+    -------
+    tuple[str, ...]
+        Normalized string identifiers preserving input order.
+
+    Raises
+    ------
+    TypeError
+        If ``cluster_ids`` is a string or is not a sequence.
+    ValueError
+        If its length does not match ``expected_length`` or an identifier is
+        empty.
+    """
+    if cluster_ids is None:
+        values = list(default_ids)
+    else:
+        if isinstance(cluster_ids, (str, bytes)) or not isinstance(cluster_ids, Sequence):
+            raise TypeError("cluster_ids must be a non-string sequence aligned with the inputs.")
+        values = list(cluster_ids)
+
+    if len(values) != expected_length:
+        raise ValueError(
+            f"cluster_ids must contain {expected_length} value(s), got {len(values)}."
+        )
+
+    normalized = tuple(str(value) for value in values)
+    if any(not value.strip() for value in normalized):
+        raise ValueError("cluster_ids cannot contain empty identifiers.")
+    return normalized
 
 class TrajectoryReader:
     """Abstract interface for trajectory backends used by :class:`Dfit.Dcov`.
@@ -36,8 +89,10 @@ class TrajectoryReader:
     Notes
     -----
     Concrete subclasses must expose ``n_frames``, ``ndim``, ``n_trajs``, and
-    ``dt`` attributes and implement ``__iter__`` yielding arrays of shape
-    ``(n_frames, ndim)`` in nm.
+    ``dt`` attributes, plus one ``trajectory_cluster_ids`` entry per yielded
+    trajectory, and implement ``__iter__`` yielding arrays of shape
+    ``(n_frames, ndim)`` in nm. ``dt`` is ``None`` when the source has no time
+    metadata.
     """
     def __init__(self):
         """Initialize shared trajectory metadata defaults.
@@ -49,7 +104,8 @@ class TrajectoryReader:
         self.n_frames = 0
         self.ndim = 3
         self.n_trajs = 0
-        self.dt = 1.0 # Default, can be overridden
+        self.dt = None
+        self.trajectory_cluster_ids: tuple[str, ...] = ()
 
     def __iter__(self) -> Iterator[np.ndarray]:
         """Yield trajectory arrays.
@@ -151,7 +207,12 @@ class NumpyTextReader(TrajectoryReader):
     Each file is expected to contain coordinate values in nm, one frame per
     line and one spatial dimension per column.
     """
-    def __init__(self, fz: str | Path | Sequence[str | Path], normalize_lengths: bool = False):
+    def __init__(
+        self,
+        fz: str | Path | Sequence[str | Path],
+        normalize_lengths: bool = False,
+        cluster_ids=None,
+    ):
         """Load metadata from text trajectory files.
 
         Parameters
@@ -162,6 +223,10 @@ class NumpyTextReader(TrajectoryReader):
         normalize_lengths : bool, default=False
             If ``True`` and multiple files have different lengths, truncate all
             trajectories to the shortest one.
+        cluster_ids : sequence[object] or None, optional
+            Cluster identifier for each input file. Repeated identifiers group
+            files into one cluster. When omitted, all text files belong to one
+            cluster.
 
         Returns
         -------
@@ -191,25 +256,22 @@ class NumpyTextReader(TrajectoryReader):
             raise ValueError("No trajectory files provided. Pass at least one file path.")
         
         self.n_trajs = len(self.files)
+        self.trajectory_cluster_ids = _normalize_cluster_ids(
+            cluster_ids,
+            self.n_trajs,
+            default_ids=["cluster_0"] * self.n_trajs,
+        )
         
         # Read first file to determine properties
         if self.n_trajs > 0:
-            first_traj = np.loadtxt(self.files[0])
-            # Handle 0-d scalar, 1D, and multi-D arrays from loadtxt
-            first_traj = np.atleast_1d(first_traj)
-            if first_traj.ndim == 1:
-                self.n_frames = first_traj.shape[0]
-                self.ndim = 1
-            else:
-                self.n_frames = first_traj.shape[0]
-                self.ndim = first_traj.shape[1]
+            first_traj = np.loadtxt(self.files[0], ndmin=2)
+            self.n_frames = first_traj.shape[0]
+            self.ndim = first_traj.shape[1]
             self.lengths.append(self.n_frames)
 
             # Validate remaining files have matching length and dims
             for f in self.files[1:]:
-                data = np.loadtxt(f)
-                if len(data.shape) == 1:
-                    data = data.reshape(-1, 1)
+                data = np.loadtxt(f, ndmin=2)
                 if data.shape[1] != self.ndim:
                     raise ValueError(f"Trajectory file {f} has {data.shape[1]} dimensions, expected {self.ndim} based on first file.")
                 self.lengths.append(data.shape[0])
@@ -241,9 +303,7 @@ class NumpyTextReader(TrajectoryReader):
             If a file has a different number of dimensions than expected.
         """
         for f in self.files:
-            data = np.loadtxt(f)
-            if len(data.shape) == 1:
-                data = data.reshape(-1, 1) # Ensure (N, 1) for 1D, as np.loadtxt returns (N,)
+            data = np.loadtxt(f, ndmin=2)
 
             # Check consistency
             if data.shape[1] != self.ndim:
@@ -260,7 +320,7 @@ class MDAnalysisReader(TrajectoryReader):
     Coordinates are converted from Angstrom (MDAnalysis default) to nm by
     multiplying by 0.1.
     """
-    def __init__(self, universe_or_group, selection_str: str = None):
+    def __init__(self, universe_or_group, selection_str: str = None, cluster_ids=None):
         """Initialize a reader from an MDAnalysis Universe or AtomGroup.
 
         Parameters
@@ -269,6 +329,8 @@ class MDAnalysisReader(TrajectoryReader):
             Input object defining topology and trajectory.
         selection_str : str, optional
             Selection expression used when ``universe_or_group`` is a Universe.
+        cluster_ids : sequence[object] or None, optional
+            One optional identifier for this MDAnalysis source.
 
         Returns
         -------
@@ -299,9 +361,15 @@ class MDAnalysisReader(TrajectoryReader):
         # This is a common assumption for diffusion (e.g. water, lipids, proteins)
         # If the selection is a single large molecule (like a protein), n_segments=1
         self.n_trajs = self.ag.n_residues
-        
+        source_cluster_id = _normalize_cluster_ids(
+            cluster_ids,
+            1,
+            default_ids=["cluster_0"],
+        )[0]
+        self.trajectory_cluster_ids = (source_cluster_id,) * self.n_trajs
+
         if self.n_trajs == 0:
-            warnings.warn("Selection contains 0 residues.")
+            raise ValueError("Selection contains 0 residues; choose a non-empty MDAnalysis selection.")
 
     def __iter__(self) -> Iterator[np.ndarray]:
         """Yield per-residue trajectories over all frames.
@@ -329,7 +397,12 @@ class MDAnalysisMultiReader(TrajectoryReader):
     Each input Universe/AtomGroup contributes residue COM trajectories. All
     inputs must share the same frame count and timestep.
     """
-    def __init__(self, universes_or_groups: Sequence, selection_str: str | list[str] | None = None):
+    def __init__(
+        self,
+        universes_or_groups: Sequence,
+        selection_str: str | list[str] | None = None,
+        cluster_ids=None,
+    ):
         """Initialize pooled MDAnalysis reader from multiple inputs.
 
         Parameters
@@ -341,6 +414,10 @@ class MDAnalysisMultiReader(TrajectoryReader):
             applied to every Universe input. If a list, it must have the same
             length as ``universes_or_groups`` and each entry is applied to the
             corresponding input. AtomGroup inputs ignore the selection string.
+        cluster_ids : sequence[object] or None, optional
+            Identifier for each Universe/AtomGroup source. Repeated identifiers
+            combine sources into one cluster. By default, every source is a
+            separate cluster.
 
         Returns
         -------
@@ -370,6 +447,12 @@ class MDAnalysisMultiReader(TrajectoryReader):
         inputs = list(universes_or_groups)
         if len(inputs) == 0:
             raise ValueError("No MDAnalysis universes provided. Pass at least one Universe/AtomGroup.")
+
+        source_cluster_ids = _normalize_cluster_ids(
+            cluster_ids,
+            len(inputs),
+            default_ids=[f"cluster_{i}" for i in range(len(inputs))],
+        )
 
         # Resolve selection_str into a per-input list.
         if isinstance(selection_str, list):
@@ -410,13 +493,17 @@ class MDAnalysisMultiReader(TrajectoryReader):
 
             n_residues = atomgroup.n_residues
             if n_residues == 0:
-                warnings.warn(f"Selection contains 0 residues for MDAnalysis input index {i}.", UserWarning)
+                raise ValueError(
+                    f"Selection contains 0 residues for MDAnalysis input index {i}; "
+                    "choose a non-empty selection."
+                )
 
             self.sources.append(
                 MDATrajectorySource(
                     universe=universe,
                     atomgroup=atomgroup,
                     n_residues=n_residues,
+                    cluster_id=source_cluster_ids[i],
                 )
             )
 
@@ -424,8 +511,11 @@ class MDAnalysisMultiReader(TrajectoryReader):
         self.dt = float(ref_dt)
         self.ndim = 3
         self.n_trajs = int(sum(source.n_residues for source in self.sources))
-        if self.n_trajs == 0:
-            warnings.warn("Combined selection contains 0 residues across all MDAnalysis inputs.", UserWarning)
+        self.trajectory_cluster_ids = tuple(
+            source.cluster_id
+            for source in self.sources
+            for _ in range(source.n_residues)
+        )
 
     def __iter__(self) -> Iterator[np.ndarray]:
         """Yield pooled per-residue trajectories over all input universes.
@@ -449,6 +539,7 @@ def get_reader(
     universes=None,
     selection=None,
     normalize_lengths: bool = False,
+    cluster_ids=None,
 ) -> TrajectoryReader:
     """Create a trajectory reader from text files or MDAnalysis input.
 
@@ -468,6 +559,9 @@ def get_reader(
         different selections to each.
     normalize_lengths : bool, default=False
         Enable truncation to shortest length for multi-file text input.
+    cluster_ids : sequence[object] or None, optional
+        Cluster identifiers aligned with text files, a single MDAnalysis input,
+        or the entries in ``universes``.
 
     Returns
     -------
@@ -491,13 +585,17 @@ def get_reader(
     if universe is not None:
         if normalize_lengths:
             warnings.warn("'normalize_lengths' is ignored for MDAnalysis inputs.", UserWarning)
-        return MDAnalysisReader(universe, selection)
+        return MDAnalysisReader(universe, selection, cluster_ids=cluster_ids)
     if universes is not None:
         if normalize_lengths:
             warnings.warn("'normalize_lengths' is ignored for MDAnalysis inputs.", UserWarning)
-        return MDAnalysisMultiReader(universes, selection)
+        return MDAnalysisMultiReader(universes, selection, cluster_ids=cluster_ids)
     if fz is not None:
-        return NumpyTextReader(fz, normalize_lengths=normalize_lengths)
+        return NumpyTextReader(
+            fz,
+            normalize_lengths=normalize_lengths,
+            cluster_ids=cluster_ids,
+        )
 
     # Defensive fallback; should not be reachable due to provided_modes checks.
     raise ValueError("Unable to determine trajectory reader input mode.")

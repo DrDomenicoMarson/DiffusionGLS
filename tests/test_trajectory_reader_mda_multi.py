@@ -53,6 +53,7 @@ def test_mda_multi_reader_metadata(monkeypatch):
     assert reader.dt == 2.0
     assert reader.ndim == 3
     assert reader.n_trajs == 52
+    assert reader.trajectory_cluster_ids == ("cluster_0",) * 32 + ("cluster_1",) * 20
 
 
 def test_mda_multi_reader_mismatched_frames(monkeypatch):
@@ -103,3 +104,37 @@ def test_mda_multi_reader_list_selections_wrong_length(monkeypatch):
             [u1, u2], selection_str=["resname LIG"]
         )
 
+
+def test_mda_multi_reader_repeated_cluster_ids(monkeypatch):
+    """Repeated source identifiers intentionally combine Universes."""
+
+    _install_fake_mda(monkeypatch)
+    u1 = _FakeUniverse(n_frames=101, dt=2.0, n_residues=2)
+    u2 = _FakeUniverse(n_frames=101, dt=2.0, n_residues=3)
+
+    reader = trajectory_reader.MDAnalysisMultiReader(
+        [u1, u2], cluster_ids=["box_A", "box_A"]
+    )
+
+    assert reader.trajectory_cluster_ids == ("box_A",) * 5
+
+
+def test_mda_multi_reader_cluster_ids_wrong_length(monkeypatch):
+    """Cluster identifiers must align with Universe sources."""
+
+    _install_fake_mda(monkeypatch)
+    u1 = _FakeUniverse(n_frames=101, dt=2.0, n_residues=2)
+    u2 = _FakeUniverse(n_frames=101, dt=2.0, n_residues=3)
+
+    with pytest.raises(ValueError, match="cluster_ids must contain 2"):
+        trajectory_reader.MDAnalysisMultiReader([u1, u2], cluster_ids=["box_A"])
+
+
+def test_mda_multi_reader_rejects_empty_selection(monkeypatch):
+    """A zero-residue source must fail before trajectory materialization."""
+
+    _install_fake_mda(monkeypatch)
+    empty = _FakeUniverse(n_frames=101, dt=2.0, n_residues=0)
+
+    with pytest.raises(ValueError, match="0 residues"):
+        trajectory_reader.MDAnalysisMultiReader([empty])

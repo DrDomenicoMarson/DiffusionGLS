@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "Dfit"
-version = "0.3"
+version = "0.4.0"
 description = "Diffusion Coefficient Fitting using Generalized Least Squares"
 readme = "README.md"
 authors = [
