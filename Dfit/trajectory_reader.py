@@ -2,6 +2,8 @@
 import numpy as np
 from pathlib import Path
 from collections.abc import Sequence, Iterator
+from dataclasses import dataclass
+import math
 import warnings
 
 try:
@@ -10,21 +12,169 @@ try:
 except ImportError:
     HAS_MDA = False
 
+
+@dataclass(frozen=True)
+class MDATrajectorySource:
+    """Container for one MDAnalysis trajectory source and its selection.
+
+    Parameters
+    ----------
+    universe : object
+        MDAnalysis universe associated with the selected atoms.
+    atomgroup : object
+        Atom selection used to define residue trajectories.
+    n_residues : int
+        Number of residues contributing trajectories from this source.
+    """
+    universe: object
+    atomgroup: object
+    n_residues: int
+
 class TrajectoryReader:
-    """Base class/Interface for trajectory readers."""
+    """Abstract interface for trajectory backends used by :class:`Dfit.Dcov`.
+
+    Notes
+    -----
+    Concrete subclasses must expose ``n_frames``, ``ndim``, ``n_trajs``, and
+    ``dt`` attributes and implement ``__iter__`` yielding arrays of shape
+    ``(n_frames, ndim)`` in nm.
+    """
     def __init__(self):
+        """Initialize shared trajectory metadata defaults.
+
+        Returns
+        -------
+        None
+        """
         self.n_frames = 0
         self.ndim = 3
         self.n_trajs = 0
         self.dt = 1.0 # Default, can be overridden
 
     def __iter__(self) -> Iterator[np.ndarray]:
-        """Yields trajectory arrays of shape (n_frames, ndim)."""
+        """Yield trajectory arrays.
+
+        Returns
+        -------
+        Iterator[ndarray]
+            Iterator over arrays of shape ``(n_frames, ndim)``.
+
+        Raises
+        ------
+        NotImplementedError
+            Always raised in the abstract base class.
+        """
         raise NotImplementedError
 
+
+def _resolve_mda_source(universe_or_group, selection_str: str | None):
+    """Resolve a Universe/AtomGroup input into a universe and atom selection.
+
+    Parameters
+    ----------
+    universe_or_group : MDAnalysis.Universe or MDAnalysis.AtomGroup
+        Input object defining topology and trajectory.
+    selection_str : str or None
+        Selection expression applied only when input is a Universe.
+
+    Returns
+    -------
+    tuple[object, object]
+        ``(universe, atomgroup)`` pair to analyze.
+
+    Raises
+    ------
+    TypeError
+        If ``universe_or_group`` is neither Universe nor AtomGroup.
+    """
+    if isinstance(universe_or_group, mda.Universe):
+        universe = universe_or_group
+        if selection_str:
+            atomgroup = universe.select_atoms(selection_str)
+        else:
+            atomgroup = universe.atoms
+    elif isinstance(universe_or_group, mda.AtomGroup):
+        atomgroup = universe_or_group
+        universe = atomgroup.universe
+    else:
+        raise TypeError(f"Invalid MDAnalysis input type: {type(universe_or_group)}")
+    return universe, atomgroup
+
+
+def _compute_residue_com_trajectories(
+    universe,
+    atomgroup,
+    n_frames: int,
+    n_trajs: int,
+) -> np.ndarray:
+    """Compute per-residue COM trajectories for one MDAnalysis selection.
+
+    Parameters
+    ----------
+    universe : MDAnalysis.Universe
+        Universe providing frame iteration.
+    atomgroup : MDAnalysis.AtomGroup
+        Selected atoms used to compute per-residue COM trajectories.
+    n_frames : int
+        Number of trajectory frames.
+    n_trajs : int
+        Number of residue trajectories to produce.
+
+    Returns
+    -------
+    ndarray
+        Array of shape ``(n_trajs, n_frames, 3)`` in nm.
+    """
+    trajs = np.zeros((n_trajs, n_frames, 3), dtype=np.float32)
+
+    # Optimization for 1-atom residues (e.g., monoatomic molecules):
+    # per-residue COM is exactly atom positions.
+    if atomgroup.n_atoms == n_trajs:
+        print("Optimization: Single-atom residues detected. Using atom positions directly.")
+        for i_frame, _ in enumerate(universe.trajectory):
+            trajs[:, i_frame, :] = atomgroup.positions * 0.1  # Angstrom -> nm
+        return trajs
+
+    for i_frame, _ in enumerate(universe.trajectory):
+        try:
+            coms = atomgroup.center_of_mass(compound='residues')
+            trajs[:, i_frame, :] = coms * 0.1  # Angstrom -> nm
+        except (TypeError, ValueError):
+            # Compatibility fallback for older MDAnalysis APIs.
+            for i, res in enumerate(atomgroup.residues):
+                trajs[i, i_frame, :] = res.atoms.center_of_mass() * 0.1  # Angstrom -> nm
+    return trajs
+
 class NumpyTextReader(TrajectoryReader):
-    """Reads trajectories from text files (legacy format)."""
+    """Read one or more trajectories from whitespace-delimited text files.
+
+    Each file is expected to contain coordinate values in nm, one frame per
+    line and one spatial dimension per column.
+    """
     def __init__(self, fz: str | Path | Sequence[str | Path], normalize_lengths: bool = False):
+        """Load metadata from text trajectory files.
+
+        Parameters
+        ----------
+        fz : str or Path or sequence[str | Path]
+            Input file path(s). A single file maps to one trajectory, while a
+            sequence maps to multiple trajectories.
+        normalize_lengths : bool, default=False
+            If ``True`` and multiple files have different lengths, truncate all
+            trajectories to the shortest one.
+
+        Returns
+        -------
+        None
+
+        Raises
+        ------
+        TypeError
+            If ``fz`` is not a supported path type/sequence.
+        ValueError
+            If no files are provided, if dimensions mismatch across files, or
+            if lengths mismatch when ``normalize_lengths=False``.
+        """
         super().__init__()
         self.files = []
         self.lengths = []
@@ -37,13 +187,17 @@ class NumpyTextReader(TrajectoryReader):
         else:
             raise TypeError(f"Invalid input type for NumpyTextReader: {type(fz)}")
         
+        if len(self.files) == 0:
+            raise ValueError("No trajectory files provided. Pass at least one file path.")
+        
         self.n_trajs = len(self.files)
         
         # Read first file to determine properties
         if self.n_trajs > 0:
             first_traj = np.loadtxt(self.files[0])
-            # Handle 1D vs Multi-D
-            if len(first_traj.shape) == 1:
+            # Handle 0-d scalar, 1D, and multi-D arrays from loadtxt
+            first_traj = np.atleast_1d(first_traj)
+            if first_traj.ndim == 1:
                 self.n_frames = first_traj.shape[0]
                 self.ndim = 1
             else:
@@ -72,6 +226,20 @@ class NumpyTextReader(TrajectoryReader):
                 self.n_frames = min_len
 
     def __iter__(self) -> Iterator[np.ndarray]:
+        """Yield trajectories loaded from text files.
+
+        Returns
+        -------
+        Iterator[ndarray]
+            Arrays with shape ``(n_frames, ndim)``. In 1D, files are reshaped
+            to ``(n_frames, 1)``. If normalization is enabled, yielded arrays
+            are truncated to the common shortest length.
+
+        Raises
+        ------
+        ValueError
+            If a file has a different number of dimensions than expected.
+        """
         for f in self.files:
             data = np.loadtxt(f)
             if len(data.shape) == 1:
@@ -87,27 +255,41 @@ class NumpyTextReader(TrajectoryReader):
                 yield data
 
 class MDAnalysisReader(TrajectoryReader):
-    """Reads trajectories using MDAnalysis."""
+    """Read trajectories from MDAnalysis objects as per-residue COM tracks.
+
+    Coordinates are converted from Angstrom (MDAnalysis default) to nm by
+    multiplying by 0.1.
+    """
     def __init__(self, universe_or_group, selection_str: str = None):
+        """Initialize a reader from an MDAnalysis Universe or AtomGroup.
+
+        Parameters
+        ----------
+        universe_or_group : MDAnalysis.Universe or MDAnalysis.AtomGroup
+            Input object defining topology and trajectory.
+        selection_str : str, optional
+            Selection expression used when ``universe_or_group`` is a Universe.
+
+        Returns
+        -------
+        None
+
+        Raises
+        ------
+        ImportError
+            If MDAnalysis is not installed.
+        TypeError
+            If ``universe_or_group`` is not a Universe or AtomGroup.
+
+        Notes
+        -----
+        Each residue in the final selection is treated as one trajectory.
+        """
         super().__init__()
         if not HAS_MDA:
             raise ImportError("MDAnalysis is not installed.")
-        
-        self.u = None
-        self.ag = None
-        
-        # Determine if input is Universe or AtomGroup
-        if isinstance(universe_or_group, mda.Universe):
-            self.u = universe_or_group
-            if selection_str:
-                self.ag = self.u.select_atoms(selection_str)
-            else:
-                self.ag = self.u.atoms # Default to all atoms
-        elif isinstance(universe_or_group, mda.AtomGroup):
-            self.ag = universe_or_group
-            self.u = self.ag.universe
-        else:
-             raise TypeError(f"Invalid input for MDAnalysisReader: {type(universe_or_group)}")
+
+        self.u, self.ag = _resolve_mda_source(universe_or_group, selection_str)
 
         self.n_frames = self.u.trajectory.n_frames
         self.dt = self.u.trajectory.dt # ps
@@ -122,69 +304,200 @@ class MDAnalysisReader(TrajectoryReader):
             warnings.warn("Selection contains 0 residues.")
 
     def __iter__(self) -> Iterator[np.ndarray]:
-        # Pre-calculate center of mass for each residue for the whole trajectory
-        # This can be memory intensive for huge systems. 
-        # Optimization: Iterate frames and build trajectories per residue.
-        
-        # Strategy:
-        # We need to yield (n_frames, 3) for each residue.
-        # Since MDAnalysis iterates by FRAME, we have to pivot the data.
-        # For memory efficiency with large trajectories, we might need a different approach,
-        # but for now, let's load the COM trajectory for the selection.
-        
-        # 1. Create a list of arrays to hold data: [ (n_frames, 3), ... ]
-        # This is still memory intensive. 
-        # If n_segments * n_frames is too large, we are in trouble.
-        # But Dfit needs the full time series for FFT.
-        
-        # Let's try a smarter way using MDAnalysis's built-in analysis if possible,
-        # or just iterate frames and accumulate.
-        
-        trajs = np.zeros((self.n_trajs, self.n_frames, 3), dtype=np.float32)
-        
-        # Map residues to indices
-        res_indices = {r.resindex: i for i, r in enumerate(self.ag.residues)}
-        
-        # Check for single-atom residues optimization
-        if self.ag.n_atoms == self.n_trajs:
-            print("Optimization: Single-atom residues detected. Using atom positions directly.")
-            for i_frame, ts in enumerate(self.u.trajectory):
-                trajs[:, i_frame, :] = self.ag.positions * 0.1 # Convert Angstrom to nm
-        else:
-            # Iterate trajectory once
-            for i_frame, ts in enumerate(self.u.trajectory):
-                # Calculate COM for each residue in the selection
-                # This loop over residues might be slow in Python for 10k waters.
-                # Faster: self.ag.center_of_mass(compound='residues')
-                
-                # Note: compound='residues' returns (n_residues, 3)
-                # We need to make sure the order matches our iteration
-                
-                # MDAnalysis 2.0+ supports compound='residues'
-                try:
-                    coms = self.ag.center_of_mass(compound='residues')
-                    trajs[:, i_frame, :] = coms * 0.1 # Convert Angstrom to nm
-                except (TypeError, ValueError):
-                    # Fallback for older MDA or if compound not supported
-                    # This is slow
-                    for i, res in enumerate(self.ag.residues):
-                        trajs[i, i_frame, :] = res.atoms.center_of_mass() * 0.1 # Convert Angstrom to nm
-        
-        # Yield them
+        """Yield per-residue trajectories over all frames.
+
+        Returns
+        -------
+        Iterator[ndarray]
+            One ``(n_frames, 3)`` array per residue trajectory in nm.
+
+        Notes
+        -----
+        This implementation materializes an in-memory array with shape
+        ``(n_trajs, n_frames, 3)``, which can be memory intensive for large
+        systems.
+        """
+        trajs = _compute_residue_com_trajectories(self.u, self.ag, self.n_frames, self.n_trajs)
+
         for i in range(self.n_trajs):
             yield trajs[i]
 
-def get_reader(fz=None, universe=None, selection=None, normalize_lengths: bool = False) -> TrajectoryReader:
-    """Factory function to get the appropriate reader."""
-    if fz is not None and universe is not None:
-        raise ValueError("Cannot provide both 'fz' and 'universe'.")
+
+class MDAnalysisMultiReader(TrajectoryReader):
+    """Pool multiple MDAnalysis trajectories as one multi-molecule dataset.
+
+    Each input Universe/AtomGroup contributes residue COM trajectories. All
+    inputs must share the same frame count and timestep.
+    """
+    def __init__(self, universes_or_groups: Sequence, selection_str: str | list[str] | None = None):
+        """Initialize pooled MDAnalysis reader from multiple inputs.
+
+        Parameters
+        ----------
+        universes_or_groups : sequence[MDAnalysis.Universe | MDAnalysis.AtomGroup]
+            Inputs to pool.
+        selection_str : str or list[str] or None, optional
+            Selection expression(s). If a single string, the same selection is
+            applied to every Universe input. If a list, it must have the same
+            length as ``universes_or_groups`` and each entry is applied to the
+            corresponding input. AtomGroup inputs ignore the selection string.
+
+        Returns
+        -------
+        None
+
+        Raises
+        ------
+        ImportError
+            If MDAnalysis is not installed.
+        TypeError
+            If ``universes_or_groups`` is not a non-string sequence or contains
+            unsupported entries.
+        ValueError
+            If the sequence is empty, if a selection list length does not match
+            ``universes_or_groups``, or if inputs have mismatched frame count
+            or timestep.
+        """
+        super().__init__()
+        if not HAS_MDA:
+            raise ImportError("MDAnalysis is not installed.")
+
+        if isinstance(universes_or_groups, (str, Path)) or not isinstance(universes_or_groups, Sequence):
+            raise TypeError(
+                "universes must be a non-string sequence of MDAnalysis Universe/AtomGroup objects."
+            )
+
+        inputs = list(universes_or_groups)
+        if len(inputs) == 0:
+            raise ValueError("No MDAnalysis universes provided. Pass at least one Universe/AtomGroup.")
+
+        # Resolve selection_str into a per-input list.
+        if isinstance(selection_str, list):
+            if len(selection_str) != len(inputs):
+                raise ValueError(
+                    f"When 'selection' is a list it must have the same length as 'universes'. "
+                    f"Got {len(selection_str)} selection(s) for {len(inputs)} universe(s)."
+                )
+            selections = selection_str
+        else:
+            # Single string (or None) – broadcast to all inputs.
+            selections = [selection_str] * len(inputs)
+
+        self.sources: list[MDATrajectorySource] = []
+        ref_n_frames = None
+        ref_dt = None
+
+        for i, item in enumerate(inputs):
+            universe, atomgroup = _resolve_mda_source(item, selections[i])
+            n_frames = universe.trajectory.n_frames
+            dt = universe.trajectory.dt
+
+            if ref_n_frames is None:
+                ref_n_frames = n_frames
+            elif n_frames != ref_n_frames:
+                raise ValueError(
+                    f"All MDAnalysis universes must have the same number of frames. "
+                    f"Found {n_frames} at index {i}, expected {ref_n_frames}."
+                )
+
+            if ref_dt is None:
+                ref_dt = dt
+            elif not math.isclose(dt, ref_dt, rel_tol=1e-5, abs_tol=1e-12):
+                raise ValueError(
+                    f"All MDAnalysis universes must have the same dt (ps). "
+                    f"Found {dt} at index {i}, expected {ref_dt}."
+                )
+
+            n_residues = atomgroup.n_residues
+            if n_residues == 0:
+                warnings.warn(f"Selection contains 0 residues for MDAnalysis input index {i}.", UserWarning)
+
+            self.sources.append(
+                MDATrajectorySource(
+                    universe=universe,
+                    atomgroup=atomgroup,
+                    n_residues=n_residues,
+                )
+            )
+
+        self.n_frames = int(ref_n_frames)
+        self.dt = float(ref_dt)
+        self.ndim = 3
+        self.n_trajs = int(sum(source.n_residues for source in self.sources))
+        if self.n_trajs == 0:
+            warnings.warn("Combined selection contains 0 residues across all MDAnalysis inputs.", UserWarning)
+
+    def __iter__(self) -> Iterator[np.ndarray]:
+        """Yield pooled per-residue trajectories over all input universes.
+
+        Returns
+        -------
+        Iterator[ndarray]
+            One ``(n_frames, 3)`` array per residue trajectory in nm.
+        """
+        for source in self.sources:
+            trajs = _compute_residue_com_trajectories(
+                source.universe, source.atomgroup, self.n_frames, source.n_residues
+            )
+            for i in range(source.n_residues):
+                yield trajs[i]
+
+
+def get_reader(
+    fz=None,
+    universe=None,
+    universes=None,
+    selection=None,
+    normalize_lengths: bool = False,
+) -> TrajectoryReader:
+    """Create a trajectory reader from text files or MDAnalysis input.
+
+    Parameters
+    ----------
+    fz : str or Path or sequence[str | Path], optional
+        Text trajectory input path(s).
+    universe : MDAnalysis.Universe or MDAnalysis.AtomGroup, optional
+        MDAnalysis input object.
+    universes : sequence[MDAnalysis.Universe | MDAnalysis.AtomGroup], optional
+        Multiple MDAnalysis inputs to pool into one multi-molecule analysis.
+        All inputs must have matching frame count and dt.
+    selection : str or list[str], optional
+        MDAnalysis selection string. Ignored when ``fz`` is provided. For
+        ``universes``, pass a single string to apply the same selection to
+        every Universe, or a list of strings (one per Universe) to apply
+        different selections to each.
+    normalize_lengths : bool, default=False
+        Enable truncation to shortest length for multi-file text input.
+
+    Returns
+    -------
+    TrajectoryReader
+        Concrete reader instance matching the provided input mode.
+
+    Raises
+    ------
+    ValueError
+        If multiple input modes are provided, or if none is provided.
+    """
+    provided_modes = sum(v is not None for v in (fz, universe, universes))
+    if provided_modes > 1:
+        raise ValueError("Provide exactly one input mode: 'fz', 'universe', or 'universes'.")
+    if provided_modes == 0:
+        raise ValueError("Must provide one input mode: 'fz', 'universe', or 'universes'.")
+
     if fz is not None and selection is not None:
         warnings.warn("'selection' is ignored when 'fz' is provided.")
+
     if universe is not None:
         if normalize_lengths:
             warnings.warn("'normalize_lengths' is ignored for MDAnalysis inputs.", UserWarning)
         return MDAnalysisReader(universe, selection)
-    elif fz is not None:
+    if universes is not None:
+        if normalize_lengths:
+            warnings.warn("'normalize_lengths' is ignored for MDAnalysis inputs.", UserWarning)
+        return MDAnalysisMultiReader(universes, selection)
+    if fz is not None:
         return NumpyTextReader(fz, normalize_lengths=normalize_lengths)
-    else:
-        raise ValueError("Must provide either 'fz' (files) or 'universe' (MDAnalysis).")
+
+    # Defensive fallback; should not be reachable due to provided_modes checks.
+    raise ValueError("Unable to determine trajectory reader input mode.")

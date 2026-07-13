@@ -1,64 +1,242 @@
 # Diffusion Coefficient Fitting
 
-Python class library to determine the diffusion coefficient of a time series using a Generalized Least Squares (GLS) minimization procedure, which accounts for the correlation of MSD data.
+`Dfit` is a Python library for estimating translational diffusion
+coefficients from trajectory data using the generalized least-squares (GLS)
+framework from:
 
-Please read and cite the reference: J. Bullerjahn, S. v. Bülow, G. Hummer, Optimal estimates of diffusion coeffcients from molecular dynamics
-simulations, Journal of Chemical Physics 153, 024116 (2020).
+J. Bullerjahn, S. v. Bulow, G. Hummer, *Optimal estimates of diffusion
+coefficients from molecular dynamics simulations*, J. Chem. Phys. 153, 024116
+(2020).
 
-The input trajectory is analyzed as a whole and split into segments. For each segment, a quality factor Q is computed, indicating how well the trajectory fits a model of random diffusion with noise. The analysis is done for different time steps $\Delta t_n$ of the trajectory. Given the quality factor analysis, the user decides on a time step/diffusion coefficient pair to use.
+The package evaluates diffusion as a function of lag time, quantifies
+goodness-of-fit with a Q-factor, and reports uncertainty estimates.
 
-# Basic Example
+## Installation
+
+```bash
+pip install -e .
 ```
+
+## Workflow Order
+
+The API is Python-only (no CLI). A standard workflow is:
+
+```python
 import Dfit
-res = Dfit.Dcov(m=20,fz='mytrajectory.dat',tmin=1.0,tmax=100.0,nseg=150)
+
+res = Dfit.Dcov(...)
+res.run_Dfit()
+res.analysis(tc=10.0)  # or tc="auto", auto_min_tc=50.0
+res.finite_size_correction(T=300, eta=0.001, L=10.0, tc=10.0)  # optional
+```
+
+Lifecycle constraints:
+
+- `run_Dfit()` must be called before `analysis()`.
+- `analysis()` must be called before `finite_size_correction()`.
+
+## Capabilities
+
+- Single trajectory analysis via automatic or user-defined segmentation.
+- Multi-trajectory / multi-molecule analysis from a list of text trajectories.
+- MDAnalysis integration (`Universe`/`AtomGroup`, single or pooled) with
+  per-residue handling.
+- Automatic lag-time choice with `tc="auto"` (Q-factor target near 0.5),
+  with optional lower-bound restriction via `auto_min_tc`.
+- Repeated analysis on the same fitted object with different `tc` values.
+- Finite-size correction for 3D cubic boxes.
+- Model persistence to and from pickle (`save_model=True`, `Dcov.load`).
+
+## Input Modes
+
+Use exactly one trajectory source:
+
+- `fz`: text file path or list of paths.
+- `universe`: MDAnalysis `Universe` or `AtomGroup`.
+- `universes`: sequence of MDAnalysis `Universe`/`AtomGroup` objects to pool.
+
+`selection` is used with MDAnalysis inputs when a `Universe` is supplied.
+
+## Units and Conversions
+
+- Internal time unit is ps.
+- Internal diffusion unit is nm^2/ps.
+- `time_unit` supports: `ps`, `ns`.
+- `diffusion_unit` supports: `cm2/s`, `nm2/ps`.
+
+`dt` behavior:
+
+- `dt=None` (default): adopt timestep from the reader.
+- Text files (`fz`): reader default is `1.0 ps`.
+- MDAnalysis inputs: reader timestep comes from trajectory metadata.
+- If explicit `dt` is provided and differs from reader timestep, a warning is
+  emitted and the user-provided value is used.
+
+## Constructor Parameters (`Dfit.Dcov`)
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `fz` | `str \| Path \| Sequence[str \| Path] \| None` | `None` | Text trajectory input path(s). |
+| `universe` | MDAnalysis object or `None` | `None` | MDAnalysis trajectory source. |
+| `universes` | `Sequence[MDAnalysis object] \| None` | `None` | Multiple MDAnalysis trajectory sources pooled in one run. |
+| `selection` | `str \| None` | `None` | MDAnalysis selection string for `Universe` input(s). |
+| `m` | `int` | `20` | Number of MSD points per lag-time fit window. |
+| `tmin` | `float \| None` | `None` | Minimum lag time in `time_unit`; defaults to one lag step. |
+| `tmax` | `float` | `100.0` | Maximum lag time in `time_unit`. |
+| `dt` | `float \| None` | `None` | Timestep in `time_unit`; `None` uses reader timestep. |
+| `d2max` | `float` | `1e-10` | Iterative GLS convergence threshold. |
+| `nitmax` | `int` | `100` | Maximum GLS iterations. |
+| `nseg` | `int \| None` | `None` | Number of segments (single-trajectory mode). |
+| `imgfmt` | `str` | `'pdf'` | Plot format (`pdf` or `png`). |
+| `fout` | `str` | `'D_analysis'` | Output filename prefix. |
+| `n_jobs` | `int` | `-1` | Worker count (`0` means serial). |
+| `normalize_lengths` | `bool` | `False` | Truncate unequal text trajectories to shortest length. |
+| `time_unit` | `str` | `'ps'` | Time unit for API input/output values. |
+| `diffusion_unit` | `str` | `'cm2/s'` | Diffusion unit for reported values. |
+| `progress` | `bool` | `True` | Enable lag-step progress bar. |
+
+## Running the Fit
+
+```python
+res.run_Dfit(save_model=False)
+```
+
+- Performs GLS fitting across lag times and segments/molecules.
+- Populates model arrays (`a2`, `s2`, `q`, `s2var`) and diagnostics.
+- Optional `save_model=True` writes `{fout}.pkl`.
+
+## Analysis
+
+```python
+res.analysis(tc=10.0, fout_prefix=None, auto_min_tc=None)
+```
+
+- `tc`: lag time in `time_unit`, or `"auto"` to choose lag with Q nearest 0.5.
+- `fout_prefix`: optional custom output prefix. Default is `{fout}.tc_{tc}`.
+- `auto_min_tc`: optional lower bound for `tc="auto"` in `time_unit`; the
+  auto search starts from the first computed lag `>= auto_min_tc`.
+
+Analysis can be repeated with different `tc` values after a single fit run.
+
+## Finite-Size Correction
+
+```python
+res.finite_size_correction(T=300, eta=0.001, L=10.0, tc=10.0)
+```
+
+Constraints:
+
+- Requires `analysis()` to have run first.
+- Only implemented for 3D data.
+- Only `boxtype='cubic'` is supported.
+
+Parameters:
+
+| Parameter | Type | Description |
+|---|---|---|
+| `tc` | `float` | Lag time (in `time_unit`) from analysis grid. |
+| `T` | `float` | Temperature in Kelvin. |
+| `eta` | `float` | Viscosity in Pa*s. |
+| `L` | `float` | Cubic box edge length in nm. |
+| `boxtype` | `str` | Box geometry (`'cubic'` only). |
+
+## Validation and Constraints
+
+- `m` must be at least 2 after internal clamping.
+- Input trajectories must provide at least 2 frames.
+- In multi-trajectory mode, all dimensions must match.
+- In multi-trajectory text mode, unequal lengths require
+  `normalize_lengths=True`.
+- In pooled MDAnalysis mode (`universes`), all inputs must share the same
+  frame count and `dt`.
+- In multi mode, very large `tmax` may be clamped to a feasible value.
+- `tc` must lie on the computed lag grid and be a multiple of `dt`.
+- `auto_min_tc` is only valid with `tc="auto"` and is rounded up to the first
+  lag on the computed grid that satisfies the requested lower bound.
+
+## Outputs
+
+Generated files:
+
+- `{fout}.tc_{tc}.dat`: text summary (statistics + lag scan table).
+- `{fout}.tc_{tc}.{imgfmt}`: plot with D(t), Q(t), and per-segment
+  distribution.
+- `{fout}.pkl`: optional serialized object if `save_model=True`.
+
+Key attributes and availability:
+
+| Attribute | Available After | Description |
+|---|---|---|
+| `a2`, `s2`, `s2var`, `q` | `run_Dfit()` | Raw fit outputs over lag and segment dimensions. |
+| `D`, `Dstd`, `Dempstd` | `analysis()` | Main diffusion estimate and uncertainties per lag. |
+| `Dsem_pred`, `Dsem_emp` | `analysis()` | Predicted and empirical SEM estimates. |
+| `q_m`, `q_std` | `analysis()` | Mean and std. deviation of Q-factor per lag. |
+| `tc_selected`, `tc_selected_idx` | `analysis()` | Final lag-time value/index used for summary. |
+| `tc_auto_unbounded`, `tc_auto_unbounded_idx`, `auto_min_tc_used` | `analysis()` | Unconstrained auto lag and applied lower-bound metadata when `tc="auto"` is used. |
+| `Dcor` | `finite_size_correction()` | Finite-size corrected diffusion series. |
+
+## Known Practical Limits
+
+- MDAnalysis mode currently materializes full per-residue trajectories in
+  memory; very large systems/trajectories can be memory intensive.
+- The package currently exposes a Python API only (no command-line interface).
+
+## Basic Examples
+
+### 1) Text trajectory file
+
+```python
+import Dfit
+
+res = Dfit.Dcov(fz="mytrajectory.dat", m=20, tmin=1.0, tmax=100.0, nseg=150)
 res.run_Dfit()
 res.analysis(tc=10.0)
-res.finite_size_correction()
+res.finite_size_correction(T=300, eta=0.001, L=10.0, tc=10.0)
 ```
 
-# Input for Dfit.Dcov()
+### 2) MDAnalysis trajectory
 
-Required:
-* fz (str): Filename of input trajectory. Format: Center-of-mass position x [y z ...] in nm. Each row corresponds to a timestep indicated in the optional argument `dt`. The number of columns determines the number of dimensions. Use no header. Separate columns by whitespace, no comma.
+```python
+import Dfit
+import MDAnalysis as mda
 
-*(NOTE: Alternatively, you can provide a list of input trajectories. The code will then treat these lists as copies of the same molecule in the same simulation [e.g. several water molecules, or several copies of the same protein in a dense protein solution, or several DOPC lipids...]. The individual trajectories will then not be segmented; instead, each individual trajectory will be treated as one segment of a long simulation. The resulting diffusion coefficient is then the mean across all segments.)*
+u = mda.Universe("topology.tpr", "trajectory.xtc")
+res = Dfit.Dcov(universe=u, selection="resname SOL", tmax=50)
+res.run_Dfit()
+res.analysis(tc=10.0)
+```
 
-Optional:
-* dt (float): Timestep [in ps] (default: 1.0).
-* m (int): Number of MSD values to consider (default: 20).
-* tmin (float): Minimum lag time [in ps] (default: None, defaults to dt).
-* tmax (float): Maximum lag time [in ps] (default: 100.0).
-* d2max (float): Convergence criterion for GLS iteration (default: 1e-10).
-* nitmax (int): Maximum number of iterations in GLS procedure (default: 100).
-* nseg (int): Number of segments (default: N / (100*tmax)).
-* fout (str): Name for output files w/o extension (default 'D_analysis').
-* imgfmt (str): Output format for plot. Choose 'pdf' or 'png' (default: 'pdf').
-* n_jobs (int): Number of parallel jobs to run. -1 means using all processors (default: -1).
+### 3) Pooled MDAnalysis trajectories (replicas)
 
-Run res.run_Dfit() without additional arguments (everything is stored in `self`).
+```python
+import Dfit
+import MDAnalysis as mda
 
-# Output
+u1 = mda.Universe("topol1.tpr", "traj_replica1.xtc")
+u2 = mda.Universe("topol2.tpr", "traj_replica2.xtc")
 
-Files:
-* D_analysis.dat: Summary of output, including diffusion coefficient (in nm^2/ps and cm^2/s) and Q-factor analysis.
-* D_analysis.pdf: (or .png) Output plots. Use this to assess which diffusion coefficient to select. Refer to Figs. 2 and 4 in the paper.
+res = Dfit.Dcov(universes=[u1, u2], selection="resname SOL", tmax=50)
+res.run_Dfit()
+res.analysis(tc="auto", auto_min_tc=50.0)
+```
 
-Stored values in the Dfit class instance:
-* res.D: Optimal diffusion coefficient estimates per timestep
-* res.Dstd: Estimated standard deviation of res.D per timestep
-* res.Dempstd: Empirical standard deviation of res.D per timestep (should be close to res.Dstd if the diffusive model is appropriate)
-* res.q_m: Mean quality factor per timestep
-* res.q_std: Standard deviation of quality factor per timestep
+### 4) Multiple text trajectories (multi-molecule mode)
 
-# Additional input for method analysis():
+```python
+import Dfit
 
-* tc (float/str): 'Timestep chosen' [in ps] for the diffusion coefficient. Must be a multiple of dt. Can also be set to 'auto' to automatically select the time point where Q is closest to 0.5.
+res = Dfit.Dcov(fz=["traj1.dat", "traj2.dat", "traj3.dat"], tmax=50.0)
+res.run_Dfit()
+res.analysis(tc="auto")
+```
 
-The analysis can be repeated with different values of tc. A red vertical line indicates the chosen timestep in the plot. Repeat until you are content with the chosen timestep
+## Persistence
 
-# Additional input for finite_size_correction():
-* tc (int/float): Use tc determined in the previous analysis step
-* eta (float): Viscosity in units of Pa*s
-* L (float): Edge length of cubic (!) simulation box in nm
-* T (float): Temperature in Kelvin
-* boxtype (str): Only 'cubic' currently allowed.
+```python
+# Save after fitting
+res.run_Dfit(save_model=True)
+
+# Load later
+res = Dfit.Dcov.load("D_analysis.pkl")
+res.analysis(tc=10.0)
+```

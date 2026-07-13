@@ -4,25 +4,26 @@ import numpy as np
 import os
 from Dfit.Dfit import Dcov, XI_CUBIC, BOLTZMANN_K
 from Dfit.trajectory_reader import NumpyTextReader
+from conftest import generate_random_walk
 
-# Mock data generation
-def generate_random_walk(n_steps, dim=3, diffusion_coeff=1.0, dt=1.0):
-    # MSD = 2 * dim * D * t
-    # variance of step = 2 * D * dt
-    step_std = np.sqrt(2 * diffusion_coeff * dt)
-    steps = np.random.normal(0, step_std, size=(n_steps, dim))
-    trajectory = np.cumsum(steps, axis=0)
-    # Add initial position 0
-    trajectory = np.vstack([np.zeros((1, dim)), trajectory])
-    return trajectory
 
-@pytest.fixture
-def random_walk_file(tmp_path):
-    # Create a temporary trajectory file
-    traj = generate_random_walk(n_steps=5000, dim=3, diffusion_coeff=0.1, dt=1.0)
-    file_path = tmp_path / "test_traj.dat"
-    np.savetxt(file_path, traj)
-    return str(file_path)
+def _set_q_profile(dcov: Dcov, q_profile: np.ndarray) -> None:
+    """Override segment Q values with a deterministic mean profile for tests.
+
+    Parameters
+    ----------
+    dcov : Dcov
+        Fitted diffusion estimator whose ``q`` array will be overwritten.
+    q_profile : ndarray
+        One-dimensional array of length ``tmax - tmin + 1`` containing the
+        desired mean ``Q`` value at each lag.
+    """
+    q_profile = np.asarray(q_profile, dtype=float)
+    expected_shape = (dcov.tmax - dcov.tmin + 1,)
+    if q_profile.shape != expected_shape:
+        raise ValueError(f"q_profile must have shape {expected_shape}, got {q_profile.shape}")
+    dcov.q[:] = q_profile[:, np.newaxis]
+
 
 def test_reader_text(random_walk_file):
     reader = NumpyTextReader(random_walk_file)
@@ -88,7 +89,8 @@ def test_finite_size_correction(random_walk_file, tmp_path):
     assert np.isclose(dcov.Dcor[itc], expected_Dcor)
 
 def test_timestep_index(random_walk_file, tmp_path):
-    dcov = Dcov(fz=random_walk_file, dt=0.5, tmin=1.0, tmax=10.0, fout=str(tmp_path / 'D_analysis'))
+    with pytest.warns(UserWarning, match="differs from"):
+        dcov = Dcov(fz=random_walk_file, dt=0.5, tmin=1.0, tmax=10.0, fout=str(tmp_path / 'D_analysis'))
     
     # Valid tc
     idx = dcov._timestep_index(2.0) # 2.0 / 0.5 = 4 steps. tmin is 2 steps (idx 0). So 4 steps is idx 2?
@@ -117,11 +119,66 @@ def test_auto_tc(random_walk_file, tmp_path):
     tc_selected = dcov.tc_selected
     expected_path = f"{tmp_path / 'D_analysis'}.tc_{tc_selected:.4g}.dat"
     assert os.path.exists(expected_path)
+    assert dcov.tc_auto_unbounded == pytest.approx(tc_selected)
+    assert dcov.tc_auto_unbounded_idx == dcov.tc_selected_idx
+    assert dcov.auto_min_tc_used is None
     
     # We can't easily assert WHICH tc was chosen without parsing stdout or checking internals,
     # but we can check that it didn't crash and produced output.
     # Ideally we would check if the chosen Q is close to 0.5, but with random walk data it might vary.
     # Let's just ensure it runs.
+
+
+def test_auto_tc_with_lower_bound_rounds_up(random_walk_file, tmp_path):
+    with pytest.warns(UserWarning, match="differs from"):
+        dcov = Dcov(
+            fz=random_walk_file,
+            dt=0.5,
+            m=5,
+            tmax=5.0,
+            fout=str(tmp_path / 'D_analysis_bound'),
+        )
+    dcov.run_Dfit()
+
+    q_profile = np.full(dcov.tmax - dcov.tmin + 1, 0.9)
+    q_profile[1] = 0.49
+    q_profile[4] = 0.48
+    _set_q_profile(dcov, q_profile)
+
+    dcov.analysis(tc='auto', auto_min_tc=2.1)
+
+    assert dcov.tc_auto_unbounded == pytest.approx(1.0)
+    assert dcov.tc_auto_unbounded_idx == 1
+    assert dcov.tc_selected == pytest.approx(2.5)
+    assert dcov.tc_selected_idx == 4
+    assert dcov.auto_min_tc_used == pytest.approx(2.5)
+
+    expected_path = f"{tmp_path / 'D_analysis_bound'}.tc_{dcov.tc_selected:.4g}.dat"
+    assert os.path.exists(expected_path)
+
+    with open(expected_path, 'r', encoding='utf-8') as handle:
+        text = handle.read()
+
+    assert "AUTO TC SELECTION:" in text
+    assert "Requested auto_min_tc: 2.1 ps" in text
+    assert "Applied auto_min_tc on lag grid: 2.5 ps" in text
+    assert "Plain auto tc without lower bound: 1 ps" in text
+
+
+def test_auto_tc_with_excessive_lower_bound_raises(random_walk_file, tmp_path):
+    dcov = Dcov(fz=random_walk_file, m=5, tmax=10.0, fout=str(tmp_path / 'D_analysis'))
+    dcov.run_Dfit()
+
+    with pytest.raises(ValueError, match="auto_min_tc .* exceeds the computed lag-time range"):
+        dcov.analysis(tc='auto', auto_min_tc=100.0)
+
+
+def test_auto_min_tc_requires_auto_mode(random_walk_file, tmp_path):
+    dcov = Dcov(fz=random_walk_file, m=5, tmax=10.0, fout=str(tmp_path / 'D_analysis'))
+    dcov.run_Dfit()
+
+    with pytest.raises(ValueError, match="auto_min_tc can only be used when tc='auto'"):
+        dcov.analysis(tc=5.0, auto_min_tc=2.0)
 
 def test_mismatched_lengths_error(tmp_path):
     traj1 = generate_random_walk(n_steps=100, dim=3)
@@ -235,3 +292,123 @@ def test_multi_tmax_clamp(tmp_path):
         dcov = Dcov(fz=[str(file1), str(file2)], m=10, tmax=100.0, dt=1.0, fout=str(tmp_path / 'D_analysis_clamp'))
     # tmax should be clamped to nperseg // m
     assert dcov.tmax == dcov.nperseg // dcov.m
+
+
+# --- P1 / P2 validation tests ---
+
+def test_dt_auto_adopt(random_walk_file, tmp_path):
+    """When dt is not provided, it should adopt reader.dt (1.0 for text files)."""
+    dcov = Dcov(fz=random_walk_file, m=10, tmax=20.0, fout=str(tmp_path / 'D_analysis'))
+    assert dcov.dt == 1.0  # NumpyTextReader defaults to 1.0 ps
+
+
+def test_dt_explicit_mismatch_warns(random_walk_file, tmp_path):
+    """Explicit dt differing from reader.dt should warn."""
+    with pytest.warns(UserWarning, match="differs from"):
+        Dcov(fz=random_walk_file, dt=0.5, tmax=20.0, fout=str(tmp_path / 'D_analysis'))
+
+
+def test_m_too_small_error(tmp_path):
+    """m clamped below 2 should raise ValueError, not crash later."""
+    # Create a very short trajectory: 2 frames -> nperseg=1
+    traj = generate_random_walk(n_steps=1, dim=3)  # 2 frames
+    file_path = tmp_path / "tiny_traj.dat"
+    np.savetxt(file_path, traj)
+
+    with pytest.raises(ValueError, match="m must be >= 2"):
+        Dcov(fz=str(file_path), m=20, tmax=1.0, dt=1.0, nseg=1,
+             fout=str(tmp_path / 'D_analysis'))
+
+
+def test_analysis_before_run_error(random_walk_file, tmp_path):
+    """analysis() before run_Dfit() should raise RuntimeError."""
+    dcov = Dcov(fz=random_walk_file, m=10, tmax=20.0, fout=str(tmp_path / 'D_analysis'))
+    with pytest.raises(RuntimeError, match="run_Dfit"):
+        dcov.analysis(tc=10)
+
+
+def test_fsc_before_analysis_error(random_walk_file, tmp_path):
+    """finite_size_correction() before analysis() should raise RuntimeError."""
+    dcov = Dcov(fz=random_walk_file, m=10, tmax=20.0, fout=str(tmp_path / 'D_analysis'))
+    dcov.run_Dfit()
+    with pytest.raises(RuntimeError, match="analysis"):
+        dcov.finite_size_correction(T=300, eta=0.001, L=10.0, tc=10)
+
+
+def test_empty_files_error(tmp_path):
+    """Empty file list should raise ValueError early."""
+    with pytest.raises(ValueError, match="No trajectory files"):
+        Dcov(fz=[], fout=str(tmp_path / 'D_analysis'))
+
+
+def test_input_mode_conflict_fz_and_universes(random_walk_file, tmp_path):
+    """Providing fz together with universes should raise ValueError."""
+    with pytest.raises(ValueError, match="exactly one input mode"):
+        Dcov(
+            fz=random_walk_file,
+            universes=[object()],
+            fout=str(tmp_path / 'D_analysis'),
+        )
+
+
+def test_input_mode_conflict_universe_and_universes(tmp_path):
+    """Providing universe together with universes should raise ValueError."""
+    with pytest.raises(ValueError, match="exactly one input mode"):
+        Dcov(
+            universe=object(),
+            universes=[object()],
+            fout=str(tmp_path / 'D_analysis'),
+        )
+
+
+def test_single_frame_error(tmp_path):
+    """Trajectory with only 1 frame should raise ValueError early."""
+    # np.loadtxt on a single-row 3D file reads shape (3,) which becomes 3 frames×1D.
+    # So write a single value to get exactly 1 frame in 1D.
+    file_path = tmp_path / "one_frame.dat"
+    file_path.write_text("0.0\n")
+
+    with pytest.raises(ValueError, match="too short"):
+        Dcov(fz=str(file_path), fout=str(tmp_path / 'D_analysis'))
+
+
+def test_parallel_consistent_single(random_walk_file, tmp_path):
+    """Serial and parallel runs must produce numerically identical results (single-traj mode)."""
+    kwargs = dict(fz=random_walk_file, m=10, tmax=20.0, nseg=5, progress=False)
+
+    dcov_serial = Dcov(**kwargs, n_jobs=0, fout=str(tmp_path / 'D_serial'))
+    dcov_serial.run_Dfit()
+    dcov_serial.analysis(tc=10)
+
+    dcov_par = Dcov(**kwargs, n_jobs=4, fout=str(tmp_path / 'D_par'))
+    dcov_par.run_Dfit()
+    dcov_par.analysis(tc=10)
+
+    assert np.allclose(dcov_serial.D, dcov_par.D), "D arrays differ between serial and parallel runs"
+    assert np.allclose(dcov_serial.a2, dcov_par.a2), "a2 arrays differ"
+    assert np.allclose(dcov_serial.s2, dcov_par.s2), "s2 arrays differ"
+    assert np.allclose(dcov_serial.q, dcov_par.q),   "q arrays differ"
+
+
+def test_parallel_consistent_multi(tmp_path):
+    """Serial and parallel runs must produce numerically identical results (multi-traj mode)."""
+    trajs = [generate_random_walk(n_steps=500, dim=3) for _ in range(8)]
+    files = []
+    for i, traj in enumerate(trajs):
+        p = tmp_path / f"traj{i}.dat"
+        np.savetxt(p, traj)
+        files.append(str(p))
+
+    kwargs = dict(fz=files, m=10, tmax=20.0, progress=False)
+
+    dcov_serial = Dcov(**kwargs, n_jobs=0, fout=str(tmp_path / 'D_serial'))
+    dcov_serial.run_Dfit()
+    dcov_serial.analysis(tc=10)
+
+    dcov_par = Dcov(**kwargs, n_jobs=4, fout=str(tmp_path / 'D_par'))
+    dcov_par.run_Dfit()
+    dcov_par.analysis(tc=10)
+
+    assert np.allclose(dcov_serial.D, dcov_par.D), "D arrays differ between serial and parallel runs"
+    assert np.allclose(dcov_serial.a2, dcov_par.a2), "a2 arrays differ"
+    assert np.allclose(dcov_serial.s2, dcov_par.s2), "s2 arrays differ"

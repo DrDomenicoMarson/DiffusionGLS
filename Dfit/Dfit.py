@@ -9,6 +9,7 @@
 
 import math
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 import warnings
 import concurrent.futures
@@ -16,7 +17,6 @@ import os
 import pickle
 
 import matplotlib.pyplot as plt
-import seaborn as sns
 import numpy as np
 from tqdm import tqdm
 from scipy.special import gammainc
@@ -29,9 +29,73 @@ TrajectoryInput = str | Path | Sequence[str | Path] | None
 XI_CUBIC = 2.837297
 BOLTZMANN_K = 1.380649e-23 # J/K
 
+
+@dataclass(frozen=True)
+class AutoTcSelection:
+    """Resolved lag-time choice for ``analysis(tc="auto")``.
+
+    Parameters
+    ----------
+    selected_idx : int
+        Final zero-based lag-grid index used for the analysis output.
+    selected_step : int
+        Final lag step on the internal ``tmin..tmax`` grid.
+    selected_tc_ps : float
+        Final lag time in ps.
+    selected_tc_disp : float
+        Final lag time in the user's ``time_unit``.
+    unbounded_idx : int
+        Zero-based lag-grid index from the unconstrained auto selection.
+    unbounded_step : int
+        Unconstrained lag step on the internal ``tmin..tmax`` grid.
+    unbounded_tc_disp : float
+        Unconstrained lag time in the user's ``time_unit``.
+    auto_min_tc_used : float or None
+        First lag on the computed grid that satisfies the lower-bound search
+        threshold, in the user's ``time_unit``.
+    """
+
+    selected_idx: int
+    selected_step: int
+    selected_tc_ps: float
+    selected_tc_disp: float
+    unbounded_idx: int
+    unbounded_step: int
+    unbounded_tc_disp: float
+    auto_min_tc_used: float | None
+
+
 def calc_q(n,m,a2_3D,s2_3D,msds_3D,a2full_3D,s2full_3D,ndim):
-    """ Q per segment (Eq. 22). Use best a2 and s2 estimates from 
-    full trajectory for cov and cinv. """
+    """Evaluate the segment quality factor ``Q`` from the GLS fit.
+
+    Parameters
+    ----------
+    n : int
+        Number of lag steps in the strided segment minus one.
+    m : int
+        Number of MSD values used in the GLS fit window.
+    a2_3D : float
+        Segment-level 3D offset estimate (sum across dimensions), in nm^2.
+    s2_3D : float
+        Segment-level 3D slope estimate (sum across dimensions), in nm^2.
+    msds_3D : ndarray of shape (m,)
+        Segment-level 3D MSD values used by the fit, in nm^2.
+    a2full_3D : float
+        Reference 3D offset used to construct the covariance matrix.
+    s2full_3D : float
+        Reference 3D slope used to construct the covariance matrix.
+    ndim : int
+        Number of spatial dimensions represented in the trajectory.
+
+    Returns
+    -------
+    float
+        Goodness-of-fit quality factor in the interval [0, 1].
+
+    Notes
+    -----
+    This follows Eq. 22 in Bullerjahn et al. (JCP 153, 024116, 2020).
+    """
 
     c = math_utils.setupc(m,n) # setups of cov matrix
     cov = math_utils.calc_cov(n,m,c,a2full_3D,s2full_3D)
@@ -46,6 +110,49 @@ def calc_q(n,m,a2_3D,s2_3D,msds_3D,a2full_3D,s2full_3D,ndim):
     return q
 
 def analyze_chunk_task(chunk_data, step, m, dt, nperseg, multi, ndim, d2max, nitmax, c2_pre, cm_pre, a2full_3D=0.0, s2full_3D=0.0):
+    """Process one worker chunk for a given lag step.
+
+    Parameters
+    ----------
+    chunk_data : list of ndarray
+        Segment trajectories assigned to this worker. Each array has shape
+        ``(n_frames_segment, ndim)`` in nm.
+    step : int
+        Lag stride in frame steps.
+    m : int
+        Number of MSD values used per lag step in the GLS fit.
+    dt : float
+        Timestep in ps used for user-facing diagnostics.
+    nperseg : int
+        Number of steps per segment before striding.
+    multi : bool
+        ``True`` for multi-trajectory mode where each input trajectory is one
+        segment/molecule, ``False`` for single-trajectory segmentation mode.
+    ndim : int
+        Number of spatial dimensions.
+    d2max : float
+        Convergence threshold for iterative GLS updates.
+    nitmax : int
+        Maximum number of GLS iterations.
+    c2_pre : ndarray or None
+        Optional precomputed covariance helper matrix for ``m=2``.
+    cm_pre : ndarray or None
+        Optional precomputed covariance helper matrix for ``m``.
+    a2full_3D : float, optional
+        Reference 3D offset used for ``Q`` evaluation in single-trajectory
+        mode.
+    s2full_3D : float, optional
+        Reference 3D slope used for ``Q`` evaluation in single-trajectory
+        mode.
+
+    Returns
+    -------
+    tuple[list[tuple[ndarray, ndarray, float, bool]] | None, Exception | None]
+        ``(results, error)`` where ``results`` contains one entry per segment:
+        ``(a2_per_dim, s2_per_dim, q_value, converged)``.  When a segment is
+        too short, ``results`` is ``None`` and ``error`` carries the
+        ``ValueError`` to propagate in the caller thread.
+    """
     results = []
     
     for s_idx, seg_z in enumerate(chunk_data):
@@ -75,8 +182,8 @@ def analyze_chunk_task(chunk_data, step, m, dt, nperseg, multi, ndim, d2max, nit
 
         # Analyze per dimension
         for d in range(ndim):
-            z_dim = z_analyzed[:, d]
-            msds[d] = math_utils.compute_MSD_1D_via_correlation(z_dim)[1:(m+1)]
+            z_dim = np.ascontiguousarray(z_analyzed[:, d])
+            msds[d] = math_utils.compute_MSD_1D_first_m(z_dim, m)
             
             # Check if pre-calculated matrices match current n
             use_c2 = c2_pre
@@ -98,28 +205,162 @@ def analyze_chunk_task(chunk_data, step, m, dt, nperseg, multi, ndim, d2max, nit
         
     return results, None
 
+
+def analyze_full_traj_task(full_z, step, m, dt, ndim, d2max, nitmax):
+    """Run the full-trajectory GLS fit for one lag step (single-trajectory mode).
+
+    Parameters
+    ----------
+    full_z : ndarray of shape (n_frames, ndim)
+        Complete trajectory array in nm.
+    step : int
+        Lag stride in frame steps.
+    m : int
+        Number of MSD values used in the GLS fit window.
+    dt : float
+        Timestep in ps (used only for error messages).
+    ndim : int
+        Number of spatial dimensions.
+    d2max : float
+        Convergence threshold for iterative GLS updates.
+    nitmax : int
+        Maximum number of GLS iterations.
+
+    Returns
+    -------
+    tuple[ndarray, ndarray, bool] | tuple[None, None, Exception]
+        ``(a2_per_dim, s2_per_dim, converged_all)`` on success, or
+        ``(None, None, exc)`` if the trajectory is too short.
+    """
+    z_strided_check = full_z[::step, 0]  # check length via first dim
+    if len(z_strided_check) <= m:
+        exc = ValueError(
+            f"Trajectory too short (length N={len(z_strided_check)}) to calculate "
+            f"m={m} MSD points at lag time step={step} (t={step * dt} ps). "
+            f"Please reduce tmax or m, or use a longer trajectory."
+        )
+        return None, None, exc
+
+    res_a2 = np.zeros(ndim)
+    res_s2 = np.zeros(ndim)
+    converged_all = True
+    for d in range(ndim):
+        z_dim = np.ascontiguousarray(full_z[:, d][::step])
+        n = len(z_dim) - 1
+        msd = math_utils.compute_MSD_1D_first_m(z_dim, m)
+        res_a2[d], res_s2[d], converged = math_utils.calc_gls(n, m, msd, d2max, nitmax)
+        if not converged:
+            converged_all = False
+    return res_a2, res_s2, converged_all
+
 class Dcov():
+    """Estimate diffusion coefficients from trajectories using GLS on MSD data.
+
+    The class supports two analysis modes:
+
+    1. Single-trajectory mode: one long trajectory is split into segments.
+    2. Multi-trajectory mode: each input trajectory/residue is a segment.
+
+    A typical workflow is:
+
+    1. Initialize :class:`Dcov` with trajectory input and fit configuration.
+    2. Call :meth:`run_Dfit` to perform GLS estimation across lag steps.
+    3. Call :meth:`analysis` to compute summary statistics and write outputs.
+    4. Optionally call :meth:`finite_size_correction` (3D, cubic box only).
+
+    Notes
+    -----
+    Internal diffusion units are nm^2/ps. Reported units are controlled through
+    ``diffusion_unit``.
     """
-    Diffusion coefficient estimator using GLS on mean-squared displacement.
-    
-    Parameters of interest:
-    - m (int): number of MSD points used per lag step (unitless). For a given lag step s,
-      the fit uses MSD values at times s*dt, 2*s*dt, ..., m*s*dt. Larger m widens the
-      lag-time window (m*s*dt) but requires longer segments and increases cost.
-    """
-    def __init__(self, fz: TrajectoryInput = None, universe=None, selection=None,
-                 m: int = 20, tmin: float | None = None, tmax: float = 100.0, dt: float = 1.0,
+    def __init__(self, fz: TrajectoryInput = None, universe=None, universes=None, selection=None,
+                 m: int = 20, tmin: float | None = None, tmax: float = 100.0, dt: float | None = None,
                  d2max: float = 1e-10, nitmax: int = 100,
                  nseg: int | None = None, imgfmt: str = 'pdf', fout: str = 'D_analysis',
                  n_jobs: int = -1, normalize_lengths: bool = False, time_unit: str = 'ps',
                  diffusion_unit: str = 'cm2/s', progress: bool = True):
+        """Initialize the diffusion estimator and validate analysis settings.
+
+        Parameters
+        ----------
+        fz : str or Path or sequence[str | Path] or None, optional
+            One trajectory file or multiple trajectory files in text format.
+            Each row is a frame and columns are coordinate dimensions in nm.
+            Provide exactly one trajectory source among ``fz``, ``universe``,
+            and ``universes``.
+        universe : MDAnalysis.Universe or MDAnalysis.AtomGroup, optional
+            MDAnalysis object used to extract per-residue trajectories.
+            Provide exactly one trajectory source among ``fz``, ``universe``,
+            and ``universes``.
+        universes : sequence[MDAnalysis.Universe | MDAnalysis.AtomGroup], optional
+            Multiple MDAnalysis objects to pool in one analysis. Inputs must
+            have matching frame count and timestep.
+        selection : str, optional
+            MDAnalysis selection string used only when ``universe`` is given as
+            a Universe. For ``universes``, the same selection is applied to
+            each Universe entry.
+        m : int, default=20
+            Number of MSD values used in each lag-time GLS fit window.
+        tmin : float or None, optional
+            Minimum lag time in ``time_unit``. If ``None``, defaults to one
+            frame step.
+        tmax : float, default=100.0
+            Maximum lag time in ``time_unit``.
+        dt : float or None, optional
+            Frame timestep in ``time_unit``. If ``None``, adopts the reader
+            timestep (1.0 ps for text files, trajectory timestep for
+            MDAnalysis).
+        d2max : float, default=1e-10
+            Convergence criterion for iterative GLS updates.
+        nitmax : int, default=100
+            Maximum number of GLS iterations.
+        nseg : int or None, optional
+            Number of segments for single-trajectory mode. If ``None``, uses an
+            automatic heuristic.
+        imgfmt : {'pdf', 'png'}, default='pdf'
+            Plot output format.
+        fout : str, default='D_analysis'
+            Output file prefix.
+        n_jobs : int, default=-1
+            Number of parallel workers. ``-1`` uses executor default, ``0``
+            forces serial execution.
+        normalize_lengths : bool, default=False
+            When multiple text trajectories have different lengths, truncate to
+            shortest length if ``True``.
+        time_unit : {'ps', 'ns'}, default='ps'
+            Time unit for user input/output values.
+        diffusion_unit : {'cm2/s', 'nm2/ps'}, default='cm2/s'
+            Unit used for reported diffusion coefficients.
+        progress : bool, default=True
+            If ``True``, show a progress bar over lag steps.
+
+        Raises
+        ------
+        ValueError
+            If input trajectories are invalid, too short, or parameter
+            combinations are infeasible.
+        TypeError
+            If an unsupported image format is requested.
+        """
 
         # Initialize Reader
-        self.reader: TrajectoryReader = get_reader(fz=fz, universe=universe, selection=selection, normalize_lengths=normalize_lengths)
+        self.reader: TrajectoryReader = get_reader(
+            fz=fz,
+            universe=universe,
+            universes=universes,
+            selection=selection,
+            normalize_lengths=normalize_lengths,
+        )
         
         # Use reader properties
         self.ndim = self.reader.ndim
         self.n = self.reader.n_frames - 1 # N is steps, n_frames is points
+
+        if self.reader.n_frames < 2:
+            raise ValueError(
+                f"Trajectory too short: {self.reader.n_frames} frame(s) (need >= 2). "
+                f"Provide a trajectory with at least 2 data points."
+            )
 
         if hasattr(self.reader, 'lengths'):
             unique_lengths = set(self.reader.lengths)
@@ -142,9 +383,16 @@ class Dcov():
         self.diff_scale = diff_map[diffusion_unit]  # scale from nm^2/ps to desired unit
         self.progress = progress
         
-        self.dt = dt * self.time_scale  # internal dt in ps
-        if not math.isclose(self.dt, self.reader.dt, rel_tol=1e-5):
-             warnings.warn(f"User provided dt ({dt} {self.time_unit}) differs from reader's dt ({self.reader.dt} ps). Using provided dt.", UserWarning)
+        if dt is None:
+            self.dt = self.reader.dt  # adopt reader's dt (already in ps)
+        else:
+            self.dt = dt * self.time_scale  # convert user-provided dt to ps
+            if not math.isclose(self.dt, self.reader.dt, rel_tol=1e-5):
+                warnings.warn(
+                    f"User provided dt ({dt} {self.time_unit} = {self.dt} ps) differs from "
+                    f"reader's dt ({self.reader.dt} ps). Using provided dt.",
+                    UserWarning,
+                )
 
         self.m = m
         
@@ -217,6 +465,12 @@ class Dcov():
         if self.m > self.nperseg:
             self.m = self.nperseg
 
+        if self.m < 2:
+            raise ValueError(
+                f"m={self.m} after clamping to segment length ({self.nperseg}); "
+                f"m must be >= 2. Use a longer trajectory or reduce nseg/tmax."
+            )
+
         # In multi-traj mode, ensure tmax is feasible given segment length and m
         if self.multi:
             max_tmax_steps = max(1, self.nperseg // self.m)
@@ -243,7 +497,11 @@ class Dcov():
         self.s2var = np.zeros((self.tmax-self.tmin+1))
         self.q = np.zeros((self.tmax-self.tmin+1, self.nseg))
 
-        # Results
+        # Lifecycle flags
+        self._fitted = False
+        self._analyzed = False
+
+        # Results (populated by run_Dfit / analysis)
         self.Dseg = None
         self.Dstd = None
         self.Dsem_pred = None
@@ -255,14 +513,56 @@ class Dcov():
         self.q_std = None
         self.tc_selected = None  # selected tc in chosen time unit
         self.tc_selected_idx = None  # index into lag arrays
+        self.tc_auto_unbounded = None  # unconstrained auto tc in chosen time unit
+        self.tc_auto_unbounded_idx = None  # index into lag arrays for unconstrained auto tc
+        self.auto_min_tc_used = None  # applied lower bound on the lag grid in chosen time unit
 
     @staticmethod
     def load(filename: str) -> 'Dcov':
-        """Load a saved Dcov state from a pickle file."""
+        """Load a serialized :class:`Dcov` instance from a pickle file.
+
+        Parameters
+        ----------
+        filename : str
+            Path to a ``.pkl`` file previously produced by
+            :meth:`run_Dfit(save_model=True)`.
+
+        Returns
+        -------
+        Dcov
+            Deserialized estimator object.
+        """
         with open(filename, 'rb') as f:
-            return pickle.load(f)
+            obj = pickle.load(f)
+            
+        # A loaded model is assumed to have been fitted. This also ensures
+        # backward compatibility with older pickle files that lack this flag.
+        obj._fitted = True
+        obj.tc_auto_unbounded = getattr(obj, 'tc_auto_unbounded', None)
+        obj.tc_auto_unbounded_idx = getattr(obj, 'tc_auto_unbounded_idx', None)
+        obj.auto_min_tc_used = getattr(obj, 'auto_min_tc_used', None)
+        return obj
 
     def _timestep_index(self, tc: float) -> int:
+        """Convert an analysis lag time to the internal lag-index position.
+
+        Parameters
+        ----------
+        tc : float
+            Lag time in ``time_unit``.
+
+        Returns
+        -------
+        int
+            Zero-based index into arrays stored on the lag-time grid
+            ``tmin..tmax``.
+
+        Raises
+        ------
+        ValueError
+            If ``tc`` is not a multiple of ``dt`` or lies outside the computed
+            lag-time range.
+        """
         steps = (tc * self.time_scale) / self.dt
         steps_int = round(steps)
         if not math.isclose(steps, steps_int, rel_tol=1e-9, abs_tol=1e-12):
@@ -272,35 +572,136 @@ class Dcov():
             raise ValueError(f'tc [{tc}] is outside the computed timestep range')
         return itc
 
-    def run_Dfit(self, save_model: bool = False):
-        """ Main Function to calculate the stepsize sigma^2 and offset a^2. """
-        
-        # Pre-load data if it fits in memory or iterate?
-        # The original code loaded everything. 
-        # Our reader yields full trajectories.
-        # To avoid re-reading for every 'step' in the outer loop, we should probably load it once
-        # IF we can afford it.
-        # The outer loop iterates over 'step' (lag time).
-        # We need the full trajectory for every lag time calculation?
-        # Actually, the original code sliced: z[::step].
-        
-        # Optimization: Read all data into a list of arrays once.
-        # If memory is an issue, we would need to re-read from disk/MDA every time, which is slow.
-        # Let's assume we load it.
-        
-        all_trajs = list(self.reader) # List of (N_frames, ndim) arrays
+    def _ceil_timestep_index(self, tc: float) -> int:
+        """Map a lower-bound lag time to the first available grid index.
 
-        # Warm up numba-compiled kernels once to avoid a slow first step
+        Parameters
+        ----------
+        tc : float
+            Lower-bound lag time in ``time_unit``.
+
+        Returns
+        -------
+        int
+            Zero-based index of the first computed lag that is greater than or
+            equal to ``tc``.
+
+        Raises
+        ------
+        ValueError
+            If the requested lower bound exceeds the computed lag grid.
+        """
+        steps = (tc * self.time_scale) / self.dt
+        steps_int = math.ceil(steps - 1e-12)
+        step = max(int(steps_int), self.tmin)
+        itc = step - self.tmin
+        if itc < 0 or itc >= (self.tmax - self.tmin + 1):
+            raise ValueError(
+                f"auto_min_tc [{tc}] exceeds the computed lag-time range up to "
+                f"{self.tmax * self.dt / self.time_scale:.4g} {self.time_unit}"
+            )
+        return itc
+
+    def _select_auto_tc(self, auto_min_tc: float | None = None) -> AutoTcSelection:
+        """Select the lag time for ``analysis(tc="auto")``.
+
+        Parameters
+        ----------
+        auto_min_tc : float or None, optional
+            Optional lower bound in ``time_unit``. When provided, the auto
+            search starts from the first lag on the computed grid that is
+            greater than or equal to this value.
+
+        Returns
+        -------
+        AutoTcSelection
+            Resolved auto-selection metadata, including the unconstrained
+            choice and the final bounded choice.
+        """
+        diff = np.abs(self.q_m - 0.5)
+        unbounded_idx = int(np.argmin(diff))
+        selected_idx = unbounded_idx
+        auto_min_tc_used = None
+
+        if auto_min_tc is not None:
+            min_idx = self._ceil_timestep_index(auto_min_tc)
+            selected_idx = min_idx + int(np.argmin(diff[min_idx:]))
+            min_step = self.tmin + min_idx
+            auto_min_tc_used = (min_step * self.dt) / self.time_scale
+
+        selected_step = self.tmin + selected_idx
+        selected_tc_ps = selected_step * self.dt
+        selected_tc_disp = selected_tc_ps / self.time_scale
+
+        unbounded_step = self.tmin + unbounded_idx
+        unbounded_tc_disp = (unbounded_step * self.dt) / self.time_scale
+
+        return AutoTcSelection(
+            selected_idx=selected_idx,
+            selected_step=selected_step,
+            selected_tc_ps=selected_tc_ps,
+            selected_tc_disp=selected_tc_disp,
+            unbounded_idx=unbounded_idx,
+            unbounded_step=unbounded_step,
+            unbounded_tc_disp=unbounded_tc_disp,
+            auto_min_tc_used=auto_min_tc_used,
+        )
+
+    def run_Dfit(self, save_model: bool = False):
+        """Run GLS fitting over all configured lag steps and segments.
+
+        Parameters
+        ----------
+        save_model : bool, default=False
+            If ``True``, serialize the current estimator to ``{fout}.pkl``
+            after fitting.
+
+        Returns
+        -------
+        None
+            This method updates instance attributes in place.
+
+        Raises
+        ------
+        ValueError
+            If the trajectory is too short for the requested ``m`` and lag
+            range at runtime.
+
+        Notes
+        -----
+        Side effects include:
+
+        - Populating fit arrays (``a2``, ``s2``, ``q``, ``s2var``).
+        - Updating convergence diagnostics (``non_converged_count``,
+          ``percent_failed``).
+        - Setting lifecycle flag ``_fitted=True``.
+        - Optionally writing ``{fout}.pkl``.
+
+        The implementation submits all independent ``(lag_step, segment_chunk)``
+        combinations to the thread pool at once, so the pool can saturate all
+        available workers across the full lag-time range rather than being
+        limited to the number of segments per step.  In single-trajectory mode
+        a two-phase approach is used: full-trajectory fits (one per lag step)
+        are collected first because their results are needed as the Q-factor
+        reference for the segment fits.
+        """
+        all_trajs = list(self.reader)  # load once; shape (n_trajs, n_frames, ndim)
+
+        # Prevent BLAS/LAPACK from spawning internal threads that would
+        # oversubscribe cores when combined with our thread pool.
+        for env_var in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS'):
+            os.environ.setdefault(env_var, '1')
+
+        # Warm up numba-compiled kernels to avoid recompilation under the
+        # global compilation lock during threaded execution.  We compile
+        # for C-contiguous arrays (matching np.ascontiguousarray output).
         try:
             dummy = np.zeros(8)
-            _ = math_utils.compute_MSD_1D_via_correlation(dummy)
+            _ = math_utils.compute_MSD_1D_first_m(dummy, 3)
             _ = math_utils.calc_gls(5, 3, np.arange(3, dtype=np.float64), self.d2max, 2,
-                                   c2=math_utils.setupc(2, 5), cm=math_utils.setupc(3, 5))
+                                    c2=math_utils.setupc(2, 5), cm=math_utils.setupc(3, 5))
         except Exception:
-            # If warm-up fails for any reason, continue; main computation will trigger JIT anyway.
             pass
-        
-        non_converged_count = 0
 
         # Determine worker count (treat n_jobs=0 as serial)
         if self.n_jobs is None or self.n_jobs < 0:
@@ -310,114 +711,131 @@ class Dcov():
         else:
             max_workers = self.n_jobs
 
-        # Use threads to avoid pickling large trajectory chunks; numba kernels release the GIL
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            
-            step_iter = range(self.tmin, self.tmax+1)
-            if self.progress:
-                step_iter = tqdm(step_iter, total=self.tmax-self.tmin+1, desc="lag steps")
-            for t, step in enumerate(step_iter):
-                    
-                    # 1. Full Trajectory Analysis (Only for Single Trajectory mode)
-                    if not self.multi:
-                        # In single mode, all_trajs has 1 element
-                        full_z = all_trajs[0]
-                        converged_all_dims = True
-                        for d in range(self.ndim):
-                            z_dim = full_z[:, d]
-                            z_strided = z_dim[::step]
-                            if len(z_strided) <= self.m:
-                                 raise ValueError(f"Trajectory too short (length N={len(z_strided)}) to calculate m={self.m} MSD points at lag time step={step} (t={step*self.dt} ps). Please reduce tmax or m, or use a longer trajectory.")
-                            n = len(z_strided) - 1
-                            msd = math_utils.compute_MSD_1D_via_correlation(z_strided)[1:(self.m+1)]
-                            self.a2full[t,d], self.s2full[t,d], converged = math_utils.calc_gls(n, self.m, msd, self.d2max, self.nitmax)
-                            if not converged: converged_all_dims = False
-                        
-                        if not converged_all_dims: non_converged_count += 1
-                        
-                        a2full_3D = np.sum(self.a2full[t])
-                        s2full_3D = np.sum(self.s2full[t])
-                    
-                    # 2. Segment Analysis
-                    n_per_seg_step = int(self.nperseg / step)
-                    
-                    # Pre-calculate covariance matrices for this step
-                    c2_pre = None
-                    if n_per_seg_step >= 2:
-                        c2_pre = math_utils.setupc(2, n_per_seg_step)
-                    
-                    cm_pre = None
-                    if n_per_seg_step >= self.m:
-                        cm_pre = math_utils.setupc(self.m, n_per_seg_step)
-                    
-                    # Prepare chunks (coarser to reduce overhead)
-                    n_workers_count = max_workers if max_workers else (os.cpu_count() or 1)
-                    chunk_size = max(1, math.ceil(self.nseg / n_workers_count))
-                    
-                    # Prepare full trajectory values if single mode
-                    a2full_3D_val = 0.0
-                    s2full_3D_val = 0.0
-                    if not self.multi:
-                        a2full_3D_val = np.sum(self.a2full[t])
-                        s2full_3D_val = np.sum(self.s2full[t])
-                    
-                    future_to_range = {}
-                    for s_start in range(0, self.nseg, chunk_size):
-                        s_end = min(s_start + chunk_size, self.nseg)
-                        
-                        chunk_data = []
-                        if self.multi:
-                            chunk_data = all_trajs[s_start:s_end]
-                        else:
-                            # Slice the single trajectory
-                            full_z = all_trajs[0]
-                            for s in range(s_start, s_end):
-                                zstart = s * (self.nperseg + 1)
-                                zend = (s + 1) * (self.nperseg + 1)
-                                chunk_data.append(full_z[zstart:zend])
-                                
-                        fut = executor.submit(analyze_chunk_task, chunk_data, step, self.m, self.dt, self.nperseg, self.multi, self.ndim, self.d2max, self.nitmax, c2_pre, cm_pre, a2full_3D_val, s2full_3D_val)
-                        future_to_range[fut] = (s_start, s_end)
-                    
-                    for future in concurrent.futures.as_completed(future_to_range):
-                        s_start, s_end = future_to_range[future]
-                        try:
-                            chunk_results, error = future.result()
-                            if error:
-                                raise error
-                            
-                            for i, (res_a2, res_s2, q_val, res_converged) in enumerate(chunk_results):
-                                s = s_start + i
-                                self.a2[t,s] = res_a2
-                                self.s2[t,s] = res_s2
-                                self.q[t,s] = q_val
-                                if not res_converged: non_converged_count += 1
-                        except Exception as exc:
-                            raise exc
+        n_lag_steps = self.tmax - self.tmin + 1
+        non_converged_count = 0
 
-                    # 3. Averaging
-                    a2m = np.mean(self.a2[t], axis=0)
-                    s2m = np.mean(self.s2[t], axis=0)
-                    
-                    self.s2var[t] = math_utils.eval_vars(n_per_seg_step, self.m, a2m, s2m, self.ndim)
-                    
-                    # Normalize by step
-                    self.a2[t] /= step
-                    self.s2[t] /= step
-                    self.s2var[t] /= step**2
-                    if not self.multi:
-                        self.a2full[t] /= step
-                        self.s2full[t] /= step
-                    
-                    # tqdm auto-updates via iteration; no manual update needed
-        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+
+            # ------------------------------------------------------------------
+            # Phase 1 (single-trajectory mode only):
+            # Run the full-trajectory GLS fits for every lag step in parallel.
+            # Results populate self.a2full / self.s2full and are later used as
+            # the Q-factor reference in the segment fits.
+            # ------------------------------------------------------------------
+            if not self.multi:
+                full_z = all_trajs[0]
+                full_futures: dict[concurrent.futures.Future, int] = {
+                    executor.submit(
+                        analyze_full_traj_task,
+                        full_z, step, self.m, self.dt, self.ndim, self.d2max, self.nitmax
+                    ): t
+                    for t, step in enumerate(range(self.tmin, self.tmax + 1))
+                }
+
+                full_iter = concurrent.futures.as_completed(full_futures)
+                if self.progress:
+                    full_iter = tqdm(full_iter, total=n_lag_steps, desc="full-traj fits")
+
+                for fut in full_iter:
+                    t = full_futures[fut]
+                    res_a2, res_s2, conv_or_exc = fut.result()
+                    if isinstance(conv_or_exc, Exception):
+                        raise conv_or_exc
+                    self.a2full[t] = res_a2
+                    self.s2full[t] = res_s2
+                    if not conv_or_exc:
+                        non_converged_count += 1
+
+            # ------------------------------------------------------------------
+            # Phase 2: Segment fits — one future per (lag_step, chunk).
+            # Each lag step's segments are split across workers so the
+            # heaviest steps (step ≈ 1, largest per-segment work) are
+            # shared.  The Numba-JIT'd compute in each chunk releases the
+            # GIL, giving true thread-level parallelism.
+            # ------------------------------------------------------------------
+            n_workers_eff = max_workers if max_workers else (os.cpu_count() or 1)
+            chunk_size = max(1, math.ceil(self.nseg / n_workers_eff))
+
+            # future -> (t, step, s_start, s_end)
+            seg_futures: dict[concurrent.futures.Future, tuple[int, int, int, int]] = {}
+
+            for t, step in enumerate(range(self.tmin, self.tmax + 1)):
+                n_per_seg_step = int(self.nperseg / step)
+
+                c2_pre = math_utils.setupc(2, n_per_seg_step) if n_per_seg_step >= 2 else None
+                cm_pre = math_utils.setupc(self.m, n_per_seg_step) if n_per_seg_step >= self.m else None
+
+                a2full_3D_val = float(np.sum(self.a2full[t])) if not self.multi else 0.0
+                s2full_3D_val = float(np.sum(self.s2full[t])) if not self.multi else 0.0
+
+                for s_start in range(0, self.nseg, chunk_size):
+                    s_end = min(s_start + chunk_size, self.nseg)
+
+                    if self.multi:
+                        chunk_data = all_trajs[s_start:s_end]
+                    else:
+                        full_z = all_trajs[0]
+                        chunk_data = [
+                            full_z[s * (self.nperseg + 1):(s + 1) * (self.nperseg + 1)]
+                            for s in range(s_start, s_end)
+                        ]
+
+                    fut = executor.submit(
+                        analyze_chunk_task,
+                        chunk_data, step, self.m, self.dt, self.nperseg,
+                        self.multi, self.ndim, self.d2max, self.nitmax,
+                        c2_pre, cm_pre, a2full_3D_val, s2full_3D_val
+                    )
+                    seg_futures[fut] = (t, step, s_start, s_end)
+
+            seg_iter = concurrent.futures.as_completed(seg_futures)
+            if self.progress:
+                seg_iter = tqdm(seg_iter, total=len(seg_futures), desc="segment fits")
+
+            for fut in seg_iter:
+                t, step, s_start, s_end = seg_futures[fut]
+                chunk_results, error = fut.result()
+                if error:
+                    raise error
+                for i, (res_a2, res_s2, q_val, res_converged) in enumerate(chunk_results):
+                    s = s_start + i
+                    self.a2[t, s] = res_a2
+                    self.s2[t, s] = res_s2
+                    self.q[t, s] = q_val
+                    if not res_converged:
+                        non_converged_count += 1
+
+        # ------------------------------------------------------------------
+        # Post-processing (serial): variance estimation and step normalisation.
+        # These depend on the full a2[t] / s2[t] arrays being populated, so
+        # they cannot be overlapped with the futures.
+        # ------------------------------------------------------------------
+        for t, step in enumerate(range(self.tmin, self.tmax + 1)):
+            n_per_seg_step = int(self.nperseg / step)
+            a2m = np.mean(self.a2[t], axis=0)
+            s2m = np.mean(self.s2[t], axis=0)
+            self.s2var[t] = math_utils.eval_vars(n_per_seg_step, self.m, a2m, s2m, self.ndim)
+
+            self.a2[t] /= step
+            self.s2[t] /= step
+            self.s2var[t] /= step ** 2
+            if not self.multi:
+                self.a2full[t] /= step
+                self.s2full[t] /= step
+
         self.non_converged_count = non_converged_count
-        self.total_cases = (self.tmax - self.tmin + 1) * (self.nseg + (1 if not self.multi else 0))
+        self.total_cases = n_lag_steps * (self.nseg + (1 if not self.multi else 0))
         self.percent_failed = 0.0
-        
+
         if non_converged_count > 0:
             self.percent_failed = (non_converged_count / self.total_cases) * 100
-            print(f"WARNING: Optimizer did not converge in {non_converged_count} cases ({self.percent_failed:.1f}% of Total {self.total_cases}). Falling back to M=2 for those cases.")
+            print(
+                f"WARNING: Optimizer did not converge in {non_converged_count} cases "
+                f"({self.percent_failed:.1f}% of Total {self.total_cases}). "
+                f"Falling back to M=2 for those cases."
+            )
+
+        self._fitted = True
 
         if save_model:
             with open(f'{self.fout}.pkl', 'wb') as f:
@@ -425,8 +843,51 @@ class Dcov():
                 print(f"Model saved to {self.fout}.pkl")
 
     # Output and plotting
-    def analysis(self, tc: float | str = 10, fout_prefix: str | None = None):
-        # Calculate statistics first
+    def analysis(self, tc: float | str = 10, fout_prefix: str | None = None,
+                 auto_min_tc: float | None = None):
+        """Compute diffusion coefficient statistics and write output files.
+
+        Parameters
+        ----------
+        tc : float or 'auto'
+            Lag time for the diffusion estimate (in ``time_unit``). Must be a
+            multiple of dt.  Pass ``'auto'`` to select the lag where Q ≈ 0.5.
+        fout_prefix : str, optional
+            Custom base name for output files.  Default: ``{fout}.tc_{tc}``.
+        auto_min_tc : float or None, optional
+            Lower bound for ``tc='auto'`` in ``time_unit``. The auto search is
+            restricted to the first lag on the computed grid that is greater
+            than or equal to this value and all larger lags.
+
+        Returns
+        -------
+        None
+            This method updates analysis attributes in place.
+
+        Raises
+        ------
+        RuntimeError
+            If called before :meth:`run_Dfit`.
+        ValueError
+            If ``tc`` is invalid for the computed lag-time grid, if
+            ``auto_min_tc`` exceeds the computed lag range, or if
+            ``auto_min_tc`` is provided together with a numeric ``tc``.
+
+        Notes
+        -----
+        Side effects include:
+
+        - Populating summary attributes (``D``, ``Dstd``, ``Dempstd``,
+          ``Dsem_pred``, ``Dsem_emp``, ``q_m``, ``q_std``).
+        - Recording selected lag time in ``tc_selected`` and
+          ``tc_selected_idx``.
+        - Writing ``.dat`` and plot output files.
+        - Setting lifecycle flag ``_analyzed=True``.
+        """
+        if not self._fitted:
+            raise RuntimeError("Call run_Dfit() before analysis().")
+
+        # Calculate statistics
         Dseg = self.s2.sum(axis=2) # across dims
         self.Dseg = np.mean(Dseg, axis=1) / (2.*self.ndim*self.dt) # mean across segs, nm^2 / (dt * ps)
 
@@ -463,24 +924,38 @@ class Dcov():
         Dsem_emp_out = self.Dsem_emp * self.diff_scale
         Dperdim_out = self.Dperdim * self.diff_scale
 
+        self.tc_auto_unbounded = None
+        self.tc_auto_unbounded_idx = None
+        self.auto_min_tc_used = None
+
         if tc == 'auto':
-            # Find index where q_m is closest to 0.5
-            # self.q_m is array of shape (tmax-tmin+1,)
-            # We want to minimize abs(q_m - 0.5)
-            # Note: q_m indices correspond to steps tmin...tmax
-            
-            diff = np.abs(self.q_m - 0.5)
-            idx_min = np.argmin(diff)
-            itc = idx_min
-            
-            # Calculate actual tc value for reporting
-            # itc is 0-indexed relative to self.tmin
-            step = self.tmin + itc
-            tc_ps = step * self.dt  # ps
-            tc_disp = tc_ps / self.time_scale  # user unit
-            
-            print(f"Automatically selected tc = {tc_disp:.4g} {self.time_unit} (Q = {self.q_m[itc]:.4f})")
+            auto_selection = self._select_auto_tc(auto_min_tc=auto_min_tc)
+            itc = auto_selection.selected_idx
+            step = auto_selection.selected_step
+            tc_ps = auto_selection.selected_tc_ps
+            tc_disp = auto_selection.selected_tc_disp
+
+            self.tc_auto_unbounded_idx = auto_selection.unbounded_idx
+            self.tc_auto_unbounded = auto_selection.unbounded_tc_disp
+            self.auto_min_tc_used = auto_selection.auto_min_tc_used
+
+            if (
+                auto_min_tc is not None
+                and auto_selection.selected_idx != auto_selection.unbounded_idx
+            ):
+                print(
+                    f"Plain auto tc = {auto_selection.unbounded_tc_disp:.4g} {self.time_unit} "
+                    f"(Q = {self.q_m[auto_selection.unbounded_idx]:.4f}); "
+                    f"bounded auto tc = {tc_disp:.4g} {self.time_unit} "
+                    f"for auto_min_tc >= {auto_min_tc:.4g} {self.time_unit} "
+                    f"(applied from {self.auto_min_tc_used:.4g} {self.time_unit}, "
+                    f"Q = {self.q_m[itc]:.4f})"
+                )
+            else:
+                print(f"Automatically selected tc = {tc_disp:.4g} {self.time_unit} (Q = {self.q_m[itc]:.4f})")
         else:
+            if auto_min_tc is not None:
+                raise ValueError("auto_min_tc can only be used when tc='auto'")
             itc = self._timestep_index(tc)
             step = self.tmin + itc
             tc_ps = step * self.dt  # ps
@@ -520,6 +995,18 @@ class Dcov():
             if hasattr(self, 'non_converged_count'):
                  g.write(f"Optimizer convergence failures: {self.non_converged_count} ({self.percent_failed:.1f}% of {self.total_cases})\n")
 
+            if tc == 'auto':
+                g.write("AUTO TC SELECTION:\n")
+                g.write(f"Selected auto tc: {tc_disp:.4g} {self.time_unit} (Q = {self.q_m[itc]:.4f})\n")
+                if auto_min_tc is not None:
+                    g.write(f"Requested auto_min_tc: {auto_min_tc:.4g} {self.time_unit}\n")
+                    g.write(f"Applied auto_min_tc on lag grid: {self.auto_min_tc_used:.4g} {self.time_unit}\n")
+                    if self.tc_auto_unbounded_idx != self.tc_selected_idx:
+                        g.write(
+                            f"Plain auto tc without lower bound: {self.tc_auto_unbounded:.4g} {self.time_unit} "
+                            f"(Q = {self.q_m[self.tc_auto_unbounded_idx]:.4f})\n"
+                        )
+
             # Summary at chosen tc
             g.write(f"Your chosen diffusion coefficient at {tc_disp} {self.time_unit}: {D_out[itc]:.4e} {self.diffusion_unit}\n")
             g.write(f"Standard deviation at {tc_disp} {self.time_unit}: {Dstd_out[itc]:.4e} {self.diffusion_unit}\n")
@@ -539,88 +1026,76 @@ class Dcov():
                 for step, Dt in zip(range(self.tmin, self.tmax+1), self.Dperdim):
                     g.write(f"{(step*self.dt)/self.time_scale:.4f} {Dperdim_out[step-self.tmin]}\n")
         
+        self._analyzed = True
         self.plot_results(tc_ps, out_base)
 
     def plot_results(self, tc, out_base):
-        sns.set_context("paper", font_scale=0.5)
-        fig = plt.figure(figsize=(6,7.5))
-        gs = fig.add_gridspec(3, 1, height_ratios=(3.0, 2.0, 2.0))
-        ax0 = fig.add_subplot(gs[0, 0])
-        ax1 = fig.add_subplot(gs[1, 0], sharex=ax0)
-        ax2 = fig.add_subplot(gs[2, 0])
-        xs = np.arange(self.tmin*self.dt,(self.tmax+1)*self.dt,self.dt) / self.time_scale
-        D_out = self.D * self.diff_scale
-        Dstd_out = self.Dstd * self.diff_scale
-        Dempstd_out = self.Dempstd * self.diff_scale
+        """Create the analysis figure for the selected lag time.
 
-        ax0.plot(xs, D_out, color='C0', linewidth=1.0, label=r'$D$')
-        ax0.plot(xs, D_out - Dstd_out, color='black', linestyle='dotted', linewidth=0.7, label=r'$\delta \overline{D}^\mathrm{predicted}$')
-        ax0.plot(xs, D_out + Dstd_out, color='black', linestyle='dotted', linewidth=0.7)
-        ax0.fill_between(xs, D_out - Dempstd_out, D_out + Dempstd_out,
-                         color='C0', alpha=0.5, edgecolor='none', linewidth=0,
-                         label=r'$\delta \overline{D}^\mathrm{empirical}$')
-        ax0.axvline(tc / self.time_scale, color='tab:red', linestyle='dashed')
-        ax0.set(ylabel=fr'$D(t)$ [{self.diffusion_unit}]')
-        ax0.set(xlim=(self.tmin * self.dt / self.time_scale, self.tmax * self.dt / self.time_scale))
-        ax0.ticklabel_format(style='scientific', scilimits=(-3, 4))
-        ax0.legend(ncol=2)
-        ax0.set_title(f"MSD window per lag: t .. {self.m}×t [{self.time_unit}]")
+        Parameters
+        ----------
+        tc : float
+            Selected lag time in ps used to draw the vertical marker.
+        out_base : str
+            Output path prefix used by the plotting backend.
 
-        ax1.plot(xs, self.q_m, color='C0')
-        ax1.fill_between(xs, self.q_m - self.q_std, self.q_m + self.q_std,
-                         color='C0', alpha=0.5, edgecolor='none', linewidth=0)
-        ax1.axhline(0.5, linestyle='dashed', color='gray', linewidth=1.2)
-        ax1.axvline(tc / self.time_scale, color='tab:red', linestyle='dashed')
-        ax1.set(ylabel=r'$Q(t)$')
-        ax1.set(xlabel=fr'lag time $t$ [{self.time_unit}]')
-        ax1.set(ylim=(0, 1))
+        Returns
+        -------
+        None
+            Writes the image file to disk.
 
-        # Distribution of per-segment/molecule estimates at the selected tc
-        itc = getattr(self, 'tc_selected_idx', None)
-        if itc is None:
-            step = int(round(tc / self.dt))
-            itc = step - self.tmin
+        Notes
+        -----
+        This is a thin wrapper around :func:`plot_diffusion_results`.
+        """
+        tc_auto_unbounded_ps = None
+        if self.tc_auto_unbounded is not None:
+            tc_auto_unbounded_ps = self.tc_auto_unbounded * self.time_scale
 
-        if 0 <= itc < len(self.D) and self.nseg > 0:
-            D_seg_tc = self.s2[itc].sum(axis=1) / (2.0 * self.ndim * self.dt) * self.diff_scale
-            violin_kwargs = dict(positions=[0], showmeans=False, showextrema=False, showmedians=False)
-            try:
-                parts = ax2.violinplot([D_seg_tc], orientation='horizontal', **violin_kwargs)
-            except TypeError:
-                parts = ax2.violinplot([D_seg_tc], vert=False, **violin_kwargs)
-            for body in parts.get('bodies', []):
-                body.set_facecolor('C0')
-                body.set_alpha(0.5)
-                body.set_edgecolor('none')
-                body.set_linewidth(0.0)
+        plot_diffusion_results(
+            D=self.D, Dstd=self.Dstd, Dempstd=self.Dempstd,
+            q_m=self.q_m, q_std=self.q_std, s2=self.s2,
+            tmin=self.tmin, tmax=self.tmax, dt=self.dt,
+            m=self.m, ndim=self.ndim, nseg=self.nseg,
+            time_scale=self.time_scale, time_unit=self.time_unit,
+            diff_scale=self.diff_scale, diffusion_unit=self.diffusion_unit,
+            tc=tc, tc_auto_unbounded=tc_auto_unbounded_ps, tc_selected_idx=self.tc_selected_idx,
+            out_base=out_base, imgfmt=self.imgfmt,
+        )
 
-            d_mean = float(np.mean(D_seg_tc))
-            d_median = float(np.median(D_seg_tc))
-            q05, q25, q75, q95 = np.percentile(D_seg_tc, [5, 25, 75, 95])
-
-            ax2.axvline(D_out[itc], color='black', linestyle='solid', linewidth=1.2, label=r'$D(t_c)$ (estimate)')
-            ax2.axvline(d_mean, color='C0', linestyle='dashed', linewidth=1.2, label=r'mean($D_i$)')
-            ax2.axvline(d_median, color='C0', linestyle='solid', linewidth=1.2, label=r'median($D_i$)')
-            ax2.plot(D_seg_tc, np.zeros_like(D_seg_tc), '|', color='C0', alpha=0.3, markersize=10)
-            ax2.axvspan(q25, q75, color='C0', alpha=0.12, label='25–75%')
-            ax2.axvspan(q05, q95, color='C0', alpha=0.05, label='5–95%')
-
-            # Cosmetic: y-axis has no physical meaning here; violin width encodes density.
-            ax2.set(yticks=[], ylabel='Density of $D_i$')
-            ax2.set_ylim(-0.6, 0.6)
-            ax2.ticklabel_format(style='scientific', scilimits=(-3, 4))
-            ax2.set(xlabel=fr'$D$ [{self.diffusion_unit}]')
-            ax2.set_title(f"Per-segment $D$ at $t_c={tc / self.time_scale:.4g}$ {self.time_unit} (n={self.nseg})")
-            ax2.legend(loc='best')
-        else:
-            ax2.axis('off')
-
-        fig.tight_layout(h_pad=0.2)
-        fig.savefig(f'{out_base}.{self.imgfmt}',dpi=300)
-        plt.close(fig)
 
     def finite_size_correction(self, T=300, eta=None, L=None, boxtype='cubic', tc=10):
-        """ T in Kelvin, eta in Pa*s, L in nm"""
+        """Apply finite-size correction to the diffusion coefficient.
+
+        Parameters
+        ----------
+        T : float
+            Temperature in Kelvin.
+        eta : float
+            Viscosity in Pa·s.
+        L : float
+            Edge length of cubic simulation box in nm.
+        boxtype : str
+            Box geometry (only ``'cubic'`` supported).
+        tc : float
+            Lag time from the analysis step (in ``time_unit``).
+
+        Returns
+        -------
+        None
+            Stores the corrected diffusion series in ``self.Dcor`` and prints
+            the selected corrected value.
+
+        Raises
+        ------
+        RuntimeError
+            If called before :meth:`analysis`.
+        ValueError
+            If dimensionality/box type is unsupported or required parameters
+            are missing.
+        """
+        if not self._analyzed:
+            raise RuntimeError("Call analysis() before finite_size_correction().")
         itc = self._timestep_index(tc)
         if self.ndim != 3:
             raise ValueError("Currently only 3D correction implemented")
@@ -629,8 +1104,174 @@ class Dcov():
         if eta is None:
             raise ValueError("Required parameter missing: eta, viscosity eta")
         if boxtype != 'cubic':
-            raise ValueError("Sorry, correction only implemented for cubic simulation boxes")
+            raise ValueError("Correction only implemented for cubic simulation boxes")
 
         kbT = T * BOLTZMANN_K # J
         self.Dcor = self.D + kbT * XI_CUBIC * 1e15 / (6. * np.pi * eta * L) # nm^2 / ps
-        print(f"Finite-size corrected diffusion coefficient D_t for timestep {tc} ps: {self.Dcor[itc]:.4g} nm^2/ps with standard dev. {self.Dstd[itc]:.4g} nm^2/ps")
+        Dcor_out = self.Dcor[itc] * self.diff_scale
+        Dstd_out = self.Dstd[itc] * self.diff_scale
+        tc_disp = (self.tmin + itc) * self.dt / self.time_scale
+        print(f"Finite-size corrected D at tc={tc_disp:.4g} {self.time_unit}: "
+              f"{Dcor_out:.4e} {self.diffusion_unit} ± {Dstd_out:.4e} {self.diffusion_unit}")
+
+
+def plot_diffusion_results(*, D, Dstd, Dempstd, q_m, q_std, s2,
+                           tmin, tmax, dt, m, ndim, nseg,
+                           time_scale, time_unit, diff_scale, diffusion_unit,
+                           tc, tc_auto_unbounded, tc_selected_idx, out_base, imgfmt):
+    """Create the three-panel diffusion analysis plot.
+
+    Parameters
+    ----------
+    D : ndarray
+        Diffusion coefficient series in internal units (nm^2/ps).
+    Dstd : ndarray
+        Predicted standard deviation of ``D`` in internal units.
+    Dempstd : ndarray
+        Empirical standard deviation of ``D`` in internal units.
+    q_m : ndarray
+        Mean quality factor per lag time.
+    q_std : ndarray
+        Standard deviation of quality factor per lag time.
+    s2 : ndarray
+        Segment-wise slope values with shape ``(n_lag, nseg, ndim)``.
+    tmin : int
+        Minimum lag step index included in the analysis grid.
+    tmax : int
+        Maximum lag step index included in the analysis grid.
+    dt : float
+        Internal timestep in ps.
+    m : int
+        Number of MSD points used per lag step.
+    ndim : int
+        Number of spatial dimensions.
+    nseg : int
+        Number of segments/molecules analyzed.
+    time_scale : float
+        Conversion factor from ``time_unit`` to ps.
+    time_unit : str
+        Display unit label for time axes.
+    diff_scale : float
+        Scale factor from nm^2/ps to requested output diffusion unit.
+    diffusion_unit : str
+        Display unit label for diffusion axes.
+    tc : float
+        Selected lag time in ps.
+    tc_auto_unbounded : float or None
+        Unconstrained auto-selected lag time in ps. When it differs from
+        ``tc``, an additional comparison marker is drawn on the plot.
+    tc_selected_idx : int or None
+        Selected lag index in the lag grid, if already known.
+    out_base : str
+        Output filename prefix.
+    imgfmt : str
+        Output image format extension (``pdf`` or ``png``).
+
+    Returns
+    -------
+    None
+        Saves the figure to ``{out_base}.{imgfmt}``.
+
+    Notes
+    -----
+    All inputs are plain arrays/scalars and the function does not depend on
+    :class:`Dcov` internals.
+    """
+    import seaborn as sns
+    sns.set_context("paper", font_scale=0.5)
+    fig = plt.figure(figsize=(6, 7.5))
+    gs = fig.add_gridspec(3, 1, height_ratios=(3.0, 2.0, 2.0))
+    ax0 = fig.add_subplot(gs[0, 0])
+    ax1 = fig.add_subplot(gs[1, 0], sharex=ax0)
+    ax2 = fig.add_subplot(gs[2, 0])
+    xs = np.arange(tmin * dt, (tmax + 1) * dt, dt) / time_scale
+    D_out = D * diff_scale
+    Dstd_out = Dstd * diff_scale
+    Dempstd_out = Dempstd * diff_scale
+    show_auto_comparison = (
+        tc_auto_unbounded is not None
+        and not math.isclose(tc_auto_unbounded, tc, rel_tol=1e-9, abs_tol=1e-12)
+    )
+
+    ax0.plot(xs, D_out, color='C0', linewidth=0.8, label=r'$D$')
+    ax0.plot(xs, D_out - Dstd_out, color='black', linestyle='dotted', linewidth=0.7,
+             label=r'$\delta \overline{D}^\mathrm{predicted}$')
+    ax0.plot(xs, D_out + Dstd_out, color='black', linestyle='dotted', linewidth=0.7)
+    ax0.fill_between(xs, D_out - Dempstd_out, D_out + Dempstd_out,
+                     color='C0', alpha=0.5, edgecolor='none', linewidth=0,
+                     label=r'$\delta \overline{D}^\mathrm{empirical}$')
+    ax0.axvline(tc / time_scale, color='tab:red', linestyle='dashed')
+    if show_auto_comparison:
+        ax0.axvline(tc_auto_unbounded / time_scale, color='tab:orange', linestyle='dotted', linewidth=1.2)
+    ax0.set(ylabel=fr'$D(t)$ [{diffusion_unit}]')
+    ax0.set(xlim=(tmin * dt / time_scale, tmax * dt / time_scale))
+    ax0.ticklabel_format(style='scientific', scilimits=(-3, 4))
+    ax0.legend(ncol=2)
+    ax0.set_title(f"MSD window per lag: t .. {m}\u00d7t [{time_unit}]")
+
+    ax1.plot(xs, q_m, color='C0', linewidth=0.8)
+    ax1.fill_between(xs, q_m - q_std, q_m + q_std,
+                     color='C0', alpha=0.5, edgecolor='none', linewidth=0)
+    ax1.axhline(0.5, linestyle='dashed', color='gray', linewidth=1.2)
+    selected_tc_marker = ax1.axvline(tc / time_scale, color='tab:red', linestyle='dashed')
+    if show_auto_comparison:
+        plain_auto_marker = ax1.axvline(
+            tc_auto_unbounded / time_scale,
+            color='tab:orange',
+            linestyle='dotted',
+            linewidth=1.2,
+        )
+        ax1.legend(
+            handles=[selected_tc_marker, plain_auto_marker],
+            labels=['selected tc', 'plain auto tc'],
+            loc='best',
+        )
+    ax1.set(ylabel=r'$Q(t)$')
+    ax1.set(xlabel=fr'lag time $t$ [{time_unit}]')
+    ax1.set(ylim=(0, 1))
+
+    # Distribution of per-segment/molecule estimates at the selected tc
+    itc = tc_selected_idx
+    if itc is None:
+        step = int(round(tc / dt))
+        itc = step - tmin
+
+    if 0 <= itc < len(D) and nseg > 0:
+        D_seg_tc = s2[itc].sum(axis=1) / (2.0 * ndim * dt) * diff_scale
+        violin_kwargs = dict(positions=[0], showmeans=False, showextrema=False, showmedians=False)
+        try:
+            parts = ax2.violinplot([D_seg_tc], orientation='horizontal', **violin_kwargs)
+        except TypeError:
+            parts = ax2.violinplot([D_seg_tc], vert=False, **violin_kwargs)
+        for body in parts.get('bodies', []):
+            body.set_facecolor('C0')
+            body.set_alpha(0.5)
+            body.set_edgecolor('none')
+            body.set_linewidth(0.0)
+
+        d_mean = float(np.mean(D_seg_tc))
+        d_median = float(np.median(D_seg_tc))
+        q05, q25, q75, q95 = np.percentile(D_seg_tc, [5, 25, 75, 95])
+
+        ax2.axvline(D_out[itc], color='black', linestyle='solid', linewidth=1.2,
+                    label=r'$D(t_c)$ (estimate)')
+        ax2.axvline(d_mean, color='C0', linestyle='dashed', linewidth=1.2,
+                    label=r'mean($D_i$)')
+        ax2.axvline(d_median, color='C0', linestyle='solid', linewidth=1.2,
+                    label=r'median($D_i$)')
+        ax2.plot(D_seg_tc, np.zeros_like(D_seg_tc), '|', color='C0', alpha=0.3, markersize=10)
+        ax2.axvspan(q25, q75, color='C0', alpha=0.12, label='25\u201375%')
+        ax2.axvspan(q05, q95, color='C0', alpha=0.05, label='5\u201395%')
+
+        ax2.set(yticks=[], ylabel='Density of $D_i$')
+        ax2.set_ylim(-0.6, 0.6)
+        ax2.ticklabel_format(style='scientific', scilimits=(-3, 4))
+        ax2.set(xlabel=fr'$D$ [{diffusion_unit}]')
+        ax2.set_title(f"Per-segment $D$ at $t_c={tc / time_scale:.4g}$ {time_unit} (n={nseg})")
+        ax2.legend(loc='best')
+    else:
+        ax2.axis('off')
+
+    fig.tight_layout(h_pad=0.2)
+    fig.savefig(f'{out_base}.{imgfmt}', dpi=300)
+    plt.close(fig)

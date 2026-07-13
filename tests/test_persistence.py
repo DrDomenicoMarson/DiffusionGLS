@@ -3,21 +3,26 @@ import numpy as np
 import os
 import pickle
 from Dfit.Dfit import Dcov
+from conftest import generate_random_walk
 
-# Mock data generation (reused from test_dfit.py)
-def generate_random_walk(n_steps, dim=3, diffusion_coeff=1.0, dt=1.0):
-    step_std = np.sqrt(2 * diffusion_coeff * dt)
-    steps = np.random.normal(0, step_std, size=(n_steps, dim))
-    trajectory = np.cumsum(steps, axis=0)
-    trajectory = np.vstack([np.zeros((1, dim)), trajectory])
-    return trajectory
 
-@pytest.fixture
-def random_walk_file(tmp_path):
-    traj = generate_random_walk(n_steps=1000, dim=3, diffusion_coeff=0.1, dt=1.0)
-    file_path = tmp_path / "test_traj.dat"
-    np.savetxt(file_path, traj)
-    return str(file_path)
+def _set_q_profile(dcov: Dcov, q_profile: np.ndarray) -> None:
+    """Override segment Q values with a deterministic mean profile for tests.
+
+    Parameters
+    ----------
+    dcov : Dcov
+        Fitted diffusion estimator whose ``q`` array will be overwritten.
+    q_profile : ndarray
+        One-dimensional array of length ``tmax - tmin + 1`` containing the
+        desired mean ``Q`` value at each lag.
+    """
+    q_profile = np.asarray(q_profile, dtype=float)
+    expected_shape = (dcov.tmax - dcov.tmin + 1,)
+    if q_profile.shape != expected_shape:
+        raise ValueError(f"q_profile must have shape {expected_shape}, got {q_profile.shape}")
+    dcov.q[:] = q_profile[:, np.newaxis]
+
 
 def test_save_load_cycle(random_walk_file, tmp_path):
     fout = str(tmp_path / 'D_analysis_save_load')
@@ -83,3 +88,28 @@ def test_auto_tc_naming(random_walk_file, tmp_path):
     expected_path = f"{fout}.tc_{expected_suffix}.dat"
     
     assert os.path.exists(expected_path)
+
+
+def test_auto_tc_metadata_persists(random_walk_file, tmp_path):
+    fout = str(tmp_path / 'D_analysis_auto_bound')
+    with pytest.warns(UserWarning, match="differs from"):
+        dcov = Dcov(fz=random_walk_file, dt=0.5, m=5, tmax=5.0, fout=fout)
+    dcov.run_Dfit()
+
+    q_profile = np.full(dcov.tmax - dcov.tmin + 1, 0.9)
+    q_profile[1] = 0.49
+    q_profile[4] = 0.48
+    _set_q_profile(dcov, q_profile)
+
+    dcov.analysis(tc='auto', auto_min_tc=2.1)
+
+    pkl_path = f"{fout}.analysis.pkl"
+    with open(pkl_path, 'wb') as handle:
+        pickle.dump(dcov, handle)
+
+    dcov_loaded = Dcov.load(pkl_path)
+    assert dcov_loaded.tc_selected == pytest.approx(dcov.tc_selected)
+    assert dcov_loaded.tc_selected_idx == dcov.tc_selected_idx
+    assert dcov_loaded.tc_auto_unbounded == pytest.approx(dcov.tc_auto_unbounded)
+    assert dcov_loaded.tc_auto_unbounded_idx == dcov.tc_auto_unbounded_idx
+    assert dcov_loaded.auto_min_tc_used == pytest.approx(dcov.auto_min_tc_used)

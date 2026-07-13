@@ -1,0 +1,17 @@
+dataset,force_field,polymer,ligand,value_cm2_s,uncertainty_cm2_s,uncertainty_label
+pooled,OPLSAA,PEF,WAT,6.110200e-09,6.773700e-10,emp sem
+pooled,OPLSAA,PEF,OXM,2.533200e-09,3.233200e-10,emp sem
+pooled,OPLSAA,PET,WAT,5.527000e-09,5.323700e-10,emp sem
+pooled,OPLSAA,PET,OXM,3.222900e-09,4.121800e-10,emp sem
+pooled,QMFF,PEF,WAT,1.883300e-09,2.661000e-10,emp sem
+pooled,QMFF,PEF,OXM,7.922300e-09,8.632200e-10,emp sem
+pooled,QMFF,PET,WAT,1.977100e-09,2.763700e-10,emp sem
+pooled,QMFF,PET,OXM,4.753500e-09,5.163000e-10,emp sem
+run_avg,OPLSAA,PEF,WAT,5.975600e-09,2.347542e-09,std
+run_avg,OPLSAA,PEF,OXM,2.234467e-09,8.650607e-10,std
+run_avg,OPLSAA,PET,WAT,5.012433e-09,1.622029e-09,std
+run_avg,OPLSAA,PET,OXM,3.420267e-09,6.084097e-10,std
+run_avg,QMFF,PEF,WAT,1.451407e-09,8.920034e-10,std
+run_avg,QMFF,PEF,OXM,8.274700e-09,2.052149e-09,std
+run_avg,QMFF,PET,WAT,2.073667e-09,2.280945e-10,std
+run_avg,QMFF,PET,OXM,4.348333e-09,5.050449e-10,std
