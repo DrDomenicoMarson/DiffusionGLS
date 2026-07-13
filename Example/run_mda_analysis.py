@@ -47,8 +47,8 @@ def analyze_system(name, tpr, xtc, selection, tmax=100, tc=10):
     -----
     Side effects:
 
-    - Creates ``D_analysis_{name}.dat``, ``D_analysis_{name}.csv``, and the
-      configured plot in the ``Example`` directory.
+    - Creates ``D_analysis_{name}.tc_{tc}.dat``, the corresponding ``.csv``,
+      and the configured plot in the ``Example`` directory.
     - Prints progress and summary messages to stdout.
     """
     print(f"--- Analyzing {name} ---")
@@ -73,7 +73,10 @@ def analyze_system(name, tpr, xtc, selection, tmax=100, tc=10):
     
     # Analyze and plot
     res.analysis(tc=tc)
-    print(f"Analysis complete. Output saved to D_analysis_{name}.dat, .csv, and .pdf\n")
+    print(
+        f"Analysis complete. Output prefix: "
+        f"D_analysis_{name}.tc_{res.tc_selected:.4g}\n"
+    )
 
 
 def analyze_pooled_system(
@@ -126,8 +129,8 @@ def analyze_pooled_system(
     res.run_Dfit()
     res.analysis(tc=tc)
     print(
-        f"Cluster-aware analysis complete. Output saved to "
-        f"D_analysis_{name}.dat, .csv, and .pdf\n"
+        f"Cluster-aware analysis complete. Output prefix: "
+        f"D_analysis_{name}.tc_{res.tc_selected:.4g}\n"
     )
 
 
@@ -165,3 +168,5 @@ if __name__ == "__main__":
     #     MDAInputSpec(tpr="replica2.tpr", xtc="replica2.xtc"),
     # ]
     # analyze_pooled_system(name="Water_pooled", systems=replicas, selection="all", tmax=50, tc="auto")
+    # For the sustained publication-cutoff workflow applied to a saved fit, see
+    # Example/run_publication_tc_suggestion.py.

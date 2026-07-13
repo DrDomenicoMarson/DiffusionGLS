@@ -27,12 +27,16 @@ import Dfit
 
 res = Dfit.Dcov(...)
 res.run_Dfit()
-res.analysis(tc=10.0)  # or tc="auto", auto_min_tc=50.0
-res.finite_size_correction(T=300, eta=0.001, L=10.0, tc=10.0)  # optional
+suggestion = res.suggest_tc(validation_window=10.0, min_tc=50.0)  # optional
+if suggestion.tc is None:
+    raise RuntimeError("No common plateau; inspect cutoff diagnostics.")
+result = res.analysis(tc=suggestion.tc)  # explicit reviewed numeric cutoff
+res.finite_size_correction(T=300, eta=0.001, L=10.0, tc=result.tc)  # optional
 ```
 
 Lifecycle constraints:
 
+- `run_Dfit()` must be called before `suggest_tc()`.
 - `run_Dfit()` must be called before `analysis()`.
 - `analysis()` must be called before `finite_size_correction()`.
 
@@ -44,6 +48,8 @@ Lifecycle constraints:
   per-residue handling.
 - Cluster-aware analysis for trajectories nested within independently prepared
   boxes or replicas.
+- Auditable common-cutoff suggestion requiring sustained diffusion and Q-factor
+  agreement in every cluster.
 - Diagnostic automatic lag-time suggestion with equal cluster weighting and an
   optional lower bound via `auto_min_tc`.
 - Repeated analysis on the same fitted object with different `tc` values.
@@ -119,6 +125,127 @@ res.run_Dfit(save_model=False)
 - Populates model arrays (`a2`, `s2`, `q`, `s2var`) and diagnostics.
 - Optional `save_model=True` writes `{fout}.pkl`.
 
+## Publication Cutoff Suggestion
+
+```python
+suggestion = res.suggest_tc(
+    validation_window=10.0,
+    min_tc=50.0,
+    relative_drift_tolerance=0.05,
+    q_tolerance=0.10,
+    persistence_windows=2,
+    blocks_per_window=5,
+    candidate_step=None,
+)
+
+if suggestion.tc is None:
+    raise RuntimeError("No common plateau passed; inspect the diagnostics.")
+
+# Deliberately make the reviewed value explicit in the final analysis.
+result = res.analysis(tc=suggestion.tc)
+```
+
+`suggest_tc()` is separate from `analysis()` by design. It produces a
+reproducible, inspectable suggestion but does not certify that a cutoff is
+appropriate for a particular scientific claim. The final report should use a
+reviewed numeric `tc`.
+
+### Selection rule
+
+One `Dcov` object represents one physical condition, and a common cutoff is
+selected only among the clusters/boxes in that object. For each candidate lag
+and cluster, every validation window is divided into contiguous blocks. If
+`Dbar[c,w,b]` and `Qbar[c,w,b]` are the block means for cluster `c`, consecutive
+window `w`, and block `b`, the diagnostics are
+
+```text
+relative_D_drift[c,w] =
+    (max_b Dbar[c,w,b] - min_b Dbar[c,w,b]) / abs(mean_b Dbar[c,w,b])
+
+Q_deviation[c,w] = max_b abs(Qbar[c,w,b] - 0.5)
+```
+
+A cluster passes a candidate only when, in every consecutive validation
+window:
+
+- `relative_D_drift <= relative_drift_tolerance`; and
+- `Q_deviation <= q_tolerance`.
+
+The procedure records the earliest passing candidate for every cluster. It
+then selects the earliest candidate at or after the latest individual onset
+where all clusters pass simultaneously. This revalidation matters because a
+cluster can leave an acceptable region at longer lag times. If no common
+candidate passes, `suggestion.tc` is `None`; the closest failing candidate is
+reported for diagnosis but is never silently selected.
+
+Block means reduce sensitivity to isolated lag-grid fluctuations. They do not
+make neighboring lag points independent observations, and the procedure does
+not calculate slope p-values or treat failure to reject a trend as evidence of
+a plateau.
+
+### Parameters and defaults
+
+| Parameter | Type | Default | Meaning |
+|---|---|---|---|
+| `validation_window` | `float` | required | Physical width of each validation window in `time_unit`; must be a multiple of `dt`. Choose and report a scientifically meaningful duration. |
+| `min_tc` | `float \| None` | `None` | Lower search bound. It is rounded up to the first stored lag; `None` starts at `tmin`. |
+| `relative_drift_tolerance` | `float` | `0.05` | Maximum 5% block-mean relative range of `D(t)` in every window. This is a pragmatic equivalence band, not a universal threshold. |
+| `q_tolerance` | `float` | `0.10` | Requires every block-mean cluster Q value to remain in `[0.4, 0.6]`. |
+| `persistence_windows` | `int` | `2` | Number of consecutive validation windows that must pass; neighboring closed windows share only their boundary lag. |
+| `blocks_per_window` | `int` | `5` | Number of contiguous block means per window. |
+| `candidate_step` | `float \| None` | `None` | Nominal candidate spacing in `time_unit`; `None` uses one tenth of `validation_window`, rounded to at least one frame. The final feasible candidate is also evaluated if off-spacing. |
+| `fout_prefix` | `str \| None` | `None` | Diagnostic output base; defaults to `{fout}.tc_suggestion`. |
+| `make_plot` | `bool` | `True` | Write the cutoff-diagnostic plot. |
+
+The defaults are intentionally transparent rather than statistically
+automatic. For a paper, report the chosen validation window and tolerances and
+repeat the suggestion with at least one stricter and one looser practical
+drift tolerance. A large shift in the suggested cutoff is evidence that the
+plateau is not well determined. Use distinct `fout_prefix` values so the
+sensitivity runs do not overwrite one another.
+
+### Role of uncertainty
+
+The candidate report includes each cluster's predicted and empirical
+within-cluster conditional SEM at every candidate. These values contextualize
+the precision of `D_c(tc)`, but they are not used as inverse-variance weights
+and do not relax the plateau criterion. Doing so could allow a noisy or
+trajectory-rich box to hide systematic drift or dominate the other boxes.
+
+`suggest_tc()` requires `m >= 3` because Q is undefined for `m=2`. A requested
+validation horizon must fit completely inside the calculated `tmin..tmax` lag
+range. In particular, two 10 ns persistence windows require at least 20 ns of
+calculated lag range after a candidate. The latest feasible candidate is
+
+```text
+latest_candidate = tmax - persistence_windows * validation_window
+```
+
+up to lag-grid rounding. For example, `tmax=100 ns`, two 10 ns windows, and
+`m=10` can only evaluate candidates through 80 ns. Evaluating a 95 ns cutoff
+would leave only 5 ns for validation; this requires an explicitly shorter
+horizon and should be described as a weaker stability check.
+
+### Return contract
+
+`suggest_tc()` returns an immutable `TcSuggestion` dataclass:
+
+- `tc`: suggested numeric cutoff, or `None` when no common plateau passes;
+- `status`: `"suggested"` or `"no_common_plateau"`;
+- `cluster_onsets`: immutable `ClusterTcOnset` entries for every box;
+- `selected_candidate`: selected `TcCandidateDiagnostic`, or `None`;
+- `closest_candidate`: lowest-violation diagnostic candidate, never an
+  implicit fallback;
+- `candidates`: complete immutable candidate diagnostics;
+- the applied units, lower bound, window, persistence, block, candidate-step,
+  and tolerance settings.
+
+Each `TcCandidateDiagnostic` contains the candidate time, validation-horizon
+end, common pass flag, worst normalized violation, and one
+`ClusterTcCandidateDiagnostic` per box. The cluster diagnostic contains
+`D_c(tc)`, predicted/empirical conditional SEM, maximum relative D drift,
+maximum Q deviation, separate criterion flags, and the combined pass flag.
+
 ## Analysis
 
 ```python
@@ -177,8 +304,8 @@ Parameters:
 
 ## Validation and Constraints
 
-- `m` must be at least 2. With `m=2`, Q is unavailable and `tc="auto"` is
-  rejected.
+- `m` must be at least 2. With `m=2`, Q is unavailable and both `tc="auto"`
+  and `suggest_tc()` are rejected.
 - Input trajectories must provide at least 2 frames.
 - Text trajectories require a positive finite `dt`.
 - In multi-trajectory mode, all dimensions must match.
@@ -201,6 +328,12 @@ Parameters:
 
 Generated files:
 
+- `{fout}.tc_suggestion.dat`: cutoff rule, status, individual cluster onsets,
+  and selected or closest-failing candidate diagnostics.
+- `{fout}.tc_suggestion.csv`: complete candidate-by-cluster diagnostics,
+  thresholds, conditional SEMs, and pass/fail columns.
+- `{fout}.tc_suggestion.{imgfmt}`: cluster `D(t)`/Q curves, Q acceptance band,
+  cluster-onset markers, and the selected validation horizon.
 - `{fout}.tc_{tc}.dat`: concise selected-cutoff report with pooled, cluster,
   and across-cluster statistics.
 - `{fout}.tc_{tc}.csv`: complete lag-dependent pooled, cluster, and
@@ -214,13 +347,14 @@ Key attributes and availability:
 | Attribute | Available After | Description |
 |---|---|---|
 | `a2`, `s2`, `s2var`, `q` | `run_Dfit()` | Raw fit outputs over lag and segment dimensions. |
-| `D`, `Dstd`, `Dempstd` | `analysis()` | Pooled diffusion estimate and predicted/empirical member SD per lag. |
-| `Dsem_pred`, `Dsem_emp` | `analysis()` | Pooled predicted and empirical conditional SEM. |
-| `q_m`, `q_std` | `analysis()` | Mean and std. deviation of Q-factor per lag. |
-| `cluster_D`, `cluster_Dstd`, `cluster_Dempstd` | `analysis()` | Per-cluster estimate and member-level uncertainty series. |
-| `cluster_Dsem_pred`, `cluster_Dsem_emp` | `analysis()` | Per-cluster conditional SEM series. |
-| `D_cluster_mean`, `D_cluster_sd` | `analysis()` | Equal-weight cluster mean and between-cluster sample SD. |
-| `D_cluster_sem_pred`, `D_cluster_sem_emp` | `analysis()` | Propagated within-cluster conditional SEM series. |
+| `D`, `Dstd`, `Dempstd` | `suggest_tc()` or `analysis()` | Pooled diffusion estimate and predicted/empirical member SD per lag. |
+| `Dsem_pred`, `Dsem_emp` | `suggest_tc()` or `analysis()` | Pooled predicted and empirical conditional SEM. |
+| `q_m`, `q_std` | `suggest_tc()` or `analysis()` | Mean and std. deviation of Q-factor per lag. |
+| `tc_suggestion` | `suggest_tc()` | Latest `TcSuggestion`, including all candidate and cluster diagnostics. |
+| `cluster_D`, `cluster_Dstd`, `cluster_Dempstd` | `suggest_tc()` or `analysis()` | Per-cluster estimate and member-level uncertainty series. |
+| `cluster_Dsem_pred`, `cluster_Dsem_emp` | `suggest_tc()` or `analysis()` | Per-cluster conditional SEM series. |
+| `D_cluster_mean`, `D_cluster_sd` | `suggest_tc()` or `analysis()` | Equal-weight cluster mean and between-cluster sample SD. |
+| `D_cluster_sem_pred`, `D_cluster_sem_emp` | `suggest_tc()` or `analysis()` | Propagated within-cluster conditional SEM series. |
 | `tc_selected`, `tc_selected_idx` | `analysis()` | Final lag-time value/index used for summary. |
 | `tc_auto_unbounded`, `tc_auto_unbounded_idx`, `auto_min_tc_used` | `analysis()` | Unconstrained auto lag and applied lower-bound metadata when `tc="auto"` is used. |
 | `Dcor` | `finite_size_correction()` | Finite-size corrected diffusion series. |
@@ -229,7 +363,8 @@ Key attributes and availability:
 
 - MDAnalysis mode currently materializes full per-residue trajectories in
   memory; very large systems/trajectories can be memory intensive.
-- The package currently exposes a Python API only (no command-line interface).
+- The package does not install a command-line interface; the `Example`
+  directory includes a standalone fitted-pickle helper script.
 
 ## Basic Examples
 
@@ -277,11 +412,29 @@ res = Dfit.Dcov(
     universes=[u1, u2, u3],
     cluster_ids=["box_1", "box_2", "box_3"],  # optional; inferred by source
     selection="resname SOL",
-    tmax=50,
+    tmax=100,
+    time_unit="ns",
 )
 res.run_Dfit()
-result = res.analysis(tc=10.0)
+result = res.analysis(tc=75.0)
 print(result.across_clusters)
+```
+
+For a publication-oriented common-cutoff suggestion:
+
+```python
+suggestion = res.suggest_tc(
+    validation_window=10.0,
+    min_tc=50.0,
+    relative_drift_tolerance=0.05,
+    q_tolerance=0.10,
+)
+if suggestion.tc is None:
+    print("No common plateau; inspect", f"{res.fout}.tc_suggestion.csv")
+else:
+    result = res.analysis(tc=suggestion.tc)
+    print("Reviewed common cutoff:", suggestion.tc, suggestion.time_unit)
+    print(result.across_clusters)
 ```
 
 ### 4) Multiple text trajectories (multi-molecule mode)
@@ -307,5 +460,19 @@ res.run_Dfit(save_model=True)
 
 # Load later
 res = Dfit.Dcov.load("D_analysis.pkl")
-res.analysis(tc=10.0)
+suggestion = res.suggest_tc(validation_window=10.0, min_tc=50.0)
+if suggestion.tc is not None:
+    res.analysis(tc=suggestion.tc)
+```
+
+Pickles written by version 0.4.0 after `run_Dfit()` already contain the fitted
+lag-dependent arrays required by `suggest_tc()`. Loading them with the current
+version does not require rerunning the GLS fit.
+
+The complete fitted-pickle example is
+[`Example/run_publication_tc_suggestion.py`](Example/run_publication_tc_suggestion.py):
+
+```bash
+python Example/run_publication_tc_suggestion.py D_analysis.pkl \
+    --validation-window 10 --min-tc 50
 ```

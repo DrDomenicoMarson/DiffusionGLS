@@ -183,6 +183,149 @@ class AutoTcSelection:
     selected_max_deviation: float
 
 
+@dataclass(frozen=True)
+class ClusterTcCandidateDiagnostic:
+    """Publication-cutoff diagnostics for one cluster at one candidate lag.
+
+    Parameters
+    ----------
+    cluster_id : str
+        User-facing cluster identifier.
+    diffusion : float
+        Cluster diffusion estimate at the candidate lag in ``diffusion_unit``.
+    predicted_sem : float
+        Predicted within-cluster conditional SEM at the candidate lag in
+        ``diffusion_unit``.
+    empirical_sem : float or None
+        Empirical within-cluster conditional SEM at the candidate lag in
+        ``diffusion_unit``, or ``None`` when unavailable.
+    max_relative_drift : float
+        Largest block-mean relative range of the cluster ``D(t)`` curve over
+        the consecutive validation windows.
+    max_q_deviation : float
+        Largest absolute deviation of a block-mean cluster Q value from 0.5
+        over the consecutive validation windows.
+    diffusion_passes : bool
+        Whether ``max_relative_drift`` satisfies the configured tolerance.
+    q_passes : bool
+        Whether ``max_q_deviation`` satisfies the configured tolerance.
+    passes : bool
+        Whether both the diffusion and Q criteria pass.
+    """
+
+    cluster_id: str
+    diffusion: float
+    predicted_sem: float
+    empirical_sem: float | None
+    max_relative_drift: float
+    max_q_deviation: float
+    diffusion_passes: bool
+    q_passes: bool
+    passes: bool
+
+
+@dataclass(frozen=True)
+class TcCandidateDiagnostic:
+    """Common publication-cutoff diagnostics at one candidate lag.
+
+    Parameters
+    ----------
+    tc : float
+        Candidate lag time in ``time_unit``.
+    validation_end : float
+        End of the complete persistence horizon in ``time_unit``.
+    passes : bool
+        Whether every cluster passes both selection criteria.
+    worst_normalized_violation : float
+        Worst cluster criterion divided by its corresponding tolerance. Values
+        no greater than one pass; this score is descriptive, not inferential.
+    clusters : tuple[ClusterTcCandidateDiagnostic, ...]
+        Per-cluster diagnostics in cluster order.
+    """
+
+    tc: float
+    validation_end: float
+    passes: bool
+    worst_normalized_violation: float
+    clusters: tuple[ClusterTcCandidateDiagnostic, ...]
+
+
+@dataclass(frozen=True)
+class ClusterTcOnset:
+    """Earliest sustained candidate accepted for one cluster.
+
+    Parameters
+    ----------
+    cluster_id : str
+        User-facing cluster identifier.
+    tc : float or None
+        Earliest candidate lag passing the configured persistence criteria, or
+        ``None`` when the cluster has no acceptable candidate.
+    """
+
+    cluster_id: str
+    tc: float | None
+
+
+@dataclass(frozen=True)
+class TcSuggestion:
+    """Auditable common-cutoff suggestion for publication-oriented analysis.
+
+    Parameters
+    ----------
+    tc : float or None
+        Earliest candidate at or after the latest individual cluster onset for
+        which every cluster passes simultaneously. ``None`` means that no
+        common plateau was found.
+    status : {'suggested', 'no_common_plateau'}
+        Machine-readable selection status.
+    time_unit : str
+        Unit used for cutoff and window values.
+    diffusion_unit : str
+        Unit used for diffusion and conditional SEM values.
+    min_tc : float
+        Applied lower search bound on the lag grid.
+    validation_window : float
+        Width of each validation window.
+    persistence_windows : int
+        Number of consecutive validation windows required.
+    blocks_per_window : int
+        Number of contiguous blocks used to summarize each window.
+    candidate_step : float
+        Spacing of evaluated cutoff candidates on the lag grid.
+    relative_drift_tolerance : float
+        Maximum accepted block-mean relative range of ``D(t)``.
+    q_tolerance : float
+        Maximum accepted block-mean absolute Q deviation from 0.5.
+    cluster_onsets : tuple[ClusterTcOnset, ...]
+        Earliest passing candidate for each cluster.
+    selected_candidate : TcCandidateDiagnostic or None
+        Diagnostics for the suggested common cutoff, or ``None`` when no
+        common cutoff passes.
+    closest_candidate : TcCandidateDiagnostic
+        Candidate with the smallest worst normalized violation. This is
+        diagnostic only and is never promoted to ``tc`` when it fails.
+    candidates : tuple[TcCandidateDiagnostic, ...]
+        Complete candidate diagnostics used by the selection.
+    """
+
+    tc: float | None
+    status: str
+    time_unit: str
+    diffusion_unit: str
+    min_tc: float
+    validation_window: float
+    persistence_windows: int
+    blocks_per_window: int
+    candidate_step: float
+    relative_drift_tolerance: float
+    q_tolerance: float
+    cluster_onsets: tuple[ClusterTcOnset, ...]
+    selected_candidate: TcCandidateDiagnostic | None
+    closest_candidate: TcCandidateDiagnostic
+    candidates: tuple[TcCandidateDiagnostic, ...]
+
+
 def calc_q(n,m,a2_3D,s2_3D,msds_3D,a2full_3D,s2full_3D,ndim):
     """Evaluate the segment quality factor ``Q`` from the GLS fit.
 
@@ -395,8 +538,11 @@ class Dcov():
 
     1. Initialize :class:`Dcov` with trajectory input and fit configuration.
     2. Call :meth:`run_Dfit` to perform GLS estimation across lag steps.
-    3. Call :meth:`analysis` to compute summary statistics and write outputs.
-    4. Optionally call :meth:`finite_size_correction` (3D, cubic box only).
+    3. Optionally call :meth:`suggest_tc` for auditable common-cutoff
+       diagnostics across clusters.
+    4. Call :meth:`analysis` with a reviewed numeric cutoff to compute summary
+       statistics and write outputs.
+    5. Optionally call :meth:`finite_size_correction` (3D, cubic box only).
 
     Notes
     -----
@@ -694,6 +840,7 @@ class Dcov():
         self.tc_auto_unbounded_idx = None  # index into lag arrays for unconstrained auto tc
         self.auto_min_tc_used = None  # applied lower bound on the lag grid in chosen time unit
         self.analysis_result = None
+        self.tc_suggestion = None
         self.cluster_D = None
         self.cluster_Dstd = None
         self.cluster_Dempstd = None
@@ -734,6 +881,7 @@ class Dcov():
         obj.tc_auto_unbounded_idx = getattr(obj, 'tc_auto_unbounded_idx', None)
         obj.auto_min_tc_used = getattr(obj, 'auto_min_tc_used', None)
         obj.analysis_result = getattr(obj, 'analysis_result', None)
+        obj.tc_suggestion = getattr(obj, 'tc_suggestion', None)
 
         if not hasattr(obj, "segment_lengths"):
             obj.segment_lengths = np.full(obj.nseg, obj.nperseg + 1, dtype=int)
@@ -1111,42 +1259,31 @@ class Dcov():
                 print(f"Model saved to {self.fout}.pkl")
 
     # Output and plotting
-    def analysis(self, tc: float | str = 10, fout_prefix: str | None = None,
-                 auto_min_tc: float | None = None) -> AnalysisResult:
-        """Compute pooled and cluster-aware statistics and write outputs.
-
-        Parameters
-        ----------
-        tc : float or {'auto'}, default=10
-            Common lag time for every cluster in ``time_unit``. A numeric value
-            is recommended for publication. ``'auto'`` provides a diagnostic
-            cluster-balanced Q suggestion and requires ``m >= 3``.
-        fout_prefix : str or None, optional
-            Custom output base. By default, use ``{fout}.tc_{tc}``.
-        auto_min_tc : float or None, optional
-            Lower bound for automatic cutoff selection in ``time_unit``.
+    def _prepare_lag_statistics(self) -> None:
+        """Compute pooled and cluster-aware statistics over the full lag grid.
 
         Returns
         -------
-        AnalysisResult
-            Selected-cutoff pooled, per-cluster, and across-cluster results.
+        None
+            Populates the lag-dependent pooled, per-cluster, and across-cluster
+            arrays used by :meth:`analysis` and :meth:`suggest_tc`.
 
         Raises
         ------
         RuntimeError
             If called before :meth:`run_Dfit`.
-        ValueError
-            If the cutoff is invalid or automatic selection is requested with
-            ``m=2``.
         """
         if not self._fitted:
-            raise RuntimeError("Call run_Dfit() before analysis().")
+            raise RuntimeError("Call run_Dfit() before preparing lag statistics.")
 
         denominator = 2.0 * self.ndim * self.dt
         member_D = self.s2.sum(axis=2) / denominator
         member_var_D = np.maximum(self.s2var_members, 0.0) / (denominator ** 2)
         if np.any(self.s2var_members < 0):
-            warnings.warn("Negative predicted variance encountered; clamping to zero.", RuntimeWarning)
+            warnings.warn(
+                "Negative predicted variance encountered; clamping to zero.",
+                RuntimeWarning,
+            )
 
         self.Dseg = np.mean(member_D, axis=1)
         self.Dstd = np.sqrt(np.mean(member_var_D, axis=1))
@@ -1191,7 +1328,9 @@ class Dcov():
             cluster_member_D = member_D[:, member_indices]
             cluster_member_var = member_var_D[:, member_indices]
             self.cluster_D[:, cluster_index] = np.mean(cluster_member_D, axis=1)
-            self.cluster_Dstd[:, cluster_index] = np.sqrt(np.mean(cluster_member_var, axis=1))
+            self.cluster_Dstd[:, cluster_index] = np.sqrt(
+                np.mean(cluster_member_var, axis=1)
+            )
             self.cluster_Dsem_pred[:, cluster_index] = (
                 np.sqrt(np.sum(cluster_member_var, axis=1)) / count
             )
@@ -1243,6 +1382,602 @@ class Dcov():
         else:
             self.q_cluster_score = np.full(n_lags, np.nan)
             self.q_cluster_max_deviation = np.full(n_lags, np.nan)
+
+    def _duration_to_steps(self, value: float, parameter_name: str) -> int:
+        """Convert a physical duration to an exact positive lag-grid step count.
+
+        Parameters
+        ----------
+        value : float
+            Duration in ``time_unit``.
+        parameter_name : str
+            Public parameter name used in validation messages.
+
+        Returns
+        -------
+        int
+            Positive number of internal frame steps represented by ``value``.
+
+        Raises
+        ------
+        TypeError
+            If ``value`` is not numeric.
+        ValueError
+            If ``value`` is non-positive, non-finite, shorter than one frame,
+            or not a multiple of ``dt``.
+        """
+        if (
+            not isinstance(value, (int, float, np.integer, np.floating))
+            or isinstance(value, (bool, np.bool_))
+        ):
+            raise TypeError(f"{parameter_name} must be a positive finite number.")
+        if not math.isfinite(float(value)) or float(value) <= 0:
+            raise ValueError(f"{parameter_name} must be a positive finite number.")
+        steps = (float(value) * self.time_scale) / self.dt
+        steps_int = round(steps)
+        if steps_int < 1:
+            raise ValueError(
+                f"{parameter_name} resolves to fewer than one frame step; "
+                f"increase it to at least {self.dt / self.time_scale:.4g} "
+                f"{self.time_unit}."
+            )
+        if not math.isclose(steps, steps_int, rel_tol=1e-9, abs_tol=1e-12):
+            raise ValueError(
+                f"{parameter_name} [{value}] must be a multiple of dt "
+                f"[{self.dt / self.time_scale:.4g} {self.time_unit}] within "
+                "numerical tolerance."
+            )
+        return int(steps_int)
+
+    def _publication_candidate(
+        self,
+        candidate_idx: int,
+        validation_steps: int,
+        persistence_windows: int,
+        blocks_per_window: int,
+        relative_drift_tolerance: float,
+        q_tolerance: float,
+    ) -> TcCandidateDiagnostic:
+        """Evaluate all clusters at one publication-cutoff candidate.
+
+        Parameters
+        ----------
+        candidate_idx : int
+            Candidate index on the stored lag grid.
+        validation_steps : int
+            Width of one validation window in internal lag steps.
+        persistence_windows : int
+            Number of consecutive windows to evaluate.
+        blocks_per_window : int
+            Number of contiguous blocks used to summarize each window.
+        relative_drift_tolerance : float
+            Maximum accepted relative block-mean range of ``D(t)``.
+        q_tolerance : float
+            Maximum accepted absolute block-mean Q deviation from 0.5.
+
+        Returns
+        -------
+        TcCandidateDiagnostic
+            Complete common and per-cluster diagnostics for the candidate.
+        """
+        cluster_diagnostics = []
+        for cluster_index, cluster_id in enumerate(self.cluster_ids):
+            relative_drifts = []
+            q_deviations = []
+            for window_index in range(persistence_windows):
+                start = candidate_idx + window_index * validation_steps
+                stop = start + validation_steps
+                window_indices = np.arange(start, stop + 1, dtype=int)
+                blocks = np.array_split(window_indices, blocks_per_window)
+                d_block_means = np.array(
+                    [np.mean(self.cluster_D[block, cluster_index]) for block in blocks]
+                )
+                q_block_means = np.array(
+                    [np.mean(self.cluster_q_m[block, cluster_index]) for block in blocks]
+                )
+
+                d_range = float(np.ptp(d_block_means))
+                d_level = abs(float(np.mean(d_block_means)))
+                if d_level > np.finfo(float).tiny:
+                    relative_drift = d_range / d_level
+                else:
+                    relative_drift = 0.0 if d_range == 0.0 else math.inf
+                q_deviation = (
+                    float(np.max(np.abs(q_block_means - 0.5)))
+                    if np.all(np.isfinite(q_block_means))
+                    else math.inf
+                )
+                relative_drifts.append(relative_drift)
+                q_deviations.append(q_deviation)
+
+            max_relative_drift = float(np.max(relative_drifts))
+            max_q_deviation = float(np.max(q_deviations))
+            diffusion_passes = (
+                math.isfinite(max_relative_drift)
+                and max_relative_drift <= relative_drift_tolerance
+            )
+            q_passes = math.isfinite(max_q_deviation) and max_q_deviation <= q_tolerance
+            cluster_diagnostics.append(
+                ClusterTcCandidateDiagnostic(
+                    cluster_id=cluster_id,
+                    diffusion=float(
+                        self.cluster_D[candidate_idx, cluster_index] * self.diff_scale
+                    ),
+                    predicted_sem=float(
+                        self.cluster_Dsem_pred[candidate_idx, cluster_index]
+                        * self.diff_scale
+                    ),
+                    empirical_sem=self._scaled_optional(
+                        self.cluster_Dsem_emp[candidate_idx, cluster_index]
+                    ),
+                    max_relative_drift=max_relative_drift,
+                    max_q_deviation=max_q_deviation,
+                    diffusion_passes=diffusion_passes,
+                    q_passes=q_passes,
+                    passes=diffusion_passes and q_passes,
+                )
+            )
+
+        worst_normalized_violation = max(
+            max(
+                diagnostic.max_relative_drift / relative_drift_tolerance,
+                diagnostic.max_q_deviation / q_tolerance,
+            )
+            for diagnostic in cluster_diagnostics
+        )
+        total_steps = validation_steps * persistence_windows
+        return TcCandidateDiagnostic(
+            tc=float((self.tmin + candidate_idx) * self.dt / self.time_scale),
+            validation_end=float(
+                (self.tmin + candidate_idx + total_steps) * self.dt / self.time_scale
+            ),
+            passes=all(diagnostic.passes for diagnostic in cluster_diagnostics),
+            worst_normalized_violation=float(worst_normalized_violation),
+            clusters=tuple(cluster_diagnostics),
+        )
+
+    def suggest_tc(
+        self,
+        validation_window: float,
+        *,
+        min_tc: float | None = None,
+        relative_drift_tolerance: float = 0.05,
+        q_tolerance: float = 0.10,
+        persistence_windows: int = 2,
+        blocks_per_window: int = 5,
+        candidate_step: float | None = None,
+        fout_prefix: str | None = None,
+        make_plot: bool = True,
+    ) -> TcSuggestion:
+        """Suggest a reviewed common cutoff from sustained cluster diagnostics.
+
+        Parameters
+        ----------
+        validation_window : float
+            Physical width of each validation window in ``time_unit``. The
+            value must be a multiple of ``dt`` and should represent a
+            scientifically meaningful interval over which a plateau is
+            expected to persist.
+        min_tc : float or None, optional
+            Lower search bound in ``time_unit``. ``None`` starts at ``tmin``;
+            otherwise the bound is rounded up to the first stored lag.
+        relative_drift_tolerance : float, default=0.05
+            Maximum relative range among contiguous block means of ``D(t)`` in
+            every validation window. The default permits 5% block-to-block
+            drift and is a documented pragmatic criterion, not a universal
+            statistical threshold.
+        q_tolerance : float, default=0.10
+            Maximum absolute deviation of every block-mean cluster Q value
+            from 0.5. The default accepts the interval [0.4, 0.6].
+        persistence_windows : int, default=2
+            Number of consecutive validation windows that must pass for every
+            cluster. Neighboring closed windows share only their boundary lag.
+        blocks_per_window : int, default=5
+            Number of contiguous blocks used to summarize each validation
+            window. Block means reduce sensitivity to isolated lag-grid noise
+            without treating adjacent lag points as independent replicates.
+        candidate_step : float or None, optional
+            Nominal spacing between evaluated candidates in ``time_unit``. The
+            value must be a multiple of ``dt``. ``None`` uses one tenth of the
+            validation window, rounded to at least one frame step. The final
+            feasible candidate is also evaluated when it is off this spacing.
+        fout_prefix : str or None, optional
+            Output base for the diagnostic ``.dat``, ``.csv``, and plot files.
+            ``None`` uses ``{fout}.tc_suggestion``.
+        make_plot : bool, default=True
+            Whether to write the two-panel cutoff-diagnostic plot.
+
+        Returns
+        -------
+        TcSuggestion
+            Dataclass containing the suggested common cutoff, individual
+            cluster onsets, the closest failing candidate when applicable, and
+            complete candidate diagnostics.
+
+        Raises
+        ------
+        RuntimeError
+            If called before :meth:`run_Dfit`.
+        TypeError
+            If integer or Boolean configuration values have invalid types.
+        ValueError
+            If ``m < 3``, thresholds or durations are invalid, or the lag range
+            is too short for the requested persistence horizon.
+
+        Notes
+        -----
+        This is a reproducible suggestion, not an automatic certification of a
+        publication cutoff. Selection is based on practical equivalence bands,
+        not p-values. Conditional cluster SEMs are reported for context but do
+        not weight the point estimate or relax the plateau criterion. The
+        returned numeric ``tc`` should be reviewed and then passed explicitly
+        to :meth:`analysis`.
+        """
+        if not self._fitted:
+            raise RuntimeError("Call run_Dfit() before suggest_tc().")
+        if self.m < 3:
+            raise ValueError("suggest_tc() requires m >= 3 because Q is undefined for m=2.")
+        for name, value in (
+            ("relative_drift_tolerance", relative_drift_tolerance),
+            ("q_tolerance", q_tolerance),
+        ):
+            if (
+                not isinstance(value, (int, float, np.integer, np.floating))
+                or isinstance(value, (bool, np.bool_))
+            ):
+                raise TypeError(f"{name} must be a positive finite number.")
+            if not math.isfinite(float(value)) or float(value) <= 0:
+                raise ValueError(f"{name} must be a positive finite number.")
+        if q_tolerance > 0.5:
+            raise ValueError("q_tolerance must not exceed 0.5.")
+        for name, value in (
+            ("persistence_windows", persistence_windows),
+            ("blocks_per_window", blocks_per_window),
+        ):
+            if not isinstance(value, (int, np.integer)) or isinstance(value, bool):
+                raise TypeError(f"{name} must be an integer.")
+            if value < 1:
+                raise ValueError(f"{name} must be at least 1.")
+        if blocks_per_window < 2:
+            raise ValueError("blocks_per_window must be at least 2.")
+        if not isinstance(make_plot, (bool, np.bool_)):
+            raise TypeError("make_plot must be a Boolean.")
+
+        validation_steps = self._duration_to_steps(validation_window, "validation_window")
+        if validation_steps < blocks_per_window:
+            raise ValueError(
+                "validation_window is too short for blocks_per_window: "
+                f"{validation_steps} lag steps cannot form {blocks_per_window} "
+                "meaningful contiguous blocks."
+            )
+        if candidate_step is None:
+            candidate_step_steps = max(1, int(round(validation_steps / 10.0)))
+        else:
+            candidate_step_steps = self._duration_to_steps(candidate_step, "candidate_step")
+        candidate_step_used = candidate_step_steps * self.dt / self.time_scale
+
+        if min_tc is None:
+            min_idx = 0
+        else:
+            if (
+                not isinstance(min_tc, (int, float, np.integer, np.floating))
+                or isinstance(min_tc, (bool, np.bool_))
+            ):
+                raise TypeError("min_tc must be a positive finite number or None.")
+            if not math.isfinite(float(min_tc)) or float(min_tc) <= 0:
+                raise ValueError("min_tc must be a positive finite number or None.")
+            min_steps = math.ceil((float(min_tc) * self.time_scale) / self.dt - 1e-12)
+            min_idx = max(int(min_steps), self.tmin) - self.tmin
+        min_tc_used = (self.tmin + min_idx) * self.dt / self.time_scale
+
+        self._prepare_lag_statistics()
+        total_validation_steps = validation_steps * persistence_windows
+        max_start_idx = len(self.D) - 1 - total_validation_steps
+        if min_idx < 0 or min_idx > max_start_idx:
+            maximum_start = (
+                (self.tmin + max_start_idx) * self.dt / self.time_scale
+                if max_start_idx >= 0
+                else None
+            )
+            suffix = (
+                f"; the latest feasible start is {maximum_start:.4g} {self.time_unit}"
+                if maximum_start is not None
+                else ""
+            )
+            raise ValueError(
+                "The computed lag range is too short for the requested min_tc, "
+                "validation_window, and persistence_windows" + suffix + "."
+            )
+
+        candidate_indices = list(
+            range(min_idx, max_start_idx + 1, candidate_step_steps)
+        )
+        if candidate_indices[-1] != max_start_idx:
+            candidate_indices.append(max_start_idx)
+        candidates = tuple(
+            self._publication_candidate(
+                candidate_idx,
+                validation_steps,
+                int(persistence_windows),
+                int(blocks_per_window),
+                float(relative_drift_tolerance),
+                float(q_tolerance),
+            )
+            for candidate_idx in candidate_indices
+        )
+
+        cluster_onsets = []
+        for cluster_index, cluster_id in enumerate(self.cluster_ids):
+            onset = next(
+                (
+                    candidate.tc
+                    for candidate in candidates
+                    if candidate.clusters[cluster_index].passes
+                ),
+                None,
+            )
+            cluster_onsets.append(ClusterTcOnset(cluster_id=cluster_id, tc=onset))
+
+        selected_candidate = None
+        if all(onset.tc is not None for onset in cluster_onsets):
+            latest_onset = max(onset.tc for onset in cluster_onsets if onset.tc is not None)
+            selected_candidate = next(
+                (
+                    candidate
+                    for candidate in candidates
+                    if candidate.tc >= latest_onset and candidate.passes
+                ),
+                None,
+            )
+        closest_candidate = min(
+            candidates,
+            key=lambda candidate: (candidate.worst_normalized_violation, candidate.tc),
+        )
+        status = "suggested" if selected_candidate is not None else "no_common_plateau"
+        self.tc_suggestion = TcSuggestion(
+            tc=selected_candidate.tc if selected_candidate is not None else None,
+            status=status,
+            time_unit=self.time_unit,
+            diffusion_unit=self.diffusion_unit,
+            min_tc=float(min_tc_used),
+            validation_window=float(validation_steps * self.dt / self.time_scale),
+            persistence_windows=int(persistence_windows),
+            blocks_per_window=int(blocks_per_window),
+            candidate_step=float(candidate_step_used),
+            relative_drift_tolerance=float(relative_drift_tolerance),
+            q_tolerance=float(q_tolerance),
+            cluster_onsets=tuple(cluster_onsets),
+            selected_candidate=selected_candidate,
+            closest_candidate=closest_candidate,
+            candidates=candidates,
+        )
+
+        out_base = fout_prefix if fout_prefix is not None else f"{self.fout}.tc_suggestion"
+        self._write_tc_suggestion_report(out_base, self.tc_suggestion)
+        self._write_tc_suggestion_csv(out_base, self.tc_suggestion)
+        if make_plot:
+            self.plot_tc_suggestion(out_base, self.tc_suggestion)
+
+        if selected_candidate is None:
+            print(
+                "No common publication cutoff passed all cluster criteria. "
+                f"Closest diagnostic candidate: {closest_candidate.tc:.4g} "
+                f"{self.time_unit} (worst normalized violation "
+                f"{closest_candidate.worst_normalized_violation:.3g})."
+            )
+        else:
+            print(
+                f"Suggested common tc = {selected_candidate.tc:.4g} {self.time_unit}; "
+                f"validated through {selected_candidate.validation_end:.4g} "
+                f"{self.time_unit} in every cluster. Review diagnostics and rerun "
+                "analysis() with this numeric cutoff."
+            )
+        return self.tc_suggestion
+
+    def _write_tc_suggestion_report(
+        self,
+        out_base: str,
+        suggestion: TcSuggestion,
+    ) -> None:
+        """Write the concise publication-cutoff suggestion report.
+
+        Parameters
+        ----------
+        out_base : str
+            Output path prefix.
+        suggestion : TcSuggestion
+            Suggestion and diagnostics to serialize.
+
+        Returns
+        -------
+        None
+            Writes ``{out_base}.dat``.
+        """
+        evaluated = suggestion.selected_candidate or suggestion.closest_candidate
+        with open(f"{out_base}.dat", "w", encoding="utf-8") as handle:
+            handle.write("PUBLICATION CUTOFF SUGGESTION\n")
+            handle.write("================================\n")
+            handle.write(
+                "This is an auditable practical-equivalence suggestion, not an "
+                "automatic certification of a publication cutoff.\n"
+            )
+            handle.write(f"Status: {suggestion.status}\n")
+            if suggestion.tc is None:
+                handle.write("Suggested common tc: NONE (no common plateau passed)\n")
+            else:
+                handle.write(
+                    f"Suggested common tc: {suggestion.tc:.6g} {suggestion.time_unit}\n"
+                )
+            handle.write(
+                f"Applied min_tc: {suggestion.min_tc:.6g} {suggestion.time_unit}\n"
+                f"Validation window: {suggestion.validation_window:.6g} "
+                f"{suggestion.time_unit}\n"
+                f"Persistence windows: {suggestion.persistence_windows}\n"
+                f"Blocks per window: {suggestion.blocks_per_window}\n"
+                f"Candidate step: {suggestion.candidate_step:.6g} "
+                f"{suggestion.time_unit}\n"
+                f"Relative D drift tolerance: {suggestion.relative_drift_tolerance:.6g}\n"
+                f"Q tolerance about 0.5: {suggestion.q_tolerance:.6g}\n"
+                f"Evaluated candidates: {len(suggestion.candidates)}\n"
+                f"Latest feasible candidate: {suggestion.candidates[-1].tc:.6g} "
+                f"{suggestion.time_unit}\n"
+            )
+            handle.write("\nINDIVIDUAL CLUSTER ONSETS\n")
+            for onset in suggestion.cluster_onsets:
+                onset_text = (
+                    f"{onset.tc:.6g} {suggestion.time_unit}"
+                    if onset.tc is not None
+                    else "NONE"
+                )
+                handle.write(f"{onset.cluster_id}: {onset_text}\n")
+            if suggestion.tc is None:
+                handle.write(
+                    "\nCLOSEST FAILING CANDIDATE (DIAGNOSTIC ONLY; NOT SELECTED)\n"
+                )
+            else:
+                handle.write("\nSELECTED COMMON CANDIDATE\n")
+            handle.write(
+                f"tc: {evaluated.tc:.6g} {suggestion.time_unit}\n"
+                f"Validation horizon end: {evaluated.validation_end:.6g} "
+                f"{suggestion.time_unit}\n"
+                f"Worst normalized violation: "
+                f"{evaluated.worst_normalized_violation:.6g}\n"
+            )
+            for diagnostic in evaluated.clusters:
+                handle.write(
+                    f"{diagnostic.cluster_id}: D={diagnostic.diffusion:.6e} "
+                    f"{suggestion.diffusion_unit}; predicted conditional SEM="
+                    f"{diagnostic.predicted_sem:.6e} {suggestion.diffusion_unit}; "
+                    f"empirical conditional SEM="
+                    f"{self._format_optional(diagnostic.empirical_sem, '.6e')} "
+                    f"{suggestion.diffusion_unit}; "
+                    f"max relative D drift={diagnostic.max_relative_drift:.6g}; "
+                    f"max |Q-0.5|={diagnostic.max_q_deviation:.6g}; "
+                    f"passes={diagnostic.passes}\n"
+                )
+            handle.write(
+                "\nConditional SEMs provide within-box context only. They are not "
+                "used as cluster weights and do not relax the plateau criteria.\n"
+            )
+
+    def _write_tc_suggestion_csv(
+        self,
+        out_base: str,
+        suggestion: TcSuggestion,
+    ) -> None:
+        """Write complete publication-cutoff candidate diagnostics.
+
+        Parameters
+        ----------
+        out_base : str
+            Output path prefix.
+        suggestion : TcSuggestion
+            Suggestion and candidate diagnostics to serialize.
+
+        Returns
+        -------
+        None
+            Writes ``{out_base}.csv`` with one row per candidate and cluster.
+        """
+        fieldnames = [
+            "status",
+            "selected",
+            "candidate_tc",
+            "validation_end",
+            "time_unit",
+            "candidate_passes_all_clusters",
+            "worst_normalized_violation",
+            "cluster_id",
+            "cluster_onset_tc",
+            "diffusion",
+            "diffusion_unit",
+            "conditional_sem_predicted",
+            "conditional_sem_empirical",
+            "max_relative_drift",
+            "relative_drift_tolerance",
+            "diffusion_passes",
+            "max_q_deviation",
+            "q_tolerance",
+            "q_passes",
+            "cluster_passes",
+            "min_tc",
+            "validation_window",
+            "persistence_windows",
+            "blocks_per_window",
+            "candidate_step",
+        ]
+        onset_by_cluster = {onset.cluster_id: onset.tc for onset in suggestion.cluster_onsets}
+        with open(f"{out_base}.csv", "w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for candidate in suggestion.candidates:
+                for diagnostic in candidate.clusters:
+                    writer.writerow(
+                        {
+                            "status": suggestion.status,
+                            "selected": suggestion.tc is not None
+                            and math.isclose(candidate.tc, suggestion.tc),
+                            "candidate_tc": candidate.tc,
+                            "validation_end": candidate.validation_end,
+                            "time_unit": suggestion.time_unit,
+                            "candidate_passes_all_clusters": candidate.passes,
+                            "worst_normalized_violation": candidate.worst_normalized_violation,
+                            "cluster_id": diagnostic.cluster_id,
+                            "cluster_onset_tc": onset_by_cluster[diagnostic.cluster_id]
+                            if onset_by_cluster[diagnostic.cluster_id] is not None
+                            else np.nan,
+                            "diffusion": diagnostic.diffusion,
+                            "diffusion_unit": suggestion.diffusion_unit,
+                            "conditional_sem_predicted": diagnostic.predicted_sem,
+                            "conditional_sem_empirical": diagnostic.empirical_sem
+                            if diagnostic.empirical_sem is not None
+                            else np.nan,
+                            "max_relative_drift": diagnostic.max_relative_drift,
+                            "relative_drift_tolerance": suggestion.relative_drift_tolerance,
+                            "diffusion_passes": diagnostic.diffusion_passes,
+                            "max_q_deviation": diagnostic.max_q_deviation,
+                            "q_tolerance": suggestion.q_tolerance,
+                            "q_passes": diagnostic.q_passes,
+                            "cluster_passes": diagnostic.passes,
+                            "min_tc": suggestion.min_tc,
+                            "validation_window": suggestion.validation_window,
+                            "persistence_windows": suggestion.persistence_windows,
+                            "blocks_per_window": suggestion.blocks_per_window,
+                            "candidate_step": suggestion.candidate_step,
+                        }
+                    )
+
+    def analysis(self, tc: float | str = 10, fout_prefix: str | None = None,
+                 auto_min_tc: float | None = None) -> AnalysisResult:
+        """Compute pooled and cluster-aware statistics and write outputs.
+
+        Parameters
+        ----------
+        tc : float or {'auto'}, default=10
+            Common lag time for every cluster in ``time_unit``. A numeric value
+            is recommended for publication. ``'auto'`` provides a diagnostic
+            cluster-balanced Q suggestion and requires ``m >= 3``.
+        fout_prefix : str or None, optional
+            Custom output base. By default, use ``{fout}.tc_{tc}``.
+        auto_min_tc : float or None, optional
+            Lower bound for automatic cutoff selection in ``time_unit``.
+
+        Returns
+        -------
+        AnalysisResult
+            Selected-cutoff pooled, per-cluster, and across-cluster results.
+
+        Raises
+        ------
+        RuntimeError
+            If called before :meth:`run_Dfit`.
+        ValueError
+            If the cutoff is invalid or automatic selection is requested with
+            ``m=2``.
+        """
+        if not self._fitted:
+            raise RuntimeError("Call run_Dfit() before analysis().")
+        self._prepare_lag_statistics()
 
         self.tc_auto_unbounded = None
         self.tc_auto_unbounded_idx = None
@@ -1304,6 +2039,7 @@ class Dcov():
             )
             for index, cluster_id in enumerate(self.cluster_ids)
         )
+        n_clusters = len(self.cluster_ids)
         across_statistics = AcrossClusterStatistics(
             n_clusters=n_clusters,
             mean=float(self.D_cluster_mean[itc] * self.diff_scale),
@@ -1697,6 +2433,38 @@ class Dcov():
                 )
                 writer.writerow(across_row)
 
+    def plot_tc_suggestion(self, out_base: str, suggestion: TcSuggestion) -> None:
+        """Create the publication-cutoff diagnostic figure.
+
+        Parameters
+        ----------
+        out_base : str
+            Output path prefix used by the plotting backend.
+        suggestion : TcSuggestion
+            Suggestion whose selected or closest candidate is highlighted.
+
+        Returns
+        -------
+        None
+            Writes ``{out_base}.{imgfmt}``.
+        """
+        plot_tc_suggestion_diagnostics(
+            cluster_ids=self.cluster_ids,
+            cluster_D=self.cluster_D,
+            cluster_q_m=self.cluster_q_m,
+            D_cluster_mean=self.D_cluster_mean,
+            tmin=self.tmin,
+            tmax=self.tmax,
+            dt=self.dt,
+            time_scale=self.time_scale,
+            time_unit=self.time_unit,
+            diff_scale=self.diff_scale,
+            diffusion_unit=self.diffusion_unit,
+            suggestion=suggestion,
+            out_base=out_base,
+            imgfmt=self.imgfmt,
+        )
+
     def plot_results(self, tc, out_base):
         """Create the analysis figure for the selected lag time.
 
@@ -1787,6 +2555,170 @@ class Dcov():
             f"{Dcor_out:.4e} {self.diffusion_unit}; predicted member SD "
             f"{Dstd_out:.4e} {self.diffusion_unit}"
         )
+
+def plot_tc_suggestion_diagnostics(
+    *,
+    cluster_ids,
+    cluster_D,
+    cluster_q_m,
+    D_cluster_mean,
+    tmin,
+    tmax,
+    dt,
+    time_scale,
+    time_unit,
+    diff_scale,
+    diffusion_unit,
+    suggestion,
+    out_base,
+    imgfmt,
+):
+    """Create the two-panel publication-cutoff diagnostic plot.
+
+    Parameters
+    ----------
+    cluster_ids : tuple[str, ...]
+        Cluster identifiers in plotting order.
+    cluster_D : ndarray
+        Per-cluster diffusion curves in internal units with shape
+        ``(n_lag, n_cluster)``.
+    cluster_q_m : ndarray
+        Per-cluster mean Q curves with shape ``(n_lag, n_cluster)``.
+    D_cluster_mean : ndarray
+        Equal-weight cluster mean diffusion curve in internal units.
+    tmin, tmax : int
+        Minimum and maximum internal lag steps represented by the arrays.
+    dt : float
+        Internal frame timestep in ps.
+    time_scale : float
+        Conversion factor from ``time_unit`` to ps.
+    time_unit : str
+        Display unit for lag times.
+    diff_scale : float
+        Scale factor from internal diffusion units to ``diffusion_unit``.
+    diffusion_unit : str
+        Display unit for diffusion values.
+    suggestion : TcSuggestion
+        Suggestion and diagnostics to visualize.
+    out_base : str
+        Output filename prefix.
+    imgfmt : {'pdf', 'png'}
+        Output image format.
+
+    Returns
+    -------
+    None
+        Saves the figure to ``{out_base}.{imgfmt}``.
+    """
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    sns.set_context("paper", font_scale=0.7)
+    fig, (ax_d, ax_q) = plt.subplots(2, 1, figsize=(7, 6), sharex=True)
+    xs = np.arange(tmin, tmax + 1, dtype=float) * dt / time_scale
+    cluster_colors = sns.color_palette("colorblind", n_colors=max(len(cluster_ids), 1))
+    for cluster_index, cluster_id in enumerate(cluster_ids):
+        color = cluster_colors[cluster_index]
+        ax_d.plot(
+            xs,
+            cluster_D[:, cluster_index] * diff_scale,
+            color=color,
+            linewidth=0.9,
+            label=f"cluster {cluster_id}",
+        )
+        ax_q.plot(
+            xs,
+            cluster_q_m[:, cluster_index],
+            color=color,
+            linewidth=0.9,
+            label=f"cluster {cluster_id}",
+        )
+    if len(cluster_ids) > 1:
+        ax_d.plot(
+            xs,
+            D_cluster_mean * diff_scale,
+            color="black",
+            linestyle="--",
+            linewidth=1.1,
+            label="equal-weight cluster mean",
+        )
+
+    evaluated = suggestion.selected_candidate or suggestion.closest_candidate
+    selection_color = "tab:green" if suggestion.selected_candidate is not None else "tab:orange"
+    selection_label = (
+        "suggested common tc"
+        if suggestion.selected_candidate is not None
+        else "closest failing candidate"
+    )
+    for axis in (ax_d, ax_q):
+        axis.axvspan(
+            evaluated.tc,
+            evaluated.validation_end,
+            color=selection_color,
+            alpha=0.08,
+            label="validation horizon" if axis is ax_d else None,
+        )
+        axis.axvline(
+            evaluated.tc,
+            color=selection_color,
+            linestyle="--",
+            linewidth=1.2,
+            label=selection_label if axis is ax_q else None,
+        )
+
+    for cluster_index, onset in enumerate(suggestion.cluster_onsets):
+        if onset.tc is None:
+            continue
+        onset_step = int(round(onset.tc * time_scale / dt))
+        onset_idx = onset_step - tmin
+        if 0 <= onset_idx < len(xs):
+            color = cluster_colors[cluster_index]
+            ax_d.plot(
+                onset.tc,
+                cluster_D[onset_idx, cluster_index] * diff_scale,
+                marker="o",
+                color=color,
+                markeredgecolor="black",
+                markeredgewidth=0.4,
+                markersize=4,
+            )
+            ax_q.plot(
+                onset.tc,
+                cluster_q_m[onset_idx, cluster_index],
+                marker="o",
+                color=color,
+                markeredgecolor="black",
+                markeredgewidth=0.4,
+                markersize=4,
+            )
+
+    ax_q.axhspan(
+        0.5 - suggestion.q_tolerance,
+        0.5 + suggestion.q_tolerance,
+        color="gray",
+        alpha=0.12,
+        label="Q acceptance band",
+    )
+    ax_q.axhline(0.5, color="gray", linestyle=":", linewidth=1.0)
+    ax_d.set_ylabel(fr"$D(t)$ [{diffusion_unit}]")
+    ax_d.ticklabel_format(style="scientific", scilimits=(-3, 4))
+    ax_d.legend(loc="best", ncol=2)
+    ax_q.set_ylabel(r"cluster mean $Q(t)$")
+    ax_q.set_xlabel(fr"lag time $t$ [{time_unit}]")
+    ax_q.set_ylim(0, 1)
+    ax_q.legend(loc="best", ncol=2)
+    ax_d.set_xlim(xs[0], xs[-1])
+    fig.suptitle(
+        "Common cutoff suggestion: "
+        + (
+            f"{suggestion.tc:.4g} {time_unit}"
+            if suggestion.tc is not None
+            else "no common plateau"
+        )
+    )
+    fig.tight_layout()
+    fig.savefig(f"{out_base}.{imgfmt}", dpi=300)
+    plt.close(fig)
 
 
 def plot_diffusion_results(*, D, Dstd, Dempstd, q_m, q_std, s2,
